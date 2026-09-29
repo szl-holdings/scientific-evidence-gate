@@ -1,0 +1,58 @@
+{
+  "schema": "science-gate-citations/v1",
+  "citations": [
+    {
+      "citation_id": "C1",
+      "doi": "10.5555/sgate.fx.0001",
+      "title": "Calibrating invented sensors on a fictional plateau",
+      "authors": [
+        {
+          "family": "Alphatest",
+          "given": "Ada"
+        },
+        {
+          "family": "Gammatest",
+          "given": "Cy"
+        }
+      ],
+      "year": 2031,
+      "journal": "Synthetic Fixture Letters",
+      "volume": "12",
+      "issue": "3"
+    },
+    {
+      "citation_id": "C2",
+      "doi": "10.5555/sgate.fx.0002",
+      "title": "Nonexistent lattice effects in a made-up alloy",
+      "authors": [
+        {
+          "family": "Betatest",
+          "given": "Bo"
+        },
+        {
+          "family": "Alphatest",
+          "given": "Ada"
+        }
+      ],
+      "year": 2032,
+      "journal": "Invented Methods Quarterly",
+      "volume": "4",
+      "issue": "1"
+    },
+    {
+      "citation_id": "C3",
+      "doi": "10.5555/sgate.fx.0003",
+      "title": "Nonexistent lattice effects in a made-up alloy",
+      "authors": [
+        {
+          "family": "Deltatest",
+          "given": "Dee"
+        }
+      ],
+      "year": 2030,
+      "journal": "Journal of Fabricated Results",
+      "volume": "7",
+      "issue": "2"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "note": "Synthetic input manifest of the invented analysis that produced the stored outputs.",
+  "inputs": [
+    {
+      "path": "data/measurements.csv",
+      "sha256": "c39d0ce24317bc5d266b8317d2e8a45ab8d530f4ae8ed9eba70c67dbf01540e1"
+    }
+  ]
+}

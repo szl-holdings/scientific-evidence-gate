@@ -1,0 +1,12 @@
+{
+  "description": "Three synthetic citations whose DOIs resolve in the frozen capture and whose metadata matches; the log backs every claimed verification with an invocation record.",
+  "status": "PASS",
+  "reason": "VERIFIED",
+  "exit_code": 0,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "PASS",
+    "citation-metadata": "PASS"
+  }
+}

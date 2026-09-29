@@ -1,0 +1,19 @@
+{
+  "description": "The frozen capture has no record for the DOI of C2. Offline, that is SOURCE_UNAVAILABLE, never 'not found'. With live access enabled and a failing network, it is SOURCE_UNAVAILABLE as well.",
+  "status": "ABSTAIN",
+  "reason": "SOURCE_UNAVAILABLE",
+  "exit_code": 2,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "ABSTAIN",
+    "citation-metadata": "ABSTAIN"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.0002": "SOURCE_UNAVAILABLE"
+  },
+  "dispositions": {
+    "C1": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C2": "SOURCE_UNAVAILABLE"
+  }
+}

@@ -1,0 +1,5 @@
+sample_id,site,value,count
+CTLSYN-0001,site-kestrel,4.20,"2,310"
+CTLSYN-0002,site-kestrel,0.75,18
+CTLSYN-0003,site-heron,9.05,406
+CTLSYN-0004,site-heron,13.50,"1,120"

@@ -1,0 +1,25 @@
+{
+  "description": "Citation C3 cites a DOI whose captured resolver answer was NOT_FOUND. A record found by a bibliographic query resembles C3; it is listed as a replacement candidate and never used as ground truth.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "FAIL",
+    "citation-metadata": "ABSTAIN"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.9999": "DOI_NOT_RESOLVED_AT_CAPTURE"
+  },
+  "dispositions": {
+    "C1": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C2": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C3": "RECORD_NOT_FOUND_UNDER_RECORDED_QUERIES"
+  },
+  "replacement_candidates": {
+    "C3": [
+      "10.5555/sgate.fx.0003"
+    ]
+  }
+}

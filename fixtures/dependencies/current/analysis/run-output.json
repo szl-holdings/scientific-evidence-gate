@@ -1,0 +1,5 @@
+{
+  "note": "synthetic analysis output for scientific-evidence-gate tests; not a real analysis",
+  "recipe": "per-site mean of value over admitted samples",
+  "samples_admitted": 6
+}

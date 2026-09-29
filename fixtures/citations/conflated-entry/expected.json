@@ -1,0 +1,23 @@
+{
+  "description": "Citation C2 combines the DOI and authors of one work with the title of another.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "PASS",
+    "citation-metadata": "FAIL"
+  },
+  "dispositions": {
+    "C1": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C2": "CONFLATED_ENTRY",
+    "C3": "VERIFIED_WITHIN_DECLARED_SCOPE"
+  },
+  "defects": {
+    "C2": [
+      "TITLE_MISMATCH",
+      "CONFLATED_ENTRY"
+    ]
+  }
+}

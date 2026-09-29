@@ -114,6 +114,7 @@ __all__ = [
     "check_reviewer_protocol",
     "check_time_source",
     "check_summary_consistency",
+    "ledger_evidence",
     "run_checks",
     "Finding",
     "DecisionInputs",
@@ -1489,14 +1490,21 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
 # ---------------------------------------------------------------------------
 
 
-def _ledger_evidence(result: CheckResult) -> dict[str, Any]:
-    """What the terminal ledger entry records: enough to rebuild the result."""
+def ledger_evidence(check: Mapping[str, Any]) -> dict[str, Any]:
+    """What a terminal ledger entry records for a check result, given its ``to_dict()`` form.
+
+    The terminal entry carries every part of the result that the verdict,
+    reason and identity fields do not, so the result can be rebuilt from the
+    sealed ledger alone. Taking the serialized form lets ``report RUN_DIR``
+    apply this same function to a ``run.json`` check and compare the output
+    with the ledger. There is one definition, so the two cannot drift apart.
+    """
     return {
-        "execution_state": result.execution_state,
-        "rows_examined": result.rows_examined,
-        "failure_modes": list(result.failure_modes),
-        "diagnostics": list(result.diagnostics),
-        "check_evidence": result.evidence,
+        "execution_state": check.get("execution_state"),
+        "rows_examined": check.get("rows_examined"),
+        "failure_modes": check.get("failure_modes"),
+        "diagnostics": check.get("diagnostics"),
+        "check_evidence": check.get("evidence"),
     }
 
 
@@ -1567,7 +1575,8 @@ def _run_one(
                 result, tallies = _result_from(spec, invocation_id, outcome)
             except (TypeError, ValueError) as exc:
                 result = _errored(spec, invocation_id, f"INVALID_OUTCOME: {exc}")
-    ledger.finish(invocation_id, verdict=result.verdict, reason=result.reason, evidence=_ledger_evidence(result))
+    evidence = ledger_evidence(result.to_dict())
+    ledger.finish(invocation_id, verdict=result.verdict, reason=result.reason, evidence=evidence)
     return result, tallies
 
 

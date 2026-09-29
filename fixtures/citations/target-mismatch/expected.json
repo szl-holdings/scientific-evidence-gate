@@ -1,0 +1,31 @@
+{
+  "description": "The DOI cited by C1 reached a different work (10.5555/sgate.fx.0010) at capture; every compared field of C1 disagrees with that work, so the defects overlap.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "FAIL",
+    "citation-metadata": "FAIL"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.0001": "DOI_TARGET_MISMATCH"
+  },
+  "dispositions": {
+    "C1": "FIELD_MISMATCH",
+    "C2": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C3": "VERIFIED_WITHIN_DECLARED_SCOPE"
+  },
+  "defects": {
+    "C1": [
+      "DOI_WORK_MISMATCH",
+      "TITLE_MISMATCH",
+      "AUTHOR_MISMATCH",
+      "YEAR_MISMATCH",
+      "JOURNAL_MISMATCH",
+      "VOLUME_MISMATCH",
+      "ISSUE_MISMATCH"
+    ]
+  }
+}

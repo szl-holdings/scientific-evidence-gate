@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "science-gate-graph/v1",
+  "title": "scientific-evidence-gate dependency graph",
+  "description": "graph.json declares artifacts (nodes) and what derives from what (edges [parent, child]). This schema is documentation: validation is implemented in science_gate/dependencies.py, which additionally refuses duplicate node ids, two nodes naming the same file (case-insensitively on Windows), a node naming a file the tool writes (graph-state.json, impact-report.json, revalidation-report.json beside the graph), edges naming undeclared nodes, repeated edges, a history that does not end in the node's declared validity, and malformed JSON (duplicate keys, NaN, Infinity). A cycle is an ERROR (GRAPH_CYCLE), as is a node path that could leave the manifest directory (UNSAFE_PATH). Other defects are MALFORMED_GRAPH. Node paths are relative to the manifest's directory, not to the graph file. The tool never rewrites graph.json; state it derives is written to graph-state.json ($defs/graph_state).",
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "description": "Optional. When present it must be science-gate-graph/v1.",
+      "const": "science-gate-graph/v1"
+    },
+    "nodes": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}}
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "optional_sha256": {
+      "anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+    },
+    "utc_timestamp": {
+      "description": "ISO-8601 UTC with a Z suffix.",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"
+    },
+    "node_kind": {
+      "enum": [
+        "SOURCE_SNAPSHOT",
+        "DESIGN",
+        "ADMITTED_EVIDENCE",
+        "ANALYSIS_RUN",
+        "RANKING_OR_MEASUREMENT",
+        "FIGURE_OR_TABLE",
+        "CONCLUSION"
+      ]
+    },
+    "validity": {
+      "description": "SUPERSEDED and INVALIDATED are declared by people; the tool never sets them and detection and impact walks keep them. STALE_PENDING_REVALIDATION and UNRESOLVED are pending.",
+      "enum": [
+        "CURRENT",
+        "STALE_PENDING_REVALIDATION",
+        "REVALIDATED_UNCHANGED",
+        "REVALIDATED_CHANGED",
+        "SUPERSEDED",
+        "INVALIDATED",
+        "UNRESOLVED"
+      ]
+    },
+    "node": {
+      "type": "object",
+      "required": ["id", "kind", "path", "recorded_sha256", "validity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "kind": {"$ref": "#/$defs/node_kind"},
+        "path": {
+          "description": "The artifact's file, relative to the manifest directory, or null for an artifact without a file (it can then never be re-hashed, only cleared by early cutoff).",
+          "anyOf": [
+            {"type": "string", "minLength": 1, "not": {"pattern": "^(?:[\\\\/]|[A-Za-z]:)"}},
+            {"type": "null"}
+          ]
+        },
+        "recorded_sha256": {
+          "description": "The digest the artifact was established with. Must be null when path is null. A file without a recorded digest (NO_BASELINE) keeps the graph from passing until it is revalidated.",
+          "$ref": "#/$defs/optional_sha256"
+        },
+        "validity": {"$ref": "#/$defs/validity"},
+        "history": {
+          "description": "Declared history. When non-empty, its last entry's 'to' must equal validity.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/transition"},
+          "default": []
+        }
+      }
+    },
+    "edge": {
+      "description": "[parent, child]: child is derived from parent.",
+      "type": "array",
+      "prefixItems": [{"$ref": "#/$defs/identifier"}, {"$ref": "#/$defs/identifier"}],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "transition": {
+      "description": "One change of validity. The contract's {at, from, to, reason}; the tool also writes trigger (the node whose change caused it) and the recorded digest before and after, so original and corrected states are both preserved.",
+      "type": "object",
+      "required": ["at", "from", "to", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "at": {"$ref": "#/$defs/utc_timestamp"},
+        "from": {"$ref": "#/$defs/validity"},
+        "to": {"$ref": "#/$defs/validity"},
+        "reason": {"type": "string", "minLength": 1},
+        "trigger": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
+        "recorded_sha256_before": {"$ref": "#/$defs/optional_sha256"},
+        "recorded_sha256_after": {"$ref": "#/$defs/optional_sha256"},
+        "observed_sha256": {"$ref": "#/$defs/optional_sha256"}
+      }
+    },
+    "state_transition": {
+      "description": "A transition as the tool writes it into graph-state.json: every key present.",
+      "allOf": [{"$ref": "#/$defs/transition"}],
+      "required": [
+        "at",
+        "from",
+        "to",
+        "reason",
+        "trigger",
+        "recorded_sha256_before",
+        "recorded_sha256_after",
+        "observed_sha256"
+      ]
+    },
+    "graph_state": {
+      "$id": "science-gate-graph-state/v1",
+      "description": "graph-state.json, written beside graph.json by 'impact' and 'revalidate' through a safe write. For a node with tool history the state is authoritative (the last history entry must match its validity and recorded digest). For a node without, graph.json's declaration applies. A state file that exists but cannot be read or validated is never ignored: commands stop with ERROR and the check ABSTAINs with PROTOCOL_BROKEN.",
+      "type": "object",
+      "required": ["schema", "graph", "updated_at", "nodes"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "science-gate-graph-state/v1"},
+        "graph": {
+          "type": "object",
+          "required": ["path", "sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "updated_at": {"$ref": "#/$defs/utc_timestamp"},
+        "nodes": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {
+            "type": "object",
+            "required": ["validity", "recorded_sha256", "stale_because", "history"],
+            "additionalProperties": false,
+            "properties": {
+              "validity": {"$ref": "#/$defs/validity"},
+              "recorded_sha256": {"$ref": "#/$defs/optional_sha256"},
+              "stale_because": {
+                "description": "Pending direct parents, plus the node itself when its own file changed or its pending state was declared. Early cutoff clears a node only when this becomes empty.",
+                "type": "array",
+                "items": {"$ref": "#/$defs/identifier"},
+                "uniqueItems": true
+              },
+              "history": {"type": "array", "items": {"$ref": "#/$defs/state_transition"}}
+            }
+          }
+        }
+      }
+    },
+    "impact_report": {
+      "$id": "science-gate-impact/v1",
+      "description": "impact-report.json or revalidation-report.json, written beside graph-state.json. The same content is printed as markdown after the headline and the written paths. Secret-looking values are redacted.",
+      "type": "object",
+      "required": [
+        "schema",
+        "command",
+        "artifact_id",
+        "at",
+        "status",
+        "reason",
+        "failure_modes",
+        "findings",
+        "graph",
+        "state",
+        "detection",
+        "publication_block",
+        "counts",
+        "transitions",
+        "nodes",
+        "does_not_prove"
+      ],
+      "properties": {
+        "schema": {"const": "science-gate-impact/v1"},
+        "command": {"enum": ["impact", "revalidate"]},
+        "status": {"enum": ["PASS", "FAIL", "ABSTAIN", "ERROR"]},
+        "publication_block": {
+          "type": "object",
+          "required": ["blocked", "rule", "publication_nodes", "stale_publication_nodes", "undetermined_publication_nodes"],
+          "properties": {
+            "blocked": {
+              "description": "true while a CONCLUSION or FIGURE_OR_TABLE is STALE_PENDING_REVALIDATION; false only when the graph is fully current; null when it cannot be decided.",
+              "type": ["boolean", "null"]
+            }
+          }
+        },
+        "impact": {"description": "Present for 'impact': origin and descendants (id, kind, depth, path_from_changed_node, prior_state, state, publication_node)."},
+        "revalidate": {"description": "Present for 'revalidate': outcome (REVALIDATED_UNCHANGED, REVALIDATED_CHANGED, REFUSED_UPSTREAM_PENDING, NO_FILE_TO_HASH, FILE_UNAVAILABLE), digests before and after, cleared and still-pending descendants."}
+      }
+    }
+  }
+}

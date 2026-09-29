@@ -1,0 +1,100 @@
+{
+  "schema": "science-gate-citations-frozen/v1",
+  "records": [
+    {
+      "doi": "10.5555/sgate.fx.0001",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0001",
+        "title": "Calibrating invented sensors on a fictional plateau",
+        "authors": [
+          {
+            "family": "Alphatest",
+            "given": "Ada"
+          },
+          {
+            "family": "Gammatest",
+            "given": "Cy"
+          }
+        ],
+        "year": 2031,
+        "journal": "Synthetic Fixture Letters",
+        "volume": "12",
+        "issue": "3"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0001",
+      "response_sha256": "7787dc0ce86ba11c5776767ecddf13681b64c5c9c091c89a5422c7d1a657d139",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0002",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0002",
+        "title": "A placeholder survey of imaginary wetland counts",
+        "authors": [
+          {
+            "family": "Betatest",
+            "given": "Bo"
+          },
+          {
+            "family": "Alphatest",
+            "given": "Ada"
+          }
+        ],
+        "year": 2032,
+        "journal": "Invented Methods Quarterly",
+        "volume": "4",
+        "issue": "1"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0002",
+      "response_sha256": "fa93df20d6f28b66d92bf017a329d3a855c0748cf89b51d2e30208878c37d248",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.9999",
+      "outcome": "NOT_FOUND",
+      "http_status": 404,
+      "work": null,
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.9999",
+      "response_sha256": "2006c0541b796cb143e7a6c06986a1117a7efc03397b14230ea81e5650c88d77",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0003",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0003",
+        "title": "Nonexistent lattice effects in a made-up alloy",
+        "authors": [
+          {
+            "family": "Deltatest",
+            "given": "Dee"
+          }
+        ],
+        "year": 2030,
+        "journal": "Journal of Fabricated Results",
+        "volume": "7",
+        "issue": "2"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works?query.bibliographic=Nonexistent+lattice+effects+in+a+made-up+alloy",
+      "response_sha256": "e3e431bf08766b1fd9795c1b666682ec883d26c06c897970a52e943aaa9b66ec",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    }
+  ]
+}

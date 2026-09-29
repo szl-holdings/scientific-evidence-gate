@@ -1,0 +1,91 @@
+{
+  "inputs": {
+    "measurements": {
+      "row_key": [
+        "sample_id"
+      ],
+      "rows": [
+        {
+          "key": [
+            "SYN-M-001"
+          ],
+          "sha256": "e2ac84548893e85e7028721b07d1152d0096c2f7094acdb7be698866bb88b68b"
+        },
+        {
+          "key": [
+            "SYN-M-002"
+          ],
+          "sha256": "d8ca6165775d748c5c014bd1e3ee8ab2c85dd56a308850b51c35e2028267067a"
+        },
+        {
+          "key": [
+            "SYN-M-003"
+          ],
+          "sha256": "b03deb29ca87b2c8f48ae63f7385b62c236f530239c55009014c6481194d194c"
+        },
+        {
+          "key": [
+            "SYN-M-004"
+          ],
+          "sha256": "13b854068c21c246a54d9da7eb7803b5f33ba2f158a1f0fa0f5e624a5147d44b"
+        },
+        {
+          "key": [
+            "SYN-M-005"
+          ],
+          "sha256": "e621377400d4f01201c212e70060cbf44f4f25ffb00321c6019fa2bd55907060"
+        },
+        {
+          "key": [
+            "SYN-M-006"
+          ],
+          "sha256": "60ea5a412fd5af27086f2fe70483266be48ba0de4777f57b40c5f8933399b8da"
+        },
+        {
+          "key": [
+            "SYN-M-007"
+          ],
+          "sha256": "d3cff62d72131a560aadbb261ec22777cfb31852b73c56f695e6e49e6d4bf810"
+        },
+        {
+          "key": [
+            "SYN-M-008"
+          ],
+          "sha256": "5479d75f38ea68029de3276a3dbff995390139f557254bd305ddc3d4f59c3d20"
+        }
+      ]
+    },
+    "sites": {
+      "row_key": [
+        "site_id"
+      ],
+      "rows": [
+        {
+          "key": [
+            "site-alpha"
+          ],
+          "sha256": "e30964df911a0e491f384b71251e02f84f999933f894f6565ef7c0ac43d945f1"
+        },
+        {
+          "key": [
+            "site-beta"
+          ],
+          "sha256": "b880f55e295eaaa08a79b0644d206831358cd278420612a58f17cdabbf0e304a"
+        },
+        {
+          "key": [
+            "site-gamma"
+          ],
+          "sha256": "bc1aadf073b6ce441e17c5774ccd377447bc3e167e963e6b776206071502d170"
+        },
+        {
+          "key": [
+            "site-delta"
+          ],
+          "sha256": "09a870b954c39ff3bff0267f6dc2217ded091df8a076b7627a85337d6ffbd544"
+        }
+      ]
+    }
+  },
+  "schema": "science-gate-snapshot/v1"
+}

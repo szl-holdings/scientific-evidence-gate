@@ -16,10 +16,18 @@
 
 Reports are rendered from the ``run.json`` document alone, never from live
 objects. ``science-gate report RUN_DIR`` can therefore re-render a recorded
-run exactly as ``verify`` rendered it. First it re-verifies the receipt, the
-ledger chain and the cross-references between the files. If any of that
-fails, the recorded status is not trusted: the report says so, with status
-ERROR.
+run exactly as ``verify`` rendered it. First it re-verifies the receipt and
+the ledger chain. Then it checks that every figure in ``run.json`` is one the
+receipt attests (see :func:`implied_predicate`), and that every check result
+matches its terminal ledger entry. If any of that fails, the recorded status
+is not trusted: the report says so, with status ERROR.
+
+The HTML renderer contract is ``science_gate._html.render(document) -> str``.
+``document`` is the ``run.json`` content as a dict, not a live object, so that
+``verify`` and ``report RUN_DIR`` render from the same input. For a
+re-rendered run it also carries ``reverification``. A run that failed
+re-verification is passed with status ERROR, and its recorded status is kept
+as ``recorded_status``.
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
@@ -41,7 +49,7 @@ from ._canonical import (
     sha256_canonical,
     strict_loads,
 )
-from ._redact import redact
+from ._redact import redact, redact_text
 from ._safeio import SafeIOError, safe_read, safe_write
 from .invariants import (
     InvariantContext,
@@ -50,9 +58,9 @@ from .invariants import (
     ledger_chain_intact,
 )
 from .ledger import LedgerFormatError, parse_jsonl
-from .models import EXIT_CODE, CheckResult, InvariantResult, Reason, Status
+from .models import EXIT_CODE, TERMINAL_INVOCATION_RESULTS, CheckResult, InvariantResult, Reason, Status
 from .receipts import build_run_receipt, receipt_bytes, verify_receipt
-from .verifier import VerificationRun
+from .verifier import VerificationRun, ledger_evidence
 
 __all__ = [
     "RUN_SCHEMA",
@@ -67,10 +75,12 @@ __all__ = [
     "REPORT_HEADINGS",
     "PASS_CONTRACT_FIELDS",
     "SARIF_VERSION",
+    "SARIF_SCHEMA",
     "HTML_RENDERER",
     "WrittenRun",
     "Reverification",
     "run_document",
+    "implied_predicate",
     "headline",
     "render_report",
     "sarif_classification",
@@ -123,7 +133,43 @@ PASS_CONTRACT_FIELDS = (
 )
 
 SARIF_VERSION = "2.1.0"
+#: A schema identifier for SARIF consumers. It is a name only: nothing is ever fetched from it.
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 HTML_RENDERER = "science_gate._html"
+
+#: ``run.json`` fields that must equal the receipt predicate's fields of the
+#: same name. The nested ones are projected by :func:`implied_predicate`.
+_ATTESTED_FIELDS = (
+    "run_id",
+    "status",
+    "reason",
+    "reasons",
+    "failure_modes",
+    "started_at",
+    "completed_at",
+    "counters",
+    "ledger_head_sha256",
+    "ledger_length",
+    "evidence_manifest_sha256",
+    "tool",
+)
+_ATTESTED_INPUT_FIELDS = ("id", "path", "required", "state", "sha256", "bytes", "rows")
+_ATTESTED_CHECK_FIELDS = (
+    "check_id",
+    "kind",
+    "version",
+    "required",
+    "execution_state",
+    "verdict",
+    "reason",
+    "rows_examined",
+    "invocation_id",
+)
+_ATTESTED_INVARIANT_FIELDS = ("name", "applicable", "holds")
+_TERMINAL_RESULTS = frozenset(result.value for result in TERMINAL_INVOCATION_RESULTS)
+#: A tuple, not a set: a tampered run.json may hold an unhashable value where
+#: a status belongs, and a membership test must not raise on it.
+_STATUS_VALUES = tuple(status.value for status in Status)
 
 #: Run files are summaries; this bounds what re-verification will read.
 MAX_RUN_FILE_BYTES = 256 * 1024 * 1024
@@ -231,6 +277,36 @@ def run_document(run: VerificationRun, receipt: Mapping[str, Any]) -> dict[str, 
     # Normalizing turns enums, Decimals and mapping proxies into JSON values,
     # exactly as they will read back from run.json.
     return strict_loads(canonical_bytes(document), integers_only=True)
+
+
+def implied_predicate(document: Mapping[str, Any]) -> dict[str, Any]:
+    """The receipt predicate that a ``run.json`` document implies.
+
+    This mirrors :func:`science_gate.receipts.run_predicate`, but it reads the
+    serialized run instead of a live result. When the projection equals the
+    predicate in ``receipt.json``, every status, counter, input state, check
+    verdict, evidence digest and invariant outcome that a re-rendered report
+    shows is one the receipt attests. It works from the raw document rather
+    than rebuilding model objects, because rebuilding would redact again under
+    the current environment and could alter what was recorded.
+
+    Raises KeyError, TypeError, AttributeError or ValueError when the
+    document does not have the shape ``verify`` writes.
+    """
+    accounting = document["accounting"]
+    return {
+        **{name: document.get(name) for name in _ATTESTED_FIELDS},
+        "input_accounting": {"counters": accounting["counters"], "closure": accounting["closure"]},
+        "inputs": [{name: item[name] for name in _ATTESTED_INPUT_FIELDS} for item in accounting["inputs"]],
+        "checks": [
+            {
+                **{name: check[name] for name in _ATTESTED_CHECK_FIELDS},
+                "evidence_sha256": sha256_canonical(check["evidence"]),
+            }
+            for check in document["checks"]
+        ],
+        "invariants": [{name: item[name] for name in _ATTESTED_INVARIANT_FIELDS} for item in document["invariants"]],
+    }
 
 
 def _known(value: Any) -> str:
@@ -508,7 +584,9 @@ def _abstained_section(doc: Mapping[str, Any]) -> list[str]:
     return ["Findings:", ""] + _bullets(findings, "- none") + ["", "Checks:", ""] + _bullets(checks, "- none")
 
 
-def _unresolved_section(doc: Mapping[str, Any], html_note: str, reverification: Reverification | None) -> list[str]:
+def _unresolved_section(
+    doc: Mapping[str, Any], html_note: str | None, reverification: Reverification | None
+) -> list[str]:
     items: list[str] = []
     for record in (doc.get("accounting") or {}).get("inputs") or []:
         if record.get("state") != "PARSED":
@@ -536,7 +614,8 @@ def _unresolved_section(doc: Mapping[str, Any], html_note: str, reverification: 
         )
     if reverification is not None:
         items += [_md(note) for note in reverification.notes]
-    items.append(_md(html_note))
+    if html_note:
+        items.append(_md(html_note))
     return _bullets(items, "- nothing")
 
 
@@ -590,14 +669,15 @@ def render_report(
     document: Mapping[str, Any],
     *,
     files: Sequence[str],
-    html_note: str,
+    html_note: str | None,
     reverification: Reverification | None = None,
 ) -> str:
     """Render ``report.md`` from a run document.
 
     The nine contract headings come first, in order, and nothing precedes
     them. The file list, and for a re-rendered run the re-verification
-    result, follow them.
+    result, follow them. ``html_note`` says why ``report.html`` was not
+    written. It is None when the page was rendered, which is not an open item.
     """
     bodies: tuple[Callable[[], list[str]], ...] = (
         lambda: _status_section(document, reverification),
@@ -730,8 +810,10 @@ def build_sarif(document: Mapping[str, Any]) -> dict[str, Any]:
     for result in results:
         result["ruleIndex"] = index[result["ruleId"]]
     artifacts = [
-        {"location": {"uri": quote(item["path"], safe="/"), "uriBaseId": "MANIFEST_DIR"},
-         "hashes": {"sha-256": item["sha256"]}}
+        {
+            "location": {"uri": quote(item["path"], safe="/"), "uriBaseId": "MANIFEST_DIR"},
+            "hashes": {"sha-256": item["sha256"]},
+        }
         for item in (document.get("accounting") or {}).get("inputs") or []
         if item.get("sha256")
     ]
@@ -764,7 +846,7 @@ def build_sarif(document: Mapping[str, Any]) -> dict[str, Any]:
                          "evidence_manifest_sha256", "evidence_boundary", "disclaimer")
         },
     }
-    return {"version": SARIF_VERSION, "runs": [run]}
+    return {"$schema": SARIF_SCHEMA, "version": SARIF_VERSION, "runs": [run]}
 
 
 # ---------------------------------------------------------------------------
@@ -783,26 +865,34 @@ class WrittenRun:
     paths: tuple[Path, ...]
 
 
-def _render_html(document: Mapping[str, Any]) -> tuple[str | None, str]:
+def _render_html(document: Mapping[str, Any], root: Path) -> tuple[str | None, str | None]:
     """Render ``report.html`` with ``science_gate._html.render(document)`` if installed.
 
-    The dashboard is a view of the run, not evidence. A missing or failing
-    renderer is therefore reported in ``report.md`` rather than changing the
-    decided status.
+    Returns ``(html, note)``. ``note`` is None when the page was rendered,
+    and otherwise says why it was not. The dashboard is a view of the run,
+    not evidence, so a missing or failing renderer is reported in
+    ``report.md`` rather than changing the decided status. An older
+    ``report.html`` already in ``root`` is left alone, and the note says so,
+    so a stale page is never mistaken for a view of this run.
     """
     try:
         spec = importlib.util.find_spec(HTML_RENDERER)
     except (ImportError, ValueError):  # a half-registered module: treat it as absent
         spec = None
     if spec is None:
-        return None, f"report.html was not written: the HTML renderer ({HTML_RENDERER}) is not installed"
-    try:
-        html = importlib.import_module(HTML_RENDERER).render(document)
-    except Exception as exc:  # a view must never take the run's evidence down with it
-        return None, f"report.html was not written: the HTML renderer failed ({type(exc).__name__}: {exc})"
-    if not isinstance(html, str):
-        return None, f"report.html was not written: the HTML renderer returned {type(html).__name__}, not text"
-    return html, f"report.html was rendered by {HTML_RENDERER}"
+        note = f"report.html was not written: the HTML renderer ({HTML_RENDERER}) is not installed"
+    else:
+        try:
+            html = importlib.import_module(HTML_RENDERER).render(document)
+        except Exception as exc:  # a view must never take the run's evidence down with it
+            note = redact_text(f"report.html was not written: the HTML renderer failed ({type(exc).__name__}: {exc})")
+        else:
+            if isinstance(html, str):
+                return html, None
+            note = f"report.html was not written: the HTML renderer returned {type(html).__name__}, not text"
+    if (root / REPORT_HTML).is_file():
+        note += "; the report.html already in this directory was left unchanged and does not reflect this rendering"
+    return None, note
 
 
 def write_run(run: VerificationRun, output_dir: str | Path, *, environ: Mapping[str, str] | None = None) -> WrittenRun:
@@ -817,7 +907,7 @@ def write_run(run: VerificationRun, output_dir: str | Path, *, environ: Mapping[
         run.result, ledger_head_sha256=seal["ledger_head_sha256"], ledger_length=seal["ledger_length"], environ=environ
     )
     document = run_document(run, receipt)
-    html, html_note = _render_html(document)
+    html, html_note = _render_html(document, root)
     names = [name for name in RUN_FILES if name != REPORT_HTML or html is not None]
     payloads = {
         RUN_JSON: pretty_json_bytes(document),
@@ -863,16 +953,67 @@ def _recorded_checks(document: Mapping[str, Any], problems: list[str]) -> tuple[
 
 
 def _cross_check(document: Mapping[str, Any], predicate: Mapping[str, Any], receipt: Mapping[str, Any]) -> list[str]:
-    """run.json must agree with the receipt it was issued with."""
-    problems = [
-        f"RUN_RECEIPT_MISMATCH: run.json {name} {document.get(name)!r} differs from the receipt's "
-        f"{predicate.get(name)!r}"
-        for name in ("run_id", "status", "reason", "ledger_head_sha256", "ledger_length", "evidence_manifest_sha256")
-        if document.get(name) != predicate.get(name)
+    """run.json must agree, field by field, with the receipt it was issued with.
+
+    That covers the attested predicate (see :func:`implied_predicate`), the
+    top-level copies of the PASS-contract counters, the exit code implied by
+    the status, and the receipt's own content hash. Without this, an edited
+    ``run.json`` would be re-rendered as a re-verified run.
+    """
+    try:
+        implied = implied_predicate(document)
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        return [f"MALFORMED_RUN: run.json cannot be compared with its receipt ({type(exc).__name__})"]
+    problems: list[str] = []
+    for name in sorted(implied):
+        if implied[name] == predicate.get(name):
+            continue
+        shown = ""
+        if isinstance(implied[name], (str, int, type(None))):
+            shown = f" ({implied[name]!r}, but the receipt attests {predicate.get(name)!r})"
+        problems.append(f"RUN_RECEIPT_MISMATCH: run.json {name} differs from the receipt{shown}")
+    counters = predicate.get("counters") if isinstance(predicate.get("counters"), dict) else {}
+    problems += [
+        f"RUN_RECEIPT_MISMATCH: run.json top-level {name} differs from the attested counter"
+        for name in PASS_CONTRACT_FIELDS
+        if name in counters and document.get(name) != counters[name]
     ]
-    recorded = (document.get("receipt") or {}).get("content_sha256")
-    if recorded != receipt.get("content_sha256"):
+    status = document.get("status")
+    if status in _STATUS_VALUES and document.get("exit_code") != EXIT_CODE[Status(status)]:
+        problems.append(f"RUN_RECEIPT_MISMATCH: run.json exit_code does not follow its status {status}")
+    named = document.get("receipt")
+    if not isinstance(named, dict) or named.get("content_sha256") != receipt.get("content_sha256"):
         problems.append("RUN_RECEIPT_MISMATCH: run.json names a different receipt content_sha256")
+    return problems
+
+
+def _ledger_cross_check(checks: Any, entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Each run.json check must match what its terminal ledger entry recorded.
+
+    The receipt attests verdicts and evidence digests. The sealed ledger also
+    records execution state, failure modes and diagnostics, so together they
+    cover every field of a check result. A check whose invocation has no
+    terminal entry is reported by the ``every_verdict_has_invocation``
+    invariant instead.
+    """
+    # A tampered file can hold any JSON value where a string belongs, so only
+    # string ids and results are used as keys.
+    recorded = {
+        entry["invocation_id"]: entry.get("evidence")
+        for entry in entries
+        if isinstance(entry.get("invocation_id"), str)
+        and isinstance(entry.get("result"), str)
+        and entry["result"] in _TERMINAL_RESULTS
+    }
+    problems: list[str] = []
+    for check in checks if isinstance(checks, list) else []:
+        if not isinstance(check, dict) or not isinstance(check.get("invocation_id"), str):
+            continue
+        invocation_id = check["invocation_id"]
+        if invocation_id in recorded and ledger_evidence(check) != recorded[invocation_id]:
+            problems.append(
+                f"RUN_LEDGER_MISMATCH: run.json check {check.get('check_id')!r} differs from its terminal ledger entry"
+            )
     return problems
 
 
@@ -882,8 +1023,9 @@ def reverify_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None =
     Checks: the receipt (structure, content hash, and signature when the key
     is available); the ledger chain against the seal in the receipt; the
     ledger invariants over the recorded results; run.json against the
-    receipt; and the evidence manifest against its recorded hash. Returns
-    the verification and the parsed ``run.json`` (None when unreadable).
+    receipt and against the terminal ledger entries; and the evidence
+    manifest against its recorded hash. Returns the verification and the
+    parsed ``run.json`` (None when unreadable).
     """
     root = Path(run_dir)
     problems: list[str] = []
@@ -892,6 +1034,8 @@ def reverify_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None =
     if document is not None and not isinstance(document, dict):
         problems.append("MALFORMED_RUN: run.json is not a JSON object")
         document = None
+    if document is not None and document.get("status") not in _STATUS_VALUES:
+        problems.append(f"MALFORMED_RUN: run.json status {_md(document.get('status'))} is not a known status")
     verification = verify_receipt(root / RECEIPT_JSON, environ=environ)
     problems.extend(f"RECEIPT: {problem}" for problem in verification.problems)
     if verification.detail and verification.signature_verified is not True:
@@ -923,6 +1067,7 @@ def reverify_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None =
         chain = ledger_chain_intact(ctx)
         invariants = (chain, every_invocation_has_terminal_result(ctx), every_verdict_has_invocation(ctx))
         problems.extend(f"INVARIANT {item.name}: {item.detail}" for item in invariants if item.violated)
+        problems.extend(_ledger_cross_check((document or {}).get("checks"), entries))
         ledger_summary = {
             "intact": not chain.violated,
             "observed_length": len(entries),
@@ -932,6 +1077,11 @@ def reverify_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None =
         problems.extend(_cross_check(document, predicate, receipt))
     elif document is not None:
         problems.append("RECEIPT: no readable predicate to cross-check run.json against")
+    if document is not None:
+        notes.append(
+            "run.json findings, declared manifest content and document list are shown as recorded: the receipt and "
+            "the ledger do not attest them directly (the manifest and document digests are in evidence-manifest.json)"
+        )
     evidence = _read_json(root, EVIDENCE_MANIFEST_JSON, problems)
     if evidence is not None:
         try:
@@ -973,6 +1123,25 @@ def _placeholder_document(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def _html_view(document: Mapping[str, Any], reverification: Reverification) -> dict[str, Any]:
+    """The document the HTML renderer sees for a re-rendered run.
+
+    It is the run document plus the re-verification result. A run that failed
+    re-verification is shown as ERROR, with its recorded status kept beside it
+    as ``recorded_status``. The dashboard therefore can never display a
+    status that re-verification rejected, just as ``report.md`` does not.
+    """
+    view = {**document, "reverification": reverification.to_dict()}
+    if not reverification.ok:
+        view.update(
+            status=Status.ERROR.value,
+            reason=Reason.PROTOCOL_BROKEN.value,
+            exit_code=EXIT_CODE[Status.ERROR],
+            recorded_status=document.get("status"),
+        )
+    return view
+
+
 def report_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None = None) -> WrittenRun:
     """``science-gate report RUN_DIR``: re-verify, then re-render report.md and report.html.
 
@@ -986,32 +1155,30 @@ def report_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None = N
     reverification, document = reverify_run_dir(root, environ=environ)
     if document is None:
         document = _placeholder_document(root)
-    html, html_note = _render_html(document)
+    try:
+        # A dry run: a tampered run.json may have the right keys holding the
+        # wrong shapes. Say so and render what is certain rather than crash.
+        render_report(document, files=(), html_note=None, reverification=reverification)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        problem = f"MALFORMED_RUN: run.json could not be rendered ({type(exc).__name__})"
+        reverification = replace(reverification, ok=False, problems=(*reverification.problems, problem))
+        document = _placeholder_document(root)
+    html, html_note = _render_html(_html_view(document, reverification), root)
     written = [REPORT_MD] + ([REPORT_HTML] if html is not None else [])
     present = [name for name in RUN_FILES if name in written or (root / name).is_file()]
-    try:
-        text = render_report(document, files=present, html_note=html_note, reverification=reverification)
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        # A tampered run.json may have the right keys holding the wrong
-        # shapes. Say so and render what is certain rather than crash.
-        problem = f"MALFORMED_RUN: run.json could not be rendered ({type(exc).__name__})"
-        reverification = Reverification(
-            False, (*reverification.problems, problem), reverification.notes, reverification.receipt,
-            reverification.ledger, reverification.invariants,
-        )
-        document = _placeholder_document(root)
-        text = render_report(document, files=present, html_note=html_note, reverification=reverification)
+    text = render_report(document, files=present, html_note=html_note, reverification=reverification)
     paths = [safe_write(root, REPORT_MD, text.encode("utf-8"))]
     if html is not None:
         paths.append(safe_write(root, REPORT_HTML, html.encode("utf-8")))
-    recorded = document.get("status")
-    if reverification.ok and recorded in {status.value for status in Status}:
-        status = Status(recorded)
+    if reverification.ok:
+        # A run that re-verified has a known status: reverify_run_dir checks it.
+        status = Status(document["status"])
         line = f"{status.value} ({document.get('reason')}) {document.get('run_id')}: recorded run re-verified"
     else:
         status = Status.ERROR
         line = (
             f"{Status.ERROR.value} ({Reason.PROTOCOL_BROKEN.value}) {document.get('run_id')}: re-verification "
-            f"failed: {(reverification.problems or (f'unknown recorded status {recorded!r}',))[0]}"
+            f"failed: {reverification.problems[0]}"
         )
-    return WrittenRun(line, status, EXIT_CODE[status], root, tuple(paths))
+    # Recorded values can hold newlines; the headline must stay one line.
+    return WrittenRun(_md(line), status, EXIT_CODE[status], root, tuple(paths))

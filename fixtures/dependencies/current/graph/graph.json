@@ -1,0 +1,119 @@
+{
+  "schema": "science-gate-graph/v1",
+  "nodes": [
+    {
+      "id": "source-snapshot",
+      "kind": "SOURCE_SNAPSHOT",
+      "path": "data/measurements.csv",
+      "recorded_sha256": "c39d0ce24317bc5d266b8317d2e8a45ab8d530f4ae8ed9eba70c67dbf01540e1",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "study-design",
+      "kind": "DESIGN",
+      "path": "design/protocol.md",
+      "recorded_sha256": "0410a5edf4a48d05eb8ce3c63db546a1676f055ae8cd42cbdf51f083e54c938c",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "admitted-evidence",
+      "kind": "ADMITTED_EVIDENCE",
+      "path": "evidence/admitted.csv",
+      "recorded_sha256": "8b874dfff6b4ff0ce8d06a6ee1956e9aa74c2c6abba4eca0bc9b2d15b16c445c",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "analysis-run",
+      "kind": "ANALYSIS_RUN",
+      "path": "analysis/run-output.json",
+      "recorded_sha256": "51fc533581536a56a1eb3648937cccdd5f3b1c083c63cc2e932a663232c8745e",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "site-means",
+      "kind": "RANKING_OR_MEASUREMENT",
+      "path": "analysis/site-means.csv",
+      "recorded_sha256": "d4dd46f61a17a9a4a7de13fc4c77f7049c64b536468e6b724f7e5c6e63b47041",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "figure-1",
+      "kind": "FIGURE_OR_TABLE",
+      "path": "figures/figure-1.csv",
+      "recorded_sha256": "7c64d6395beba7bf1e7fff970fac7581cb1be3400ac0ccaf44baae52d9ee1ad1",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "table-2",
+      "kind": "FIGURE_OR_TABLE",
+      "path": "figures/table-2.csv",
+      "recorded_sha256": "7a05168278772ab5613e32a9867455bd9768305498773e55d49a913b629eeb5b",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "conclusion-1",
+      "kind": "CONCLUSION",
+      "path": "conclusions/conclusion-1.md",
+      "recorded_sha256": "2a490c6fe166a2b3c6bfb19b68825f86dfb1e0d59871d341603efcd0f9f914a7",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "conclusion-2",
+      "kind": "CONCLUSION",
+      "path": "conclusions/conclusion-2.md",
+      "recorded_sha256": "bbdcb94f18e5a34b350fc400f2bedf7046b1767d8aeed66acb68a71037c5d3f0",
+      "validity": "CURRENT",
+      "history": []
+    }
+  ],
+  "edges": [
+    [
+      "source-snapshot",
+      "admitted-evidence"
+    ],
+    [
+      "study-design",
+      "admitted-evidence"
+    ],
+    [
+      "study-design",
+      "analysis-run"
+    ],
+    [
+      "admitted-evidence",
+      "analysis-run"
+    ],
+    [
+      "analysis-run",
+      "site-means"
+    ],
+    [
+      "site-means",
+      "figure-1"
+    ],
+    [
+      "site-means",
+      "conclusion-1"
+    ],
+    [
+      "figure-1",
+      "conclusion-1"
+    ],
+    [
+      "source-snapshot",
+      "table-2"
+    ],
+    [
+      "table-2",
+      "conclusion-2"
+    ]
+  ]
+}

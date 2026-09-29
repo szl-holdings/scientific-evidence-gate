@@ -29,8 +29,10 @@ from science_gate.reports import (
     RESULTS_SARIF,
     RUN_FILES,
     RUN_JSON,
+    SARIF_SCHEMA,
     SARIF_VERSION,
     build_sarif,
+    implied_predicate,
     render_report,
     report_run_dir,
     sarif_classification,
@@ -48,6 +50,11 @@ def raising_check(ctx: CheckContext, spec: Any) -> CheckOutcome:
 
 def headings(text: str) -> list[str]:
     return _HEADING.findall(text)
+
+
+def section(text: str, heading: str) -> str:
+    """The body of one ``## heading`` section of a report."""
+    return text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
 
 
 def html_renderer(render: Callable[[Any], Any]) -> Any:
@@ -209,7 +216,7 @@ class SarifTests(RunDirectoryTestCase):
     def test_sarif_file_is_2_1_0_with_consistent_rules(self) -> None:
         self.write_run_dir()
         sarif = self.read_json(RESULTS_SARIF)
-        self.assertEqual(sarif["version"], SARIF_VERSION)
+        self.assertEqual((sarif["version"], sarif["$schema"]), (SARIF_VERSION, SARIF_SCHEMA))
         (run,) = sarif["runs"]
         rules = run["tool"]["driver"]["rules"]
         self.assertEqual(len(run["results"]), 6)
@@ -286,11 +293,57 @@ class ReverificationTests(RunDirectoryTestCase):
         path.write_bytes(b"".join([lines[1], lines[0], *lines[2:]]))
         self.assert_rejected("CHAIN_BREAK")
 
-    def test_edited_run_status_is_rejected(self) -> None:
+    def edit_run_json(self, edit: Callable[[dict[str, Any]], None]) -> None:
         document = self.read_json(RUN_JSON)
-        document["status"] = "FAIL"
+        edit(document)
         (self.out / RUN_JSON).write_text(json.dumps(document), encoding="utf-8")
+
+    def test_edited_run_status_is_rejected(self) -> None:
+        self.edit_run_json(lambda document: document.update(status="FAIL"))
         self.assert_rejected("RUN_RECEIPT_MISMATCH")
+
+    def test_run_json_implies_exactly_the_receipt_predicate(self) -> None:
+        # Every predicate field is projected, so a new receipt field cannot go unchecked.
+        predicate = self.read_json(RECEIPT_JSON)["body"]["predicate"]
+        self.assertEqual(implied_predicate(self.read_json(RUN_JSON)), predicate)
+
+    def test_every_attested_figure_is_cross_checked(self) -> None:
+        def top_level_rows(document: dict[str, Any]) -> None:
+            document["rows_examined"] = 600
+
+        def counters(document: dict[str, Any]) -> None:
+            document["counters"]["checks_failed"] = 0 if document["counters"]["checks_failed"] else 1
+
+        def input_state(document: dict[str, Any]) -> None:
+            document["accounting"]["inputs"][0]["state"] = "MISSING"
+
+        def check_evidence(document: dict[str, Any]) -> None:
+            document["checks"][0]["evidence"] = {"synthetic": "replaced"}
+
+        def invariant(document: dict[str, Any]) -> None:
+            document["invariants"][0]["holds"] = not document["invariants"][0]["holds"]
+
+        def exit_code(document: dict[str, Any]) -> None:
+            document["exit_code"] = 1
+
+        pristine = (self.out / RUN_JSON).read_bytes()
+        for edit in (top_level_rows, counters, input_state, check_evidence, invariant, exit_code):
+            with self.subTest(edit=edit.__name__):
+                (self.out / RUN_JSON).write_bytes(pristine)
+                self.edit_run_json(edit)
+                self.assert_rejected("RUN_RECEIPT_MISMATCH")
+
+    def test_check_fields_outside_the_receipt_are_checked_against_the_ledger(self) -> None:
+        self.edit_run_json(lambda document: document["checks"][0].update(diagnostics=["synthetic inserted note"]))
+        self.assert_rejected("RUN_LEDGER_MISMATCH")
+
+    def test_unknown_recorded_status_is_rejected(self) -> None:
+        self.edit_run_json(lambda document: document.update(status=["PASS"]))
+        self.assert_rejected("is not a known status")
+
+    def test_unattested_content_is_labelled_as_recorded(self) -> None:
+        self.rerender()
+        self.assertIn("findings, declared manifest content and document list are shown as recorded", self.report_text())
 
     def test_edited_receipt_is_rejected(self) -> None:
         receipt = self.read_json(RECEIPT_JSON)
@@ -359,6 +412,34 @@ class HtmlRendererTests(RunDirectoryTestCase):
         self.assertEqual(written.status, Status.PASS)
         self.assertFalse((self.out / REPORT_HTML).exists())
         self.assertIn("the HTML renderer failed (ValueError: synthetic renderer failure)", self.report_text())
+
+    def test_a_rendered_page_is_not_an_open_item(self) -> None:
+        self.write_with(lambda document: SYNTHETIC_HTML)
+        self.assertNotIn("report.html", section(self.report_text(), "WHAT REMAINS UNRESOLVED"))
+
+    def test_a_stale_page_from_an_earlier_run_is_flagged(self) -> None:
+        self.write("run/report.html", "<!doctype html><title>an earlier synthetic run</title>")
+        self.write_run_dir()
+        self.assertIn("the report.html already in this directory was left unchanged", self.report_text())
+        self.assertNotIn("`report.html`", section(self.report_text(), "FILES"))
+
+    def test_a_rejected_run_is_never_shown_to_the_renderer_as_trusted(self) -> None:
+        seen: list[Any] = []
+
+        def render(document: Any) -> str:
+            seen.append(document)
+            return SYNTHETIC_HTML
+
+        self.write_with(render)
+        with html_renderer(render):
+            self.assertEqual(report_run_dir(self.out, environ={}).exit_code, 0)
+        self.assertEqual((seen[-1]["status"], seen[-1]["reverification"]["ok"]), ("PASS", True))
+        (self.out / LEDGER_JSONL).write_bytes(b"".join((self.out / LEDGER_JSONL).read_bytes().splitlines(True)[:-1]))
+        with html_renderer(render):
+            self.assertEqual(report_run_dir(self.out, environ={}).exit_code, 3)
+        rejected = seen[-1]
+        self.assertEqual((rejected["status"], rejected["recorded_status"]), ("ERROR", "PASS"))
+        self.assertFalse(rejected["reverification"]["ok"])
 
 
 if __name__ == "__main__":

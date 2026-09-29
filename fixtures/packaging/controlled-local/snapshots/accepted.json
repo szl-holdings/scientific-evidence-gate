@@ -1,0 +1,36 @@
+{
+  "inputs": {
+    "measurements": {
+      "row_key": [
+        "sample_id"
+      ],
+      "rows": [
+        {
+          "key": [
+            "CTLSYN-0001"
+          ],
+          "sha256": "6e1e22647ed42e4bfd4ea24fb647d58f81dc402939681399eb8400c0ce26ec96"
+        },
+        {
+          "key": [
+            "CTLSYN-0002"
+          ],
+          "sha256": "dac1e982d65d1efe0ca030293cdcf96d9bbceee876baf4d18787ec4f23a9d438"
+        },
+        {
+          "key": [
+            "CTLSYN-0003"
+          ],
+          "sha256": "13822c94c1cc4f3250cf57826adc63e478c49b547465106165ddef8e4d68a648"
+        },
+        {
+          "key": [
+            "CTLSYN-0004"
+          ],
+          "sha256": "be641b241c4f9448aae303a60b5d5f6045d3051a3d12784dd3f27bb15d6f422a"
+        }
+      ]
+    }
+  },
+  "schema": "science-gate-snapshot/v1"
+}

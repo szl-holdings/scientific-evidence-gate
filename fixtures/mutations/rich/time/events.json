@@ -1,0 +1,30 @@
+{
+  "events": [
+    {
+      "id": "obs-alpha",
+      "local_time": "2026-03-10T14:30:00",
+      "source": "synthetic-field-logger",
+      "timezone": "+02:00",
+      "utc": "2026-03-10T12:30:00Z"
+    },
+    {
+      "id": "obs-beta",
+      "local_time": "2026-03-11T08:00:00",
+      "source": "synthetic-field-logger",
+      "timezone": "UTC",
+      "utc": "2026-03-11T08:00:00Z"
+    },
+    {
+      "id": "obs-gamma",
+      "local_time": "2026-03-12T21:45:00",
+      "source": "synthetic-bench-clock",
+      "timezone": "-05:30",
+      "utc": "2026-03-13T03:15:00Z"
+    }
+  ],
+  "schema": "science-gate-time-sources/v1",
+  "window": {
+    "end": "2026-03-31T23:59:59Z",
+    "start": "2026-03-01T00:00:00Z"
+  }
+}

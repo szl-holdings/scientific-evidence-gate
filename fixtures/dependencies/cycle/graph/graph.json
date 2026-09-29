@@ -1,0 +1,40 @@
+{
+  "schema": "science-gate-graph/v1",
+  "nodes": [
+    {
+      "id": "cycle-design",
+      "kind": "DESIGN",
+      "path": null,
+      "recorded_sha256": null,
+      "validity": "CURRENT"
+    },
+    {
+      "id": "cycle-analysis",
+      "kind": "ANALYSIS_RUN",
+      "path": null,
+      "recorded_sha256": null,
+      "validity": "CURRENT"
+    },
+    {
+      "id": "cycle-conclusion",
+      "kind": "CONCLUSION",
+      "path": null,
+      "recorded_sha256": null,
+      "validity": "CURRENT"
+    }
+  ],
+  "edges": [
+    [
+      "cycle-design",
+      "cycle-analysis"
+    ],
+    [
+      "cycle-analysis",
+      "cycle-conclusion"
+    ],
+    [
+      "cycle-conclusion",
+      "cycle-analysis"
+    ]
+  ]
+}

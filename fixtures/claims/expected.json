@@ -1,0 +1,79 @@
+{
+  "note": "Expected outcomes of verifying each synthetic fixture's manifest.json. Every name, value and file here is invented. The claim_registry check has id 'claims' in every fixture.",
+  "fixtures": {
+    "valid": {
+      "status": "PASS",
+      "reason": "VERIFIED",
+      "exit_code": 0,
+      "claims_check": {
+        "verdict": "PASS",
+        "reason": "VERIFIED",
+        "failure_modes": []
+      },
+      "demonstrates": "four claims traced to pinned stored outputs; every manuscript number registered or declared not a claim"
+    },
+    "unregistered": {
+      "status": "ABSTAIN",
+      "reason": "UNVERIFIED",
+      "exit_code": 2,
+      "claims_check": {
+        "verdict": "ABSTAIN",
+        "reason": "UNVERIFIED",
+        "failure_modes": [
+          "EPHEMERAL_CLAIM"
+        ]
+      },
+      "demonstrates": "manuscript number 42.5 on line 7 matches no registered claim"
+    },
+    "ephemeral": {
+      "status": "ABSTAIN",
+      "reason": "UNVERIFIED",
+      "exit_code": 2,
+      "claims_check": {
+        "verdict": "ABSTAIN",
+        "reason": "UNVERIFIED",
+        "failure_modes": [
+          "EPHEMERAL_CLAIM"
+        ]
+      },
+      "demonstrates": "claim C-004 has no derivation and no stored output: UNVERIFIED, never false"
+    },
+    "replaced-output": {
+      "status": "FAIL",
+      "reason": "SOURCE_MISMATCH",
+      "exit_code": 1,
+      "claims_check": {
+        "verdict": "FAIL",
+        "reason": "SOURCE_MISMATCH",
+        "failure_modes": [
+          "SOURCE_MISMATCH"
+        ]
+      },
+      "demonstrates": "outputs/site-summary.json no longer matches the digest the registry pinned"
+    },
+    "rounding": {
+      "status": "FAIL",
+      "reason": "SOURCE_MISMATCH",
+      "exit_code": 1,
+      "claims_check": {
+        "verdict": "FAIL",
+        "reason": "SOURCE_MISMATCH",
+        "failure_modes": [
+          "SOURCE_MISMATCH"
+        ]
+      },
+      "demonstrates": "claim 6.2 against stored 6.27 disagrees: 6.27 rounds half-even to 6.3 at the claim's 1 decimal, although both would round to 6"
+    },
+    "separators": {
+      "status": "ABSTAIN",
+      "reason": "REQUIRES_HUMAN_REVIEW",
+      "exit_code": 2,
+      "claims_check": {
+        "verdict": "ABSTAIN",
+        "reason": "REQUIRES_HUMAN_REVIEW",
+        "failure_modes": []
+      },
+      "demonstrates": "manuscript 10,801 is ambiguous without a declared thousands separator"
+    }
+  }
+}

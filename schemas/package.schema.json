@@ -1,0 +1,405 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "science-gate-package/v1",
+  "title": "scientific-evidence-gate evaluation package index (package.json)",
+  "description": "The index written last into every package made by 'science-gate package'. This schema is documentation: the rules are implemented in science_gate/packaging.py. CONTROLLED_LOCAL and REFERENCE_ONLY data is never copied; PUBLIC and SYNTHETIC data is copied only when redistribution_allowed is true or when a SYNTHETIC corpus declares no permissions (its default synthetic permissions). The manifest follows the same rule as the data because check parameters can quote data values. Files are copied byte for byte or withheld whole, never altered. Every evaluation file is listed with its disposition, so nothing a run relied on is dropped. Evaluation permission does not imply training permission.",
+  "type": "object",
+  "required": [
+    "schema",
+    "tool",
+    "created_at",
+    "run_label",
+    "package_state",
+    "incomplete_because",
+    "corpus",
+    "permission_statement",
+    "source_licenses",
+    "approved_redactions",
+    "files",
+    "schemas",
+    "expected_results",
+    "local_execution",
+    "contents",
+    "evidence_boundary",
+    "disclaimer"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "science-gate-package/v1"},
+    "tool": {"$ref": "#/$defs/tool"},
+    "created_at": {"$ref": "#/$defs/utc"},
+    "run_label": {"type": ["string", "null"]},
+    "package_state": {
+      "enum": ["COMPLETE", "INCOMPLETE"],
+      "description": "INCOMPLETE when an evaluation file the run needed has no pinned digest (UNAVAILABLE, other than an absent optional input) or the schemas are incomplete. The package command then exits 2 (ABSTAIN), never 0."
+    },
+    "incomplete_because": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "One line per reason the package is INCOMPLETE; empty exactly when package_state is COMPLETE."
+    },
+    "corpus": {
+      "type": "object",
+      "required": ["access_class", "access_class_source", "permissions", "permission_sources", "data_inclusion"],
+      "additionalProperties": false,
+      "properties": {
+        "access_class": {"$ref": "#/$defs/access_class"},
+        "access_class_source": {
+          "$ref": "#/$defs/source",
+          "description": "DEFAULT when the manifest declares no corpus, which makes it CONTROLLED_LOCAL."
+        },
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "permission_sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "evaluation_allowed",
+            "training_allowed",
+            "redistribution_allowed",
+            "derivatives_allowed",
+            "public_display_allowed",
+            "commercial_use_allowed"
+          ],
+          "properties": {
+            "evaluation_allowed": {"$ref": "#/$defs/source"},
+            "training_allowed": {"$ref": "#/$defs/source"},
+            "redistribution_allowed": {"$ref": "#/$defs/source"},
+            "derivatives_allowed": {"$ref": "#/$defs/source"},
+            "public_display_allowed": {"$ref": "#/$defs/source"},
+            "commercial_use_allowed": {"$ref": "#/$defs/source"}
+          }
+        },
+        "data_inclusion": {
+          "type": "object",
+          "required": ["included", "basis", "statement"],
+          "additionalProperties": false,
+          "properties": {
+            "included": {"type": "boolean"},
+            "basis": {
+              "enum": [
+                "REDISTRIBUTION_ALLOWED",
+                "SYNTHETIC_DEFAULT_PERMISSIONS",
+                "ACCESS_CLASS_CONTROLLED_LOCAL",
+                "ACCESS_CLASS_REFERENCE_ONLY",
+                "REDISTRIBUTION_NOT_ALLOWED"
+              ]
+            },
+            "statement": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "permission_statement": {
+      "type": "string",
+      "pattern": "^Evaluation permission does not imply training permission\\.",
+      "description": "Always opens with the explicit statement that evaluation permission does not imply training permission."
+    },
+    "source_licenses": {
+      "type": "object",
+      "required": ["state", "declared", "assertion", "statement"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {"const": "NOT_DECLARED"},
+        "declared": {"type": "null"},
+        "assertion": {"const": "NOASSERTION"},
+        "statement": {"type": "string", "minLength": 1}
+      },
+      "description": "The v1 manifest has no field for source licenses, so none are declared and none are asserted (NOASSERTION)."
+    },
+    "approved_redactions": {
+      "type": "object",
+      "required": ["state", "declared", "statement"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {"const": "NOT_DECLARED"},
+        "declared": {"type": "null"},
+        "statement": {"type": "string", "minLength": 1}
+      },
+      "description": "The v1 manifest has no field for approved redactions. Packaging never alters a file; a file matching a secret pattern is withheld whole instead."
+    },
+    "files": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evaluation_file"},
+      "description": "Every evaluation file: the manifest, every declared input, and every document a check read. Ordered by kind (manifest, input, document), then name, then path."
+    },
+    "schemas": {
+      "type": "object",
+      "required": ["state", "problem", "files"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {"enum": ["INCLUDED", "INCOMPLETE"]},
+        "problem": {"type": ["string", "null"]},
+        "files": {"type": "array", "items": {"$ref": "#/$defs/content_entry"}}
+      },
+      "description": "Every *.schema.json of the source tree, copied under schemas/. INCOMPLETE when one could not be read or manifest.schema.json or package.schema.json is missing."
+    },
+    "expected_results": {
+      "type": "object",
+      "required": ["reproducible", "not_reproducible", "recorded_run", "network", "content_policy"],
+      "additionalProperties": false,
+      "properties": {
+        "reproducible": {
+          "type": "object",
+          "required": [
+            "status",
+            "reason",
+            "reasons",
+            "failure_modes",
+            "counters",
+            "input_accounting",
+            "inputs",
+            "checks",
+            "invariants",
+            "ledger_length",
+            "tool",
+            "exit_code"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "status": {"enum": ["PASS", "FAIL", "ABSTAIN", "ERROR"]},
+            "reason": {"type": "string"},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "failure_modes": {"type": "array", "items": {"type": "string"}},
+            "counters": {"type": "object"},
+            "input_accounting": {"type": "object"},
+            "inputs": {"type": "array", "items": {"type": "object"}},
+            "checks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["check_id", "evidence_sha256", "verdict"],
+                "not": {"required": ["invocation_id"]},
+                "properties": {"evidence_sha256": {"$ref": "#/$defs/sha256"}}
+              },
+              "description": "Check evidence appears only as evidence_sha256, so expected results never quote input content."
+            },
+            "invariants": {"type": "array", "items": {"type": "object"}},
+            "ledger_length": {"type": "integer", "minimum": 0},
+            "tool": {"$ref": "#/$defs/tool"},
+            "exit_code": {"enum": [0, 1, 2, 3]}
+          },
+          "description": "The receipt-predicate fields of the packaging-time run that a faithful re-execution reproduces (science_gate.packaging.expected_results_from_predicate)."
+        },
+        "not_reproducible": {
+          "type": "object",
+          "required": ["fields", "why"],
+          "additionalProperties": false,
+          "properties": {
+            "fields": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"}
+          }
+        },
+        "recorded_run": {
+          "type": "object",
+          "required": ["run_id", "started_at", "completed_at", "ledger_head_sha256", "evidence_manifest_sha256", "receipt"],
+          "additionalProperties": false,
+          "properties": {
+            "run_id": {"type": "string"},
+            "started_at": {"$ref": "#/$defs/utc"},
+            "completed_at": {"$ref": "#/$defs/utc"},
+            "ledger_head_sha256": {"$ref": "#/$defs/sha256_or_null"},
+            "evidence_manifest_sha256": {"$ref": "#/$defs/sha256_or_null"},
+            "receipt": {
+              "type": "object",
+              "required": ["path", "content_sha256", "signature_state", "key_id"],
+              "additionalProperties": false,
+              "properties": {
+                "path": {"const": "expected/receipt.json"},
+                "content_sha256": {"$ref": "#/$defs/sha256"},
+                "signature_state": {"enum": ["UNSIGNED", "SIGNED_HMAC_SHA256"]},
+                "key_id": {"$ref": "#/$defs/sha256_or_null"}
+              }
+            }
+          },
+          "description": "Provenance of the packaging-time run. These values change on every run and are not expectations."
+        },
+        "network": {
+          "type": "object",
+          "required": ["live_requested", "network_used", "statement"],
+          "additionalProperties": false,
+          "properties": {
+            "live_requested": {"type": "boolean"},
+            "network_used": {"const": false},
+            "statement": {"type": "string"}
+          }
+        },
+        "content_policy": {"type": "string"}
+      }
+    },
+    "local_execution": {
+      "type": "object",
+      "required": ["requires", "steps", "command", "expected_exit_code"],
+      "additionalProperties": false,
+      "properties": {
+        "requires": {
+          "type": "object",
+          "required": ["tool", "version", "python", "network"],
+          "additionalProperties": false,
+          "properties": {
+            "tool": {"type": "string"},
+            "version": {"type": "string"},
+            "python": {"type": "string"},
+            "network": {"const": "none"}
+          }
+        },
+        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "command": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "An argument list for the science-gate command line, never a shell string."
+        },
+        "expected_exit_code": {"enum": [0, 1, 2, 3]}
+      }
+    },
+    "contents": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/content_entry"},
+      "description": "Every file in the package except package.json, sorted by path. 'science-gate package --force' replaces an existing output only when every file in it is package.json or listed here."
+    },
+    "evidence_boundary": {
+      "type": "object",
+      "required": ["integrity", "performance", "scientific_validity"],
+      "additionalProperties": false,
+      "properties": {
+        "integrity": {"type": "string"},
+        "performance": {"type": "string"},
+        "scientific_validity": {"const": "NOT ESTABLISHED"}
+      }
+    },
+    "disclaimer": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256_or_null": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "utc": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "source": {"enum": ["DECLARED", "DEFAULT"]},
+    "access_class": {"enum": ["PUBLIC", "REFERENCE_ONLY", "SYNTHETIC", "CONTROLLED_LOCAL"]},
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {"name": {"type": "string"}, "version": {"type": "string"}}
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_allowed",
+        "training_allowed",
+        "redistribution_allowed",
+        "derivatives_allowed",
+        "public_display_allowed",
+        "commercial_use_allowed"
+      ],
+      "properties": {
+        "evaluation_allowed": {"type": "boolean", "default": true},
+        "training_allowed": {"type": "boolean", "default": false},
+        "redistribution_allowed": {"type": "boolean", "default": false},
+        "derivatives_allowed": {"type": "boolean", "default": false},
+        "public_display_allowed": {"type": "boolean", "default": false},
+        "commercial_use_allowed": {"type": "boolean", "default": false}
+      }
+    },
+    "content_entry": {
+      "type": "object",
+      "required": ["path", "sha256", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "evaluation_file": {
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "path",
+        "package_path",
+        "state",
+        "sha256",
+        "bytes",
+        "required",
+        "declared_sha256",
+        "disposition",
+        "basis",
+        "retrieval"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"enum": ["manifest", "input", "document"]},
+        "name": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "description": "Relative to the manifest directory, as the run recorded it."},
+        "package_path": {
+          "type": ["string", "null"],
+          "pattern": "^evaluation/",
+          "description": "Where the file is in the package (INCLUDED) or must be placed (otherwise). Null only when the recorded path is not a safe relative path."
+        },
+        "state": {"enum": ["PARSED", "PARTIAL", "EMPTY", "MISSING", "REFUSED", "OPEN_FAILED", "PARSE_ERROR", "HASH_MISMATCH"]},
+        "sha256": {"$ref": "#/$defs/sha256_or_null"},
+        "bytes": {"type": ["integer", "null"], "minimum": 0},
+        "required": {"type": ["boolean", "null"], "description": "Declared for inputs; true for the manifest; null for documents."},
+        "declared_sha256": {"$ref": "#/$defs/sha256_or_null"},
+        "disposition": {"enum": ["INCLUDED", "WITHHELD", "UNAVAILABLE"]},
+        "basis": {
+          "enum": [
+            "REDISTRIBUTION_ALLOWED",
+            "SYNTHETIC_DEFAULT_PERMISSIONS",
+            "ACCESS_CLASS_CONTROLLED_LOCAL",
+            "ACCESS_CLASS_REFERENCE_ONLY",
+            "REDISTRIBUTION_NOT_ALLOWED",
+            "SECRET_PATTERN_IN_CONTENT",
+            "DECLARED_DIGEST_MISMATCH",
+            "NO_RECORDED_DIGEST"
+          ]
+        },
+        "retrieval": {
+          "type": ["string", "null"],
+          "description": "How a recipient obtains the file: its package_path and SHA-256 for a WITHHELD file, or why no digest could be pinned. Null only for an INCLUDED file."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"disposition": {"const": "INCLUDED"}}},
+          "then": {
+            "properties": {
+              "basis": {"enum": ["REDISTRIBUTION_ALLOWED", "SYNTHETIC_DEFAULT_PERMISSIONS"]},
+              "sha256": {"$ref": "#/$defs/sha256"},
+              "package_path": {"type": "string"},
+              "retrieval": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "WITHHELD"}}},
+          "then": {
+            "properties": {
+              "basis": {
+                "enum": [
+                  "ACCESS_CLASS_CONTROLLED_LOCAL",
+                  "ACCESS_CLASS_REFERENCE_ONLY",
+                  "REDISTRIBUTION_NOT_ALLOWED",
+                  "SECRET_PATTERN_IN_CONTENT",
+                  "DECLARED_DIGEST_MISMATCH"
+                ]
+              },
+              "sha256": {"$ref": "#/$defs/sha256"},
+              "package_path": {"type": "string"},
+              "retrieval": {"type": "string"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "UNAVAILABLE"}}},
+          "then": {
+            "properties": {
+              "basis": {"enum": ["NO_RECORDED_DIGEST", "DECLARED_DIGEST_MISMATCH"]},
+              "retrieval": {"type": "string"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -178,6 +178,19 @@ class InitCommandTests(CliTestCase):
         verified = self.run_cli("verify", str(self.tmp / "starter" / "manifest.json"), "--output", "run")
         self.assertEqual(verified.returncode, 0, verified.stdout)
 
+    def test_valid_fixture_is_the_init_template(self) -> None:
+        # The committed fixture and the scaffold must not drift apart: both are the reference PASS project.
+        written = scaffold_project(self.tmp / "starter")
+        fixture = VALID_MANIFEST.parent
+        for path in written:
+            relpath = path.relative_to(self.tmp / "starter")
+            with self.subTest(file=relpath.as_posix()):
+                self.assertEqual(path.read_bytes(), (fixture / relpath).read_bytes())
+        self.assertEqual(
+            sorted(item.relative_to(fixture) for item in fixture.rglob("*") if item.is_file()),
+            sorted(path.relative_to(self.tmp / "starter") for path in written),
+        )
+
     def test_init_refuses_to_overwrite(self) -> None:
         existing = self.write("starter/notes.txt", "keep me")
         completed = self.run_cli("init", "starter")

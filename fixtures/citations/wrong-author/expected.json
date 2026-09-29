@@ -1,0 +1,22 @@
+{
+  "description": "Citation C2 names an author the resolved record does not list; everything else matches.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "PASS",
+    "citation-metadata": "FAIL"
+  },
+  "dispositions": {
+    "C1": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C2": "FIELD_MISMATCH",
+    "C3": "VERIFIED_WITHIN_DECLARED_SCOPE"
+  },
+  "defects": {
+    "C2": [
+      "AUTHOR_MISMATCH"
+    ]
+  }
+}

@@ -43,6 +43,7 @@ from science_gate.verifier import (
     NetworkPolicy,
     build_snapshot,
     decide,
+    ledger_evidence,
     resolve_check,
     verify,
 )
@@ -476,6 +477,15 @@ class EngineTests(ProjectTestCase):
                 self.assertEqual((trace.check_id, trace.verdict), (result.check_id, result.verdict))
         self.assertEqual(run.ledger.open_invocations(), ())
         self.assertTrue(run.ledger.verify().intact)
+
+    def test_terminal_entries_record_everything_the_verdict_does_not(self) -> None:
+        run = self.verify_with(check("rows", "row_count"), check("boom", "raises"))
+        terminal = {entry["invocation_id"]: entry for entry in run.ledger.entries if entry["completed_at"] is not None}
+        for result in run.result.checks:
+            with self.subTest(check=result.check_id):
+                entry = terminal[result.invocation_id]
+                self.assertEqual(entry["evidence"], ledger_evidence(result.to_dict()))
+                self.assertEqual((entry["verdict"], entry["reason"]), (result.verdict.value, result.reason.value))
 
     def test_unusable_outcomes_and_params_are_errors(self) -> None:
         run = self.verify_with(

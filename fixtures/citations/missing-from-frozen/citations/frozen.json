@@ -1,0 +1,34 @@
+{
+  "schema": "science-gate-citations-frozen/v1",
+  "records": [
+    {
+      "doi": "10.5555/sgate.fx.0001",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0001",
+        "title": "Calibrating invented sensors on a fictional plateau",
+        "authors": [
+          {
+            "family": "Alphatest",
+            "given": "Ada"
+          },
+          {
+            "family": "Gammatest",
+            "given": "Cy"
+          }
+        ],
+        "year": 2031,
+        "journal": "Synthetic Fixture Letters",
+        "volume": "12",
+        "issue": "3"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0001",
+      "response_sha256": "7787dc0ce86ba11c5776767ecddf13681b64c5c9c091c89a5422c7d1a657d139",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    }
+  ]
+}

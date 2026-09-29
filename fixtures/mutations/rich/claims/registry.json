@@ -1,0 +1,45 @@
+{
+  "claims": [
+    {
+      "claim_id": "claim-alpha-mean",
+      "derivation": {
+        "analysis_recipe": "analysis/recipe.md",
+        "code_version": "synthetic-analysis-code-test",
+        "environment": "python-stdlib-synthetic",
+        "input_manifest_sha256": "c03a22c70b05fe58f0339b33cbed3e7b25e1e5de9a89e6a2218d53fb06f1bc55"
+      },
+      "precision_decimals": 2,
+      "publication_location": "claims/manuscript.md",
+      "review_state": "REVIEWED",
+      "statement": "The mean synthetic value at site-alpha is 6.27 synthetic units.",
+      "stored_output": {
+        "path": "outputs/results.json",
+        "selector": "/site_alpha_mean",
+        "sha256": "50e86bb28bf860cd1f0a0445019ab0f254b19154ba07e822dedfbc0b3e250de4"
+      },
+      "unit": "synthetic-unit",
+      "value": "6.27"
+    },
+    {
+      "claim_id": "claim-sample-count",
+      "derivation": {
+        "analysis_recipe": "analysis/recipe.md",
+        "code_version": "synthetic-analysis-code-test",
+        "environment": "python-stdlib-synthetic",
+        "input_manifest_sha256": "c03a22c70b05fe58f0339b33cbed3e7b25e1e5de9a89e6a2218d53fb06f1bc55"
+      },
+      "precision_decimals": 0,
+      "publication_location": "claims/manuscript.md",
+      "review_state": "REVIEWED",
+      "statement": "The synthetic study examined 8 samples.",
+      "stored_output": {
+        "path": "outputs/results.json",
+        "selector": "/sample_count",
+        "sha256": "50e86bb28bf860cd1f0a0445019ab0f254b19154ba07e822dedfbc0b3e250de4"
+      },
+      "unit": "samples",
+      "value": "8"
+    }
+  ],
+  "schema": "science-gate-claims/v1"
+}

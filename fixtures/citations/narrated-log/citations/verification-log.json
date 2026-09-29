@@ -1,0 +1,43 @@
+{
+  "schema": "science-gate-verification-log/v1",
+  "claimed_verified": 8,
+  "verifier": {
+    "name": "synthetic-citation-checker",
+    "version": "0.0-fixture"
+  },
+  "entries": [
+    {
+      "citation_id": "C1",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C2",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C3",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C4",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C5",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C6",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C7",
+      "claimed_status": "VERIFIED"
+    },
+    {
+      "citation_id": "C8",
+      "claimed_status": "VERIFIED"
+    }
+  ],
+  "invocations": []
+}

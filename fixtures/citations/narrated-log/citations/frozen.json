@@ -1,0 +1,229 @@
+{
+  "schema": "science-gate-citations-frozen/v1",
+  "records": [
+    {
+      "doi": "10.5555/sgate.fx.0001",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0001",
+        "title": "Calibrating invented sensors on a fictional plateau",
+        "authors": [
+          {
+            "family": "Alphatest",
+            "given": "Ada"
+          },
+          {
+            "family": "Gammatest",
+            "given": "Cy"
+          }
+        ],
+        "year": 2031,
+        "journal": "Synthetic Fixture Letters",
+        "volume": "12",
+        "issue": "3"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0001",
+      "response_sha256": "7787dc0ce86ba11c5776767ecddf13681b64c5c9c091c89a5422c7d1a657d139",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0002",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0002",
+        "title": "A placeholder survey of imaginary wetland counts",
+        "authors": [
+          {
+            "family": "Betatest",
+            "given": "Bo"
+          },
+          {
+            "family": "Alphatest",
+            "given": "Ada"
+          }
+        ],
+        "year": 2032,
+        "journal": "Invented Methods Quarterly",
+        "volume": "4",
+        "issue": "1"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0002",
+      "response_sha256": "fa93df20d6f28b66d92bf017a329d3a855c0748cf89b51d2e30208878c37d248",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0003",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0003",
+        "title": "Nonexistent lattice effects in a made-up alloy",
+        "authors": [
+          {
+            "family": "Deltatest",
+            "given": "Dee"
+          }
+        ],
+        "year": 2030,
+        "journal": "Journal of Fabricated Results",
+        "volume": "7",
+        "issue": "2"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0003",
+      "response_sha256": "e3e431bf08766b1fd9795c1b666682ec883d26c06c897970a52e943aaa9b66ec",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0004",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0004",
+        "title": "Simulated drift in a pretend tide gauge network",
+        "authors": [
+          {
+            "family": "Epsilontest",
+            "given": "Eli"
+          },
+          {
+            "family": "Zetatest",
+            "given": "Fay"
+          },
+          {
+            "family": "Deltatest",
+            "given": "Dee"
+          }
+        ],
+        "year": 2033,
+        "journal": "Synthetic Fixture Letters",
+        "volume": "13",
+        "issue": "1"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0004",
+      "response_sha256": "6df4c194c5b8d3b48ca9503e568ccd04b7d132bfaeb8f69401de651e1e22f479",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0005",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0005",
+        "title": "An imaginary cohort for testing evidence gates",
+        "authors": [
+          {
+            "family": "Etatest",
+            "given": "Gus"
+          }
+        ],
+        "year": 2031,
+        "journal": "Placeholder Reviews in Testing",
+        "volume": "2",
+        "issue": "4"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0005",
+      "response_sha256": "931ffa819bdb137825da30efbcaafb4ea08b97e349be5969b70cd9b2a62dd939",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0006",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0006",
+        "title": "Counting fictitious pollinators on invented meadows",
+        "authors": [
+          {
+            "family": "Thetatest",
+            "given": "Hal"
+          },
+          {
+            "family": "Betatest",
+            "given": "Bo"
+          }
+        ],
+        "year": 2029,
+        "journal": "Invented Methods Quarterly",
+        "volume": "3",
+        "issue": "2"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0006",
+      "response_sha256": "56406587daa26a9a75acc271eb9b16292449ed44cb9f33c3b5b14ae29c949d45",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0007",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0007",
+        "title": "Stress-testing make-believe reference lists",
+        "authors": [
+          {
+            "family": "Iotatest",
+            "given": "Ivy"
+          }
+        ],
+        "year": 2034,
+        "journal": "Journal of Fabricated Results",
+        "volume": "9",
+        "issue": "1"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0007",
+      "response_sha256": "4604887dc979ac2c31a377d19ab7a990f5d5baacd6e9612ef304ab62e173126a",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/sgate.fx.0008",
+      "outcome": "FOUND",
+      "http_status": 200,
+      "work": {
+        "doi": "10.5555/sgate.fx.0008",
+        "title": "A mock inventory of unreal glacier cores",
+        "authors": [
+          {
+            "family": "Kappatest",
+            "given": "Jo"
+          },
+          {
+            "family": "Epsilontest",
+            "given": "Eli"
+          }
+        ],
+        "year": 2032,
+        "journal": "Synthetic Fixture Letters",
+        "volume": "12",
+        "issue": "4"
+      },
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/works/10.5555/sgate.fx.0008",
+      "response_sha256": "25da771db64472b8eae43e390775681e54f7cc52bbd5cb1cf272b70a826990fa",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
+    }
+  ]
+}

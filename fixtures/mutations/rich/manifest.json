@@ -1,0 +1,223 @@
+{
+  "accepted_snapshot": "snapshots/accepted.json",
+  "checks": [
+    {
+      "id": "rows",
+      "inputs": [
+        "measurements",
+        "sites"
+      ],
+      "kind": "row_count",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "columns",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "required_columns",
+      "params": {
+        "columns": [
+          "sample_id",
+          "site",
+          "value",
+          "count"
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "site_columns",
+      "inputs": [
+        "sites"
+      ],
+      "kind": "required_columns",
+      "params": {
+        "columns": [
+          "site_id",
+          "region",
+          "elevation_band"
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "duplicates",
+      "inputs": [
+        "measurements",
+        "sites"
+      ],
+      "kind": "duplicate_rows",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "snapshot",
+      "inputs": [
+        "measurements",
+        "sites"
+      ],
+      "kind": "snapshot_completeness",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "values",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "value",
+        "expected": [
+          {
+            "key": "SYN-M-001",
+            "value": "12.4"
+          },
+          {
+            "key": "SYN-M-002",
+            "value": "0.1"
+          },
+          {
+            "key": "SYN-M-004",
+            "value": "27.12"
+          },
+          {
+            "key": "SYN-M-007",
+            "value": "4.75"
+          }
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "counts",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "count",
+        "expected": [
+          {
+            "key": "SYN-M-001",
+            "value": "1234"
+          },
+          {
+            "key": "SYN-M-006",
+            "value": "10,500"
+          },
+          {
+            "key": "SYN-M-008",
+            "value": "3,300"
+          }
+        ],
+        "thousands": ","
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "reviewers",
+      "kind": "reviewer_protocol",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "timing",
+      "kind": "time_source",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "summary",
+      "kind": "summary_consistency",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "citation_log",
+      "kind": "verification_log",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "citation_resolver",
+      "kind": "citation_resolver",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "citation_metadata",
+      "kind": "citation_metadata",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "claims",
+      "kind": "claim_registry",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "dependencies",
+      "kind": "dependency_currency",
+      "required": true,
+      "version": "1"
+    }
+  ],
+  "citations": {
+    "entries": "citations/entries.json",
+    "frozen": "citations/frozen.json",
+    "live": false,
+    "log": "citations/verification-log.json"
+  },
+  "claims": "claims/registry.json",
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  },
+  "dependencies": "graph/graph.json",
+  "inputs": [
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 8,
+      "format": "csv",
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "required": true,
+      "row_key": [
+        "sample_id"
+      ],
+      "sha256": "8656acf7fb0fbb37553a1d7bca2759420f6808779159ac70f3cfae5e078989f3"
+    },
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 4,
+      "format": "json",
+      "id": "sites",
+      "path": "data/sites.json",
+      "required": true,
+      "row_key": [
+        "site_id"
+      ],
+      "sha256": "6feba8e021e6f943a165ed3eeec575c75969c03df40d1805d995d86e19859bed"
+    }
+  ],
+  "manuscript": "claims/manuscript.md",
+  "reviews": {
+    "required_reviewers": [
+      "reviewer-a",
+      "reviewer-b"
+    ],
+    "verdicts": "reviews/verdicts.json"
+  },
+  "run_label": "synthetic-mutation-rich",
+  "schema": "science-gate-manifest/v1",
+  "summary_claim": "claims/summary.json",
+  "time_sources": "time/events.json"
+}

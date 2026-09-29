@@ -1,0 +1,18 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "synthetic-dependency-cycle",
+  "inputs": [],
+  "checks": [
+    {
+      "id": "currency",
+      "kind": "dependency_currency",
+      "version": "1",
+      "required": true
+    }
+  ],
+  "dependencies": "graph/graph.json",
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}

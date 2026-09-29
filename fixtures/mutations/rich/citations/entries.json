@@ -1,0 +1,39 @@
+{
+  "citations": [
+    {
+      "authors": [
+        {
+          "family": "Placeholder",
+          "given": "Avery"
+        },
+        {
+          "family": "Fictional",
+          "given": "Blake"
+        }
+      ],
+      "citation_id": "cite-methods",
+      "doi": "10.5555/sg.synthetic.0001",
+      "issue": "3",
+      "journal": "Journal of Invented Test Data",
+      "title": "Synthetic Methods for Invented Field Measurements",
+      "volume": "12",
+      "year": 2024
+    },
+    {
+      "authors": [
+        {
+          "family": "Madeup",
+          "given": "Casey"
+        }
+      ],
+      "citation_id": "cite-calibration",
+      "doi": "10.5555/sg.synthetic.0002",
+      "issue": "1",
+      "journal": "Proceedings of Nonexistent Instruments",
+      "title": "An Imaginary Calibration Standard",
+      "volume": "4",
+      "year": 2023
+    }
+  ],
+  "schema": "science-gate-citations/v1"
+}

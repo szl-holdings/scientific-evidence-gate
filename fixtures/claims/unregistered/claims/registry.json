@@ -1,0 +1,100 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "C-001",
+      "statement": "Mean synthetic value at site-alpha",
+      "value": "6.27",
+      "unit": "arbitrary units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/site-summary (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.1 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ffea21f208dbba22351f51945a4084f7f006257c384d40e4557e332d12bf38b2"
+      },
+      "stored_output": {
+        "path": "outputs/site-summary.json",
+        "sha256": "90d00ddf799e5c13f10448b4637075ca7702a075396bf6a501a1dda1f9d723e6",
+        "selector": "/sites/site-alpha/mean_value"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-a)",
+      "publication_location": "claims/manuscript.md line 5"
+    },
+    {
+      "claim_id": "C-002",
+      "statement": "Mean synthetic value at site-beta",
+      "value": "15.31",
+      "unit": "arbitrary units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/site-summary (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.1 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ffea21f208dbba22351f51945a4084f7f006257c384d40e4557e332d12bf38b2"
+      },
+      "stored_output": {
+        "path": "outputs/site-summary.json",
+        "sha256": "90d00ddf799e5c13f10448b4637075ca7702a075396bf6a501a1dda1f9d723e6",
+        "selector": "/sites/site-beta/mean_value"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-a)",
+      "publication_location": "claims/manuscript.md line 5"
+    },
+    {
+      "claim_id": "C-003",
+      "statement": "Total synthetic count at site-gamma",
+      "value": "10801",
+      "unit": "counts",
+      "precision_decimals": 0,
+      "derivation": {
+        "analysis_recipe": "recipes/site-summary (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.1 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ffea21f208dbba22351f51945a4084f7f006257c384d40e4557e332d12bf38b2"
+      },
+      "stored_output": {
+        "path": "outputs/site-counts.csv",
+        "sha256": "65003bf811bb8f79594344ebae42230761a8c4aacc4cff5ed1efa967043527aa",
+        "selector": {
+          "row": {
+            "site": "site-gamma"
+          },
+          "column": "total_count"
+        }
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-a)",
+      "publication_location": "claims/manuscript.md line 6"
+    },
+    {
+      "claim_id": "C-004",
+      "statement": "Number of synthetic samples",
+      "value": "6",
+      "unit": "samples",
+      "precision_decimals": 0,
+      "derivation": {
+        "analysis_recipe": "recipes/site-summary (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.1 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ffea21f208dbba22351f51945a4084f7f006257c384d40e4557e332d12bf38b2"
+      },
+      "stored_output": {
+        "path": "outputs/site-summary.json",
+        "sha256": "90d00ddf799e5c13f10448b4637075ca7702a075396bf6a501a1dda1f9d723e6",
+        "selector": "/samples"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-a)",
+      "publication_location": "claims/manuscript.md line 4"
+    }
+  ],
+  "not_claims": {
+    "manuscript_sha256": "00fc9b32ad6e3c1d7d4d0987bef139d1e0b87fd7a46b54732cbfe5e6068f689d",
+    "tokens": [
+      {
+        "line": 1,
+        "text": "3",
+        "reason": "draft number of this synthetic note, not a result"
+      }
+    ]
+  }
+}

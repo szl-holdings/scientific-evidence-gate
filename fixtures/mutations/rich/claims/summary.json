@@ -1,0 +1,32 @@
+{
+  "pinned": {
+    "documents": {
+      "analysis/recipe.md": "5b76b4aeb3f342dd5a8b0eb4122b1f96ea693ed764b7bff56695f88a1adc653c",
+      "citations/entries.json": "100c9e5a72d8996bde9d8981f3a6cb2ac758d98c64ddd29f1139b54436f747d9",
+      "citations/frozen.json": "3342ee95ca81b28e11961d203b72bca2db36e68bd8d8e66c33e018ca94a09725",
+      "citations/verification-log.json": "84cd1e9c36219cd06bcb615d60a3f656ecf85f8d289e219248ddf1cf8b89f78c",
+      "claims/manuscript.md": "a7e8e8bf32b5fe7473884fa19c0693de58e9bf5167549a2c058826e90ca1354f",
+      "claims/registry.json": "181bb300033347352f4faca6074ee4f466442967a33fb61e8703144c8c673143",
+      "graph/design/protocol.md": "a6fc0c757d8175547a58757e4753c0efbfebbcb754f9105cadb186cae5020c24",
+      "graph/graph.json": "981738c949a62ffdb6df4cc480b4a8302a3747c8be23a2827e482774137a51ee",
+      "outputs/results-table.md": "07f5b14e52fa42ba2eb1c3193ee161045f932a375d4278c2e4a188bb6ddab81f",
+      "outputs/results.json": "50e86bb28bf860cd1f0a0445019ab0f254b19154ba07e822dedfbc0b3e250de4",
+      "reviews/verdicts.json": "26dac596cbd2c067c777a408f26e39db36e27568379d4fb4c7f1acd2761d8157",
+      "snapshots/accepted.json": "1406b9ce64c8e9b31fac5e768ac3b7d16058301f1007087b4ad9e3aa87495f08",
+      "time/events.json": "5ba30da8618826382074fc62b7c38fa6fdc6db7f452828d56f58414ea60d4e6b"
+    },
+    "inputs": {
+      "measurements": {
+        "rows": 8,
+        "sha256": "8656acf7fb0fbb37553a1d7bca2759420f6808779159ac70f3cfae5e078989f3"
+      },
+      "sites": {
+        "rows": 4,
+        "sha256": "6feba8e021e6f943a165ed3eeec575c75969c03df40d1805d995d86e19859bed"
+      }
+    }
+  },
+  "recorded_at": "2026-03-15T00:00:00Z",
+  "schema": "science-gate-summary/v1",
+  "status": "PASS"
+}

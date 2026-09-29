@@ -1,0 +1,9 @@
+{
+  "note": "Invented values computed from invented data; not a real measurement.",
+  "samples": 6,
+  "sites": {
+    "site-alpha": {"mean_value": "6.72"},
+    "site-beta": {"mean_value": 15.3125},
+    "site-gamma": {"mean_value": "11.775"}
+  }
+}

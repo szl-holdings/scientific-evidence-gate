@@ -19,4 +19,4 @@ def cli_demo(args: argparse.Namespace) -> int:
     inside ``--output``. Print a one-line status headline followed by the
     paths written, and claim no scientific verification.
     """
-    raise NotImplementedError("demo is not implemented yet (science_gate.demo)")
+    raise NotImplementedError("science_gate.demo.cli_demo")

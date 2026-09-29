@@ -1,0 +1,9 @@
+sample_id,site,value,count
+SYN-M-001,site-alpha,12.40,"1,234"
+SYN-M-002,site-alpha,0.14,7
+SYN-M-003,site-beta,3.5,12
+SYN-M-004,site-beta,27.125,"2,048"
+SYN-M-005,site-gamma,8.00,301
+SYN-M-006,site-gamma,15.55,"10,500"
+SYN-M-007,site-delta,4.75,56
+SYN-M-008,site-delta,19.2,"3,300"

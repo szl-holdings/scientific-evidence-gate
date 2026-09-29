@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "science-gate-claims/v1",
+  "title": "scientific-evidence-gate claim registry",
+  "description": "The document a manifest's 'claims' field points to, read by the claim_registry check (ARCHITECTURE.md section 7). This schema is documentation: validation is implemented in science_gate/claims.py (parse_registry), which additionally refuses duplicate claim ids, duplicate not_claims entries, malformed JSON (duplicate keys, NaN, Infinity) and stored-output paths that are absolute, drive-qualified or climb above the manifest directory. A registry that fails validation makes the check ABSTAIN with PROTOCOL_BROKEN; it is never a FAIL. Only claim_id is structurally required in a claim: an absent, null or blank field is a MISSING link, which the check lists rather than refusing the document. A claim missing any of ANALYSIS_RECIPE, CODE_VERSION, ENVIRONMENT, INPUT_MANIFEST or STORED_OUTPUT is UNVERIFIED with EPHEMERAL_CLAIM, never false.",
+  "type": "object",
+  "required": ["schema", "claims"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "science-gate-claims/v1"},
+    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+    "not_claims": {"anyOf": [{"$ref": "#/$defs/not_claims"}, {"type": "null"}]}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optional_text": {
+      "description": "Null, absent and blank (whitespace-only) all mean the field is missing.",
+      "type": ["string", "null"]
+    },
+    "optional_sha256": {
+      "description": "Null, absent and blank mean missing; any other value must be a well-formed SHA-256, because a malformed recorded digest would pose as a replaced file.",
+      "anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}, {"type": "string", "pattern": "^\\s*$"}]
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim_id"],
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "statement": {"$ref": "#/$defs/optional_text"},
+        "value": {
+          "description": "The value as printed, e.g. \"12.40\" (trailing zeros state precision). An integer or a JSON decimal is accepted and rendered in plain notation; a string keeps the printed form exactly. Numbers are read only through invariants.parse_decimal, with the check's declared thousands and decimal_point.",
+          "anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "number"}, {"type": "null"}]
+        },
+        "unit": {"$ref": "#/$defs/optional_text"},
+        "precision_decimals": {
+          "description": "When given, it must equal the number of decimals the value prints; otherwise the comparison requires human review.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "derivation": {"anyOf": [{"$ref": "#/$defs/derivation"}, {"type": "null"}]},
+        "stored_output": {"anyOf": [{"$ref": "#/$defs/stored_output"}, {"type": "null"}]},
+        "review_state": {
+          "description": "Recorded as DECLARED; the content is not judged.",
+          "$ref": "#/$defs/optional_text"
+        },
+        "publication_location": {
+          "description": "Recorded as DECLARED. The lines on which the manuscript prints the claim's value are reported beside it for reference and are not judged.",
+          "$ref": "#/$defs/optional_text"
+        }
+      }
+    },
+    "derivation": {
+      "description": "The recorded derivation. This tool never starts a process, so it cannot re-run the analysis: each field is checked for presence only and reported as DECLARED.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "analysis_recipe": {"$ref": "#/$defs/optional_text"},
+        "code_version": {"$ref": "#/$defs/optional_text"},
+        "environment": {"$ref": "#/$defs/optional_text"},
+        "input_manifest_sha256": {"$ref": "#/$defs/optional_sha256"}
+      }
+    },
+    "stored_output": {
+      "description": "The one link the tool tests: the file's SHA-256 must equal sha256 (a mismatch is FAIL with SOURCE_MISMATCH), and the value the selector points at is compared with the claim through invariants.compare_decimal (a disagreement is FAIL with SOURCE_MISMATCH). A file that is missing or unreadable abstains.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Relative to the manifest directory. Read through the check context, so it is size-limited, confined to the manifest directory, and listed in the evidence manifest with role claims.stored_output.",
+          "anyOf": [
+            {"type": "string", "minLength": 1, "not": {"pattern": "^(?:[\\\\/]|[A-Za-z]:)"}},
+            {"type": "null"}
+          ]
+        },
+        "sha256": {"$ref": "#/$defs/optional_sha256"},
+        "selector": {
+          "anyOf": [
+            {
+              "description": "An RFC 6901 JSON Pointer into a JSON stored output. The empty string selects the whole document.",
+              "type": "string",
+              "pattern": "^(?:/(?:[^~]|~[01])*)*$"
+            },
+            {"$ref": "#/$defs/csv_selector"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "csv_selector": {
+      "description": "Selects one cell of a CSV stored output: the single row whose cells equal every entry of row (exact strings), in column. No matching row, or a column that does not exist, abstains; more than one matching row requires human review.",
+      "type": "object",
+      "required": ["row", "column"],
+      "additionalProperties": false,
+      "properties": {
+        "row": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"minLength": 1},
+          "additionalProperties": {"type": "string"}
+        },
+        "column": {"type": "string", "minLength": 1}
+      }
+    },
+    "not_claims": {
+      "description": "Manuscript numbers reviewed and declared not to be claims (a year, a section number, a draft number). They apply only while the manuscript's SHA-256 equals manuscript_sha256: an exemption keyed by line is a statement about one exact text, so after any edit none of them apply and the check requires human review. An exemption that matches no number also requires human review. Exempted numbers are listed in the evidence, never dropped.",
+      "type": "object",
+      "required": ["manuscript_sha256", "tokens"],
+      "additionalProperties": false,
+      "properties": {
+        "manuscript_sha256": {"$ref": "#/$defs/sha256"},
+        "tokens": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["line", "text", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "line": {"type": "integer", "minimum": 1},
+              "text": {"description": "The token exactly as printed, sign included.", "type": "string", "minLength": 1},
+              "reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}

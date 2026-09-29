@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "science-gate-citations/v1",
+  "title": "scientific-evidence-gate citation documents",
+  "description": "The three documents the citation checks read (ARCHITECTURE.md section 9): the citations as written (manifest citations.entries), an external verifier's log (citations.log) and a frozen capture of resolver answers (citations.frozen). This schema is documentation: validation is implemented in science_gate/citations.py and science_gate/adapters/, which also refuse malformed JSON (duplicate keys, NaN, Infinity), duplicate citation ids, duplicate invocation ids and two frozen records for one DOI. A structural violation makes the reading check ABSTAIN with PROTOCOL_BROKEN. Missing evidence fields are not structural: an incomplete invocation backs no claim, and a frozen record with missing provenance makes its DOI SOURCE_UNAVAILABLE.",
+  "oneOf": [
+    {"$ref": "#/$defs/entries_document"},
+    {"$ref": "#/$defs/verification_log"},
+    {"$ref": "#/$defs/frozen_set"}
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "utc_timestamp": {
+      "description": "ISO-8601 UTC with a Z suffix, as science_gate._clock.parse_utc accepts.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+    },
+    "doi": {
+      "description": "A DOI, optionally prefixed by doi: or a doi.org resolver URL. Prefixes are removed and ASCII letters folded before any comparison.",
+      "type": "string",
+      "pattern": "^\\s*(?:[Dd][Oo][Ii]:|[Hh][Tt][Tt][Pp][Ss]?://(?:[Dd][Xx]\\.)?[Dd][Oo][Ii]\\.[Oo][Rr][Gg]/)?10\\.[0-9]{4,9}/\\S+\\s*$"
+    },
+    "author": {
+      "type": "object",
+      "required": ["family"],
+      "additionalProperties": false,
+      "properties": {
+        "family": {"$ref": "#/$defs/text"},
+        "given": {"anyOf": [{"$ref": "#/$defs/text"}, {"type": "null"}], "description": "Omitted or null: given names are not compared for this author."}
+      }
+    },
+    "year": {
+      "anyOf": [
+        {"type": "integer", "minimum": 1000, "maximum": 9999},
+        {"type": "string", "pattern": "^\\s*[0-9]{4}\\s*$"},
+        {"type": "null"}
+      ]
+    },
+    "label": {
+      "description": "A volume or issue. A non-negative integer is read as its decimal text.",
+      "anyOf": [
+        {"$ref": "#/$defs/text"},
+        {"type": "integer", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "work": {
+      "description": "The minimum metadata kept about a work. The DOI, title and author set identify it; year, journal, volume and issue are compared only when both sides give them.",
+      "type": "object",
+      "required": ["doi", "title", "authors"],
+      "additionalProperties": false,
+      "properties": {
+        "doi": {"$ref": "#/$defs/doi"},
+        "title": {"$ref": "#/$defs/text"},
+        "authors": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/author"}},
+        "year": {"$ref": "#/$defs/year"},
+        "journal": {"anyOf": [{"$ref": "#/$defs/text"}, {"type": "null"}]},
+        "volume": {"$ref": "#/$defs/label"},
+        "issue": {"$ref": "#/$defs/label"}
+      }
+    },
+    "citation": {
+      "description": "One citation as written in the manuscript: a work plus its identifier.",
+      "type": "object",
+      "required": ["citation_id", "doi", "title", "authors"],
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {"$ref": "#/$defs/identifier"},
+        "doi": {"$ref": "#/$defs/doi"},
+        "title": {"$ref": "#/$defs/text"},
+        "authors": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/author"}},
+        "year": {"$ref": "#/$defs/year"},
+        "journal": {"anyOf": [{"$ref": "#/$defs/text"}, {"type": "null"}]},
+        "volume": {"$ref": "#/$defs/label"},
+        "issue": {"$ref": "#/$defs/label"}
+      }
+    },
+    "entries_document": {
+      "title": "citations.entries",
+      "description": "Citation ids are unique. An empty list makes the resolver and metadata checks NOT_APPLICABLE, never PASS.",
+      "type": "object",
+      "required": ["schema", "citations"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "science-gate-citations/v1"},
+        "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}}
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "version": {"$ref": "#/$defs/text"}
+      }
+    },
+    "log_entry": {
+      "type": "object",
+      "required": ["citation_id", "claimed_status"],
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {"$ref": "#/$defs/text"},
+        "claimed_status": {"enum": ["VERIFIED", "NOT_VERIFIED"]}
+      }
+    },
+    "invocation": {
+      "description": "One recorded verification attempt. invocation_id and citation_id identify it (structural). request, response_sha256 and retrieved_at are its evidence: if any is missing or malformed, the invocation is listed as incomplete and backs no claim.",
+      "type": "object",
+      "required": ["invocation_id", "citation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "invocation_id": {"$ref": "#/$defs/text"},
+        "citation_id": {"$ref": "#/$defs/text"},
+        "request": {"$ref": "#/$defs/text"},
+        "response_sha256": {"$ref": "#/$defs/sha256"},
+        "retrieved_at": {"$ref": "#/$defs/utc_timestamp"}
+      }
+    },
+    "verification_log": {
+      "title": "citations.log",
+      "description": "The contract's log format. A citation claimed VERIFIED with no complete invocation is UNVERIFIED with NARRATED_VERIFICATION, and claimed_verified is set against the complete invocations by the checked_claims_le_invocations invariant. A missing or null invocations list means no invocation was recorded at all; it is reported as unknown, never as zero.",
+      "type": "object",
+      "required": ["claimed_verified", "verifier", "entries"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "science-gate-verification-log/v1"},
+        "claimed_verified": {"type": "integer", "minimum": 0},
+        "verifier": {"$ref": "#/$defs/verifier"},
+        "entries": {"type": "array", "items": {"$ref": "#/$defs/log_entry"}},
+        "invocations": {"anyOf": [{"type": "array", "items": {"$ref": "#/$defs/invocation"}}, {"type": "null"}]}
+      }
+    },
+    "frozen_record": {
+      "description": "One captured resolver answer, keyed by the requested DOI. The six provenance fields are not required by structure, but a record missing or mangling any of them makes its DOI SOURCE_UNAVAILABLE. FOUND needs a work (and a 2xx status if one is given); NOT_FOUND and ERROR carry none. NOT_FOUND yields DOI_NOT_RESOLVED_AT_CAPTURE; a DOI with no record at all is SOURCE_UNAVAILABLE.",
+      "type": "object",
+      "required": ["doi", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "doi": {"$ref": "#/$defs/doi"},
+        "outcome": {"enum": ["FOUND", "NOT_FOUND", "ERROR"]},
+        "http_status": {"anyOf": [{"type": "integer", "minimum": 100, "maximum": 599}, {"type": "null"}]},
+        "work": {"anyOf": [{"$ref": "#/$defs/work"}, {"type": "null"}]},
+        "retrieved_at": {"$ref": "#/$defs/utc_timestamp"},
+        "request_url_or_query": {"$ref": "#/$defs/text"},
+        "response_sha256": {"$ref": "#/$defs/sha256"},
+        "resolver_identity": {"$ref": "#/$defs/text"},
+        "resolver_schema_version": {"$ref": "#/$defs/text"},
+        "live_refresh_performed": {"type": "boolean"}
+      }
+    },
+    "frozen_set": {
+      "title": "citations.frozen",
+      "type": "object",
+      "required": ["schema", "records"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "science-gate-citations-frozen/v1"},
+        "records": {"type": "array", "items": {"$ref": "#/$defs/frozen_record"}}
+      }
+    }
+  }
+}

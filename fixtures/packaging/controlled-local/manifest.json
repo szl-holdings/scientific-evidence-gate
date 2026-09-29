@@ -1,0 +1,114 @@
+{
+  "accepted_snapshot": "snapshots/accepted.json",
+  "checks": [
+    {
+      "id": "rows",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "row_count",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "columns",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "required_columns",
+      "params": {
+        "columns": [
+          "sample_id",
+          "site",
+          "value",
+          "count"
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "duplicates",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "duplicate_rows",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "snapshot",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "snapshot_completeness",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "values",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "value",
+        "expected": [
+          {
+            "key": "CTLSYN-0001",
+            "value": "4.2"
+          },
+          {
+            "key": "CTLSYN-0003",
+            "value": "9.05"
+          }
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "counts",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "count",
+        "expected": [
+          {
+            "key": "CTLSYN-0001",
+            "value": "2310"
+          }
+        ],
+        "thousands": ","
+      },
+      "required": true,
+      "version": "1"
+    }
+  ],
+  "corpus": {
+    "access_class": "CONTROLLED_LOCAL",
+    "permissions": {
+      "evaluation_allowed": true,
+      "redistribution_allowed": false,
+      "training_allowed": false
+    }
+  },
+  "inputs": [
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 4,
+      "format": "csv",
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "required": true,
+      "row_key": [
+        "sample_id"
+      ],
+      "sha256": "1c0280f71f50e6f4f432edd72813e507ce4646419ef103e6b663a58df2dc255d"
+    }
+  ],
+  "run_label": "synthetic-controlled-local",
+  "schema": "science-gate-manifest/v1"
+}

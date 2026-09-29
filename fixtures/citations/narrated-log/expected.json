@@ -1,0 +1,15 @@
+{
+  "description": "The log claims eight verified citations and records zero invocations: narrated verification. Resolution and metadata are clean, so the log is the only defect.",
+  "status": "ABSTAIN",
+  "reason": "UNVERIFIED",
+  "exit_code": 2,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "ABSTAIN",
+    "doi-resolution": "PASS",
+    "citation-metadata": "PASS"
+  },
+  "violated_invariants": [
+    "checked_claims_le_invocations"
+  ]
+}

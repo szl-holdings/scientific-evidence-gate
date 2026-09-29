@@ -1,0 +1,22 @@
+[
+  {
+    "elevation_band": "low",
+    "region": "synthetic-north",
+    "site_id": "site-alpha"
+  },
+  {
+    "elevation_band": "high",
+    "region": "synthetic-north",
+    "site_id": "site-beta"
+  },
+  {
+    "elevation_band": "low",
+    "region": "synthetic-south",
+    "site_id": "site-gamma"
+  },
+  {
+    "elevation_band": "mid",
+    "region": "synthetic-south",
+    "site_id": "site-delta"
+  }
+]

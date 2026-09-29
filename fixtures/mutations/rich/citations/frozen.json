@@ -1,0 +1,59 @@
+{
+  "records": [
+    {
+      "doi": "10.5555/sg.synthetic.0001",
+      "http_status": 200,
+      "live_refresh_performed": false,
+      "outcome": "FOUND",
+      "request_url_or_query": "doi:10.5555/sg.synthetic.0001",
+      "resolver_identity": "synthetic-frozen-resolver",
+      "resolver_schema_version": "1",
+      "response_sha256": "fc71934acee4df9aade966a3a444cb7b857097b301f206eefd7f2bed9b25e7a8",
+      "retrieved_at": "2026-03-14T12:00:00Z",
+      "work": {
+        "authors": [
+          {
+            "family": "Placeholder",
+            "given": "Avery"
+          },
+          {
+            "family": "Fictional",
+            "given": "Blake"
+          }
+        ],
+        "doi": "10.5555/sg.synthetic.0001",
+        "issue": "3",
+        "journal": "Journal of Invented Test Data",
+        "title": "Synthetic Methods for Invented Field Measurements",
+        "volume": "12",
+        "year": 2024
+      }
+    },
+    {
+      "doi": "10.5555/sg.synthetic.0002",
+      "http_status": 200,
+      "live_refresh_performed": false,
+      "outcome": "FOUND",
+      "request_url_or_query": "doi:10.5555/sg.synthetic.0002",
+      "resolver_identity": "synthetic-frozen-resolver",
+      "resolver_schema_version": "1",
+      "response_sha256": "cd0c06a8b25079d78c8078da071a227360f82f01bc654855fa100d036c00058d",
+      "retrieved_at": "2026-03-14T12:00:00Z",
+      "work": {
+        "authors": [
+          {
+            "family": "Madeup",
+            "given": "Casey"
+          }
+        ],
+        "doi": "10.5555/sg.synthetic.0002",
+        "issue": "1",
+        "journal": "Proceedings of Nonexistent Instruments",
+        "title": "An Imaginary Calibration Standard",
+        "volume": "4",
+        "year": 2023
+      }
+    }
+  ],
+  "schema": "science-gate-citations-frozen/v1"
+}

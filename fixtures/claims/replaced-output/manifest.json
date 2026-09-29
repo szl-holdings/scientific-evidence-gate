@@ -1,0 +1,44 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "synthetic-claims-replaced-output",
+  "inputs": [
+    {
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "format": "csv",
+      "required": true,
+      "sha256": "c39d0ce24317bc5d266b8317d2e8a45ab8d530f4ae8ed9eba70c67dbf01540e1",
+      "row_key": [
+        "sample_id"
+      ],
+      "expected_rows": 6,
+      "denominator_source": "INDEPENDENT"
+    }
+  ],
+  "checks": [
+    {
+      "id": "rows",
+      "kind": "row_count",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "measurements"
+      ]
+    },
+    {
+      "id": "claims",
+      "kind": "claim_registry",
+      "version": "1",
+      "required": true,
+      "params": {
+        "thousands": ","
+      }
+    }
+  ],
+  "claims": "claims/registry.json",
+  "manuscript": "claims/manuscript.md",
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}

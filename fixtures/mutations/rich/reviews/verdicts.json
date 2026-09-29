@@ -1,0 +1,17 @@
+{
+  "schema": "science-gate-reviews/v1",
+  "verdicts": [
+    {
+      "recorded_at": "2026-03-12T09:00:00Z",
+      "reviewer": "reviewer-a",
+      "subject": "synthetic-mutation-rich",
+      "verdict": "ACCEPT"
+    },
+    {
+      "recorded_at": "2026-03-12T10:15:00Z",
+      "reviewer": "reviewer-b",
+      "subject": "synthetic-mutation-rich",
+      "verdict": "ACCEPT"
+    }
+  ]
+}

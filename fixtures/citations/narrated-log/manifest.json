@@ -1,0 +1,57 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "citations-narrated-log",
+  "inputs": [
+    {
+      "id": "observations",
+      "path": "data/observations.csv",
+      "format": "csv",
+      "required": true,
+      "row_key": [
+        "observation_id"
+      ],
+      "expected_rows": 3,
+      "denominator_source": "INDEPENDENT",
+      "sha256": "284bf819d7dd5ce5c4197cad4aad1669323a7715eeb69d0908c8ea0152b88e8c"
+    }
+  ],
+  "checks": [
+    {
+      "id": "observations",
+      "kind": "row_count",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "observations"
+      ]
+    },
+    {
+      "id": "citation-log",
+      "kind": "verification_log",
+      "version": "1",
+      "required": true
+    },
+    {
+      "id": "doi-resolution",
+      "kind": "citation_resolver",
+      "version": "1",
+      "required": true
+    },
+    {
+      "id": "citation-metadata",
+      "kind": "citation_metadata",
+      "version": "1",
+      "required": true
+    }
+  ],
+  "citations": {
+    "entries": "citations/entries.json",
+    "log": "citations/verification-log.json",
+    "frozen": "citations/frozen.json",
+    "live": false
+  },
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}
