@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "science-gate-manifest/v1",
+  "title": "scientific-evidence-gate manifest",
+  "description": "Declares what a run is expected to examine. This schema is documentation: validation is implemented in science_gate/manifests.py, which additionally refuses subprocess-shaped keys at any depth (case-insensitively), duplicate ids, duplicate normalized paths (case-insensitive on Windows), unsafe role paths, references to undeclared inputs, and malformed JSON (duplicate keys, NaN, Infinity). Every violation is an ERROR with PROTOCOL_BROKEN and a named diagnostic. Paths are relative to the manifest's directory.",
+  "type": "object",
+  "required": ["schema", "inputs", "checks"],
+  "additionalProperties": false,
+  "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+  "properties": {
+    "schema": {"const": "science-gate-manifest/v1"},
+    "run_label": {"type": ["string", "null"], "minLength": 1},
+    "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}},
+    "accepted_snapshot": {"$ref": "#/$defs/optional_role_path"},
+    "checks": {"type": "array", "items": {"$ref": "#/$defs/check"}},
+    "claims": {"$ref": "#/$defs/optional_role_path"},
+    "manuscript": {"$ref": "#/$defs/optional_role_path"},
+    "dependencies": {"$ref": "#/$defs/optional_role_path"},
+    "citations": {"anyOf": [{"$ref": "#/$defs/citations"}, {"type": "null"}]},
+    "reviews": {"anyOf": [{"$ref": "#/$defs/reviews"}, {"type": "null"}]},
+    "time_sources": {"$ref": "#/$defs/optional_role_path"},
+    "limits": {"anyOf": [{"$ref": "#/$defs/limits"}, {"type": "null"}]},
+    "corpus": {"anyOf": [{"$ref": "#/$defs/corpus"}, {"type": "null"}]},
+    "summary_claim": {"$ref": "#/$defs/optional_role_path"}
+  },
+  "$defs": {
+    "unsafe_key": {
+      "description": "Keys that would request a process: command, cmd, shell, exec, script, run, subprocess, entrypoint, in any letter case. The tool never starts a process, so such a key is refused at any depth with UNSAFE_SUBPROCESS_REQUEST.",
+      "type": "string",
+      "pattern": "^(?:[Cc][Mm][Dd]|[Cc][Oo][Mm][Mm][Aa][Nn][Dd]|[Ee][Nn][Tt][Rr][Yy][Pp][Oo][Ii][Nn][Tt]|[Ee][Xx][Ee][Cc]|[Rr][Uu][Nn]|[Ss][Cc][Rr][Ii][Pp][Tt]|[Ss][Hh][Ee][Ll][Ll]|[Ss][Uu][Bb][Pp][Rr][Oo][Cc][Ee][Ss][Ss])$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "role_path": {
+      "description": "A path relative to the manifest directory. Absolute paths, drive letters, UNC shares and '..' that climbs above the manifest directory are refused with UNSAFE_PATH.",
+      "type": "string",
+      "minLength": 1,
+      "not": {"pattern": "^(?:[\\\\/]|[A-Za-z]:)"}
+    },
+    "optional_role_path": {
+      "anyOf": [{"$ref": "#/$defs/role_path"}, {"type": "null"}]
+    },
+    "input": {
+      "type": "object",
+      "required": ["id", "path", "format"],
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "path": {
+          "description": "Only type-checked by the manifest validator. Discovery judges its safety (traversal, symlinks, size) and marks an unsafe input REFUSED so that it stays visible in the input accounting.",
+          "type": "string",
+          "minLength": 1
+        },
+        "required": {"type": "boolean", "default": true},
+        "format": {"enum": ["csv", "json", "jsonl"]},
+        "sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "row_key": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "default": []
+        },
+        "expected_rows": {"type": ["integer", "null"], "minimum": 0},
+        "denominator_source": {
+          "anyOf": [{"enum": ["INDEPENDENT", "OBSERVED", "ESTIMATED", "UNAVAILABLE"]}, {"type": "null"}],
+          "description": "Where expected_rows came from. Only INDEPENDENT closes accounting. expected_rows requires a source other than UNAVAILABLE, and such a source requires expected_rows."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"required": ["expected_rows"], "properties": {"expected_rows": {"type": "integer"}}},
+          "then": {
+            "required": ["denominator_source"],
+            "properties": {"denominator_source": {"enum": ["INDEPENDENT", "OBSERVED", "ESTIMATED"]}}
+          }
+        },
+        {
+          "if": {
+            "required": ["denominator_source"],
+            "properties": {"denominator_source": {"enum": ["INDEPENDENT", "OBSERVED", "ESTIMATED"]}}
+          },
+          "then": {"required": ["expected_rows"], "properties": {"expected_rows": {"type": "integer"}}}
+        }
+      ]
+    },
+    "check": {
+      "type": "object",
+      "required": ["id", "kind", "version"],
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "kind": {
+          "description": "Must be a registered check kind.",
+          "enum": [
+            "citation_metadata",
+            "citation_resolver",
+            "claim_registry",
+            "dependency_currency",
+            "duplicate_rows",
+            "numeric_agreement",
+            "required_columns",
+            "reviewer_protocol",
+            "row_count",
+            "snapshot_completeness",
+            "summary_consistency",
+            "time_source",
+            "verification_log"
+          ]
+        },
+        "version": {"type": "string", "minLength": 1},
+        "required": {"type": "boolean", "default": true},
+        "inputs": {
+          "description": "Ids of declared inputs.",
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "default": []
+        },
+        "params": {
+          "description": "Free-form parameters owned by the check kind. Non-integer numbers are read as exact decimals, never floats.",
+          "$ref": "#/$defs/safe_object",
+          "default": {}
+        }
+      }
+    },
+    "safe_object": {
+      "type": "object",
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "additionalProperties": {"$ref": "#/$defs/safe_value"}
+    },
+    "safe_value": {
+      "anyOf": [
+        {"type": ["string", "number", "boolean", "null"]},
+        {"type": "array", "items": {"$ref": "#/$defs/safe_value"}},
+        {"$ref": "#/$defs/safe_object"}
+      ]
+    },
+    "citations": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "entries": {"$ref": "#/$defs/optional_role_path"},
+        "log": {"$ref": "#/$defs/optional_role_path"},
+        "frozen": {"$ref": "#/$defs/optional_role_path"},
+        "live": {"type": "boolean", "default": false}
+      }
+    },
+    "reviews": {
+      "type": "object",
+      "required": ["required_reviewers", "verdicts"],
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "required_reviewers": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "verdicts": {"$ref": "#/$defs/role_path"}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "max_file_bytes": {"type": "integer", "minimum": 1, "default": 52428800},
+        "max_files": {"type": "integer", "minimum": 1, "default": 10000},
+        "max_rows": {"type": "integer", "minimum": 1, "default": 1000000}
+      }
+    },
+    "corpus": {
+      "description": "When absent, the corpus is treated as CONTROLLED_LOCAL, the most restrictive class.",
+      "type": "object",
+      "required": ["access_class"],
+      "additionalProperties": false,
+      "propertyNames": {"not": {"$ref": "#/$defs/unsafe_key"}},
+      "properties": {
+        "access_class": {"enum": ["PUBLIC", "REFERENCE_ONLY", "SYNTHETIC", "CONTROLLED_LOCAL"]},
+        "permissions": {
+          "description": "Evaluation permission never implies training permission.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "evaluation_allowed": {"type": "boolean", "default": true},
+            "training_allowed": {"type": "boolean", "default": false},
+            "redistribution_allowed": {"type": "boolean", "default": false},
+            "derivatives_allowed": {"type": "boolean", "default": false},
+            "public_display_allowed": {"type": "boolean", "default": false},
+            "commercial_use_allowed": {"type": "boolean", "default": false}
+          }
+        }
+      }
+    }
+  }
+}

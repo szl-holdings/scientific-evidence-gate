@@ -1,0 +1,268 @@
+"""Canonical JSON, strict JSON parsing and SHA-256 helpers.
+
+Every hash this tool emits (ledger entries, receipts, evidence manifests) is a
+hash of *canonical* JSON: UTF-8, sorted keys, compact separators,
+``ensure_ascii=False``, integers only. Two semantically equal documents must
+hash identically on every machine and under every ``PYTHONHASHSEED``, so this
+module is deliberately strict:
+
+* Floats are refused outright. Their text form is platform- and
+  history-dependent (``0.1 + 0.2``), so a float in hashed content would make a
+  hash depend on arithmetic accidents. Non-integer quantities travel as
+  ``decimal.Decimal`` and are serialized as decimal strings such as ``"0.125"``.
+* NaN and infinities are refused in every form, because they have no stable
+  JSON representation and usually signal a failed computation.
+* Mapping keys must be strings. ``json`` would silently coerce ``1`` and
+  ``"1"`` to the same key, which could merge two distinct facts.
+* Sets are emitted as lists sorted by their canonical encoding, so iteration
+  order never leaks into output.
+
+The strict loader mirrors these rules on the way in: duplicate keys, NaN and
+Infinity are errors, and JSON numbers with a fraction or exponent are parsed as
+``Decimal`` so a float can never enter the process from input data either.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from decimal import Decimal
+from enum import Enum
+from pathlib import PurePath
+from typing import Any, BinaryIO, Mapping
+
+__all__ = [
+    "CanonicalizationError",
+    "SizeLimitExceeded",
+    "StrictJSONError",
+    "normalize",
+    "canonical_dumps",
+    "canonical_bytes",
+    "pretty_json_bytes",
+    "sha256_bytes",
+    "sha256_canonical",
+    "sha256_stream",
+    "sha256_file",
+    "strict_loads",
+    "HASH_CHUNK_BYTES",
+]
+
+#: Read size for streaming hashes. Large enough to be efficient, small enough
+#: that a multi-gigabyte input never has to fit in memory.
+HASH_CHUNK_BYTES = 1 << 16
+
+
+class CanonicalizationError(ValueError):
+    """Raised when a value cannot be represented in canonical JSON.
+
+    The message names the JSON path of the offending value so the producer of
+    bad evidence can be found without a debugger.
+    """
+
+
+class SizeLimitExceeded(ValueError):
+    """Raised when a stream proves larger than its declared byte budget."""
+
+
+class StrictJSONError(ValueError):
+    """Raised by :func:`strict_loads` for any input that is not strict JSON.
+
+    ``kind`` is one of ``MALFORMED_JSON``, ``DUPLICATE_KEY``,
+    ``NON_FINITE_NUMBER`` or ``NON_INTEGER_NUMBER`` so callers can report a
+    named diagnostic instead of a traceback.
+    """
+
+    def __init__(self, kind: str, message: str, *, line: int | None = None, column: int | None = None) -> None:
+        location = f" (line {line}, column {column})" if line is not None else ""
+        super().__init__(f"{kind}: {message}{location}")
+        self.kind = kind
+        self.detail = message
+        self.line = line
+        self.column = column
+
+
+def normalize(value: Any, _path: str = "$") -> Any:
+    """Return a JSON-safe copy of ``value`` that obeys the canonical rules.
+
+    Accepted: ``None``, ``bool``, ``int``, ``str``, finite ``Decimal`` (emitted
+    as its string form), ``Enum`` (emitted as its value), mappings with string
+    keys, lists, tuples, sets, and objects exposing ``to_dict()``.
+
+    Refused: floats, non-finite decimals, bytes and filesystem paths. Paths are
+    refused because an absolute path would make output differ between
+    machines; callers must pass an explicit relative path string instead.
+
+    A ``Decimal`` keeps its own ``str`` form, so ``Decimal("1.50")`` stays
+    ``"1.50"`` (printed precision is evidence) and an input such as ``1e999999``
+    stays compact instead of expanding into a million digits.
+    """
+    if isinstance(value, Enum):
+        return normalize(value.value, _path)
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        raise CanonicalizationError(
+            f"float at {_path}: floats never enter hashed content; use an int or a decimal string"
+        )
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise CanonicalizationError(f"non-finite decimal at {_path}")
+        return str(value)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, Enum):
+                key = key.value
+            if not isinstance(key, str):
+                raise CanonicalizationError(f"non-string key {key!r} at {_path}")
+            if key in result:
+                raise CanonicalizationError(f"duplicate key {key!r} at {_path} after normalization")
+            result[key] = normalize(item, f"{_path}.{key}")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [normalize(item, f"{_path}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, (set, frozenset)):
+        items = [normalize(item, f"{_path}{{}}") for item in value]
+        return sorted(items, key=_encode)
+    if isinstance(value, (bytes, bytearray, PurePath)):
+        raise CanonicalizationError(
+            f"{type(value).__name__} at {_path}: pass an explicit string (relative path or hex digest)"
+        )
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return normalize(to_dict(), _path)
+    raise CanonicalizationError(f"unsupported type {type(value).__name__} at {_path}")
+
+
+def _encode(normalized: Any) -> str:
+    """Serialize an already-normalized value with the canonical settings."""
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def canonical_dumps(value: Any) -> str:
+    """Return the canonical JSON text of ``value``."""
+    return _encode(normalize(value))
+
+
+def canonical_bytes(value: Any) -> bytes:
+    """Return the canonical UTF-8 bytes of ``value`` (the bytes that get hashed)."""
+    text = canonical_dumps(value)
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:  # lone surrogates cannot be encoded
+        raise CanonicalizationError(f"string is not valid Unicode text: {exc.reason}") from exc
+
+
+def pretty_json_bytes(value: Any) -> bytes:
+    """Return deterministic, human-readable JSON bytes ending in a newline.
+
+    Output files are read by people as well as machines. This uses the same
+    normalization as the canonical form (so it can never contain floats and
+    keys are always sorted) but indents it. Hashes are always taken over
+    :func:`canonical_bytes`, never over this rendering.
+    """
+    text = json.dumps(normalize(value), sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False)
+    try:
+        return (text + "\n").encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CanonicalizationError(f"string is not valid Unicode text: {exc.reason}") from exc
+
+
+def sha256_bytes(data: bytes) -> str:
+    """Return the lowercase hex SHA-256 of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_canonical(value: Any) -> str:
+    """Return the SHA-256 of the canonical encoding of ``value``."""
+    return sha256_bytes(canonical_bytes(value))
+
+
+def sha256_stream(stream: BinaryIO, *, max_bytes: int | None = None) -> tuple[str, int]:
+    """Hash a binary stream in chunks and return ``(hexdigest, byte_count)``.
+
+    Streaming keeps memory flat for large inputs. When ``max_bytes`` is given
+    the read stops with :class:`SizeLimitExceeded` as soon as the stream proves
+    larger than the limit, so a file that grows after it was measured can
+    never be hashed past its declared budget.
+    """
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = stream.read(HASH_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise SizeLimitExceeded(f"stream exceeds {max_bytes} bytes")
+        digest.update(chunk)
+    return digest.hexdigest(), total
+
+
+def sha256_file(path: str | PurePath, *, max_bytes: int | None = None) -> tuple[str, int]:
+    """Stream-hash the file at ``path`` and return ``(hexdigest, byte_count)``."""
+    with open(path, "rb") as stream:
+        return sha256_stream(stream, max_bytes=max_bytes)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that refuses duplicate keys.
+
+    Python's ``json`` keeps the *last* duplicate silently, which lets a file
+    say two different things to two different readers. Refusing is the only
+    unambiguous option.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise StrictJSONError("DUPLICATE_KEY", f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(name: str) -> Any:
+    """``parse_constant`` hook that refuses NaN, Infinity and -Infinity."""
+    raise StrictJSONError("NON_FINITE_NUMBER", f"{name} is not a finite JSON number")
+
+
+def _reject_non_integer(text: str) -> Any:
+    """``parse_float`` hook for documents that must be canonical.
+
+    Canonical output never contains a fraction or an exponent. Accepting one
+    on the way back in would let ``1.5`` and ``"1.5"`` normalize to the same
+    string and therefore hash identically, hiding a type change.
+    """
+    raise StrictJSONError("NON_INTEGER_NUMBER", f"{text} is not an integer; canonical documents carry integers only")
+
+
+def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
+    """Parse strict JSON from text or UTF-8 bytes (a leading BOM is accepted).
+
+    Non-integer numbers are returned as ``Decimal``, or refused when
+    ``integers_only`` is set (use it to re-read documents this tool wrote in
+    canonical form, such as ledgers and receipts). Every failure is raised as
+    :class:`StrictJSONError`, never as a bare ``json``, ``Unicode`` or
+    recursion error, so callers can always produce a named diagnostic.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            text = bytes(data).decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise StrictJSONError("MALFORMED_JSON", f"not valid UTF-8 at byte {exc.start}") from exc
+    else:
+        text = data[1:] if data.startswith("\ufeff") else data
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_reject_non_integer if integers_only else Decimal,
+        )
+    except StrictJSONError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise StrictJSONError("MALFORMED_JSON", exc.msg, line=exc.lineno, column=exc.colno) from exc
+    except RecursionError as exc:
+        raise StrictJSONError("MALFORMED_JSON", "nesting is too deep") from exc
+    except ValueError as exc:  # e.g. integers beyond the interpreter's digit limit
+        raise StrictJSONError("MALFORMED_JSON", str(exc)) from exc

@@ -1,0 +1,26 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "synthetic-empty",
+  "inputs": [
+    {
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "format": "csv",
+      "required": true,
+      "row_key": ["sample_id"]
+    }
+  ],
+  "checks": [
+    {"id": "rows", "kind": "row_count", "version": "1", "required": true, "inputs": ["measurements"]},
+    {
+      "id": "columns",
+      "kind": "required_columns",
+      "version": "1",
+      "required": true,
+      "inputs": ["measurements"],
+      "params": {"columns": ["sample_id", "site", "value", "count"]}
+    },
+    {"id": "duplicates", "kind": "duplicate_rows", "version": "1", "required": true, "inputs": ["measurements"]}
+  ],
+  "corpus": {"access_class": "SYNTHETIC", "permissions": {}}
+}

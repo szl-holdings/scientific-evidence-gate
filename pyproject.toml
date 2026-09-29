@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scientific-evidence-gate"
+version = "0.1.0"
+description = "Local-only evidence gate: a passing check must emit enough evidence to prove it had the opportunity to fail."
+requires-python = ">=3.11"
+license = {text = "NOASSERTION"}
+dependencies = []
+
+[project.scripts]
+science-gate = "science_gate.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

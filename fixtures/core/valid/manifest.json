@@ -1,0 +1,118 @@
+{
+  "accepted_snapshot": "snapshots/accepted.json",
+  "checks": [
+    {
+      "id": "rows",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "row_count",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "columns",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "required_columns",
+      "params": {
+        "columns": [
+          "sample_id",
+          "site",
+          "value",
+          "count"
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "duplicates",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "duplicate_rows",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "snapshot",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "snapshot_completeness",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "values",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "value",
+        "expected": [
+          {
+            "key": "SYN-0001",
+            "value": "12.4"
+          },
+          {
+            "key": "SYN-0002",
+            "value": "0.1"
+          },
+          {
+            "key": "SYN-0004",
+            "value": "27.12"
+          }
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "counts",
+      "inputs": [
+        "measurements"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "count",
+        "expected": [
+          {
+            "key": "SYN-0001",
+            "value": "1234"
+          },
+          {
+            "key": "SYN-0006",
+            "value": "10,500"
+          }
+        ],
+        "thousands": ","
+      },
+      "required": true,
+      "version": "1"
+    }
+  ],
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  },
+  "inputs": [
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 6,
+      "format": "csv",
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "required": true,
+      "row_key": [
+        "sample_id"
+      ],
+      "sha256": "c39d0ce24317bc5d266b8317d2e8a45ab8d530f4ae8ed9eba70c67dbf01540e1"
+    }
+  ],
+  "run_label": "synthetic-starter",
+  "schema": "science-gate-manifest/v1"
+}
