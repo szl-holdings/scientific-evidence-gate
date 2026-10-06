@@ -1,0 +1,138 @@
+{
+  "accepted_snapshot": "snapshots/accepted.json",
+  "checks": [
+    {
+      "id": "rows",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "row_count",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "columns",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "required_columns",
+      "params": {
+        "columns": [
+          "plot_id",
+          "habitat",
+          "canopy_cover_pct",
+          "stem_count"
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "duplicates",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "duplicate_rows",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "snapshot",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "snapshot_completeness",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "canopy",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "canopy_cover_pct",
+        "expected": [
+          {
+            "key": "PLOT-SYN-01",
+            "value": "41.2"
+          },
+          {
+            "key": "PLOT-SYN-03",
+            "value": "62.05"
+          },
+          {
+            "key": "PLOT-SYN-06",
+            "value": "69"
+          }
+        ]
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "stems",
+      "inputs": [
+        "plots"
+      ],
+      "kind": "numeric_agreement",
+      "params": {
+        "column": "stem_count",
+        "expected": [
+          {
+            "key": "PLOT-SYN-02",
+            "value": "987"
+          },
+          {
+            "key": "PLOT-SYN-05",
+            "value": "3,042"
+          }
+        ],
+        "thousands": ","
+      },
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "reviewers",
+      "kind": "reviewer_protocol",
+      "required": true,
+      "version": "1"
+    },
+    {
+      "id": "timing",
+      "kind": "time_source",
+      "required": true,
+      "version": "1"
+    }
+  ],
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  },
+  "inputs": [
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 6,
+      "format": "csv",
+      "id": "plots",
+      "path": "data/plots.csv",
+      "required": true,
+      "row_key": [
+        "plot_id"
+      ],
+      "sha256": "41a4043095563b45a7e760e4f2633ef175005931f0df76ef4dbdd83af74d7d92"
+    }
+  ],
+  "reviews": {
+    "required_reviewers": [
+      "reviewer-a",
+      "reviewer-b"
+    ],
+    "verdicts": "reviews/verdicts.json"
+  },
+  "run_label": "example-field-survey",
+  "schema": "science-gate-manifest/v1",
+  "time_sources": "time/events.json"
+}

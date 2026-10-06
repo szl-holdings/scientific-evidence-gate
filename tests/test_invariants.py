@@ -195,6 +195,12 @@ class PassContractTests(InvariantTestCase):
         )
         self.assertViolated("pass_requires_examined_rows", "examined no rows", checks=())
 
+    def test_the_examined_rows_detail_says_it_is_a_per_check_total(self) -> None:
+        # run.json's rows_examined counts distinct rows; this sum counts a row once per check that read it.
+        result = self.judge("pass_requires_examined_rows")
+        self.assertIs(result.holds, True)
+        self.assertTrue(result.detail.startswith("per-check rows examined total="), result.detail)
+
     def test_pass_is_impossible_when_a_required_checker_did_not_run(self) -> None:
         # Requirement 4.
         skipped = self.replaced_check(

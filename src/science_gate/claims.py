@@ -57,6 +57,7 @@ __all__ = [
     "NOT_CLAIMS_KEYS",
     "NOT_CLAIM_TOKEN_KEYS",
     "STORED_OUTPUT_ROLE",
+    "preload_stored_outputs",
     "DECLARED",
     "MISSING",
     "DIGEST_MATCHES",
@@ -519,6 +520,27 @@ def parse_registry(document: Any) -> Registry:
         claims.append(claim)
     not_claims, digest = _parse_not_claims(top.get("not_claims"))
     return Registry(tuple(claims), not_claims, digest)
+
+
+def preload_stored_outputs(ctx: CheckContext) -> None:
+    """Read every stored output the registry names, before any check runs (``verifier.PRELOADS``).
+
+    Reading them up front puts their digests into the run id and in front of
+    ``summary_consistency``, which then reports an unpinned stored output as
+    a blind spot. The claim_registry check later reads the same bytes from
+    the context. An unusable registry reads nothing here: the check reports
+    why.
+    """
+    registry_document = ctx.role_document("claims")
+    if not registry_document.loaded:
+        return
+    try:
+        registry = parse_registry(registry_document.content)
+    except RegistryFormatError:
+        return
+    for claim in registry.claims:
+        if claim.stored_output.path is not None:
+            ctx.read_document(claim.stored_output.path, role=STORED_OUTPUT_ROLE, parse="bytes")
 
 
 # ---------------------------------------------------------------------------

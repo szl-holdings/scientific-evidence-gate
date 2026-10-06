@@ -1,0 +1,7 @@
+plot_id,habitat,canopy_cover_pct,stem_count
+PLOT-SYN-01,wetland-invented,41.25,"1,204"
+PLOT-SYN-02,wetland-invented,38.70,987
+PLOT-SYN-03,upland-invented,62.05,"2,310"
+PLOT-SYN-04,upland-invented,57.5,"1,876"
+PLOT-SYN-05,riparian-invented,73.35,"3,042"
+PLOT-SYN-06,riparian-invented,69.00,"2,755"

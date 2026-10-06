@@ -1,0 +1,15 @@
+{
+  "schema": "science-gate-reviews/v1",
+  "verdicts": [
+    {
+      "recorded_at": "2026-04-02T09:00:00Z",
+      "reviewer": "reviewer-a",
+      "verdict": "ACCEPT"
+    },
+    {
+      "recorded_at": "2026-04-03T15:30:00Z",
+      "reviewer": "reviewer-b",
+      "verdict": "ACCEPT"
+    }
+  ]
+}

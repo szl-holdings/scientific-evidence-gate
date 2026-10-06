@@ -1,0 +1,23 @@
+{
+  "events": [
+    {
+      "id": "visit-01",
+      "local_time": "2026-03-12T07:45:00",
+      "source": "synthetic field log",
+      "timezone": "-05:00",
+      "utc": "2026-03-12T12:45:00Z"
+    },
+    {
+      "id": "visit-02",
+      "local_time": "2026-03-19T16:10:00",
+      "source": "synthetic field log",
+      "timezone": "+05:30",
+      "utc": "2026-03-19T10:40:00Z"
+    }
+  ],
+  "schema": "science-gate-time-sources/v1",
+  "window": {
+    "end": "2026-03-31T23:59:59Z",
+    "start": "2026-03-01T00:00:00Z"
+  }
+}

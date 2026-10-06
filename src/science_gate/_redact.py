@@ -18,15 +18,23 @@ Two detectors are combined:
 
 Redaction is deliberately over-eager. A false positive hides one value from a
 report; a false negative leaks a credential.
+
+Scanning the environment is the expensive part: one verify redacts thousands
+of strings. :func:`redaction_scope` reads the environment once for a whole
+operation (``verify`` and the other commands enter one), and :func:`redact`
+reads it once per call. Outside a scope, :func:`redact_text` reads it on
+every call, so a secret set a moment ago is never missed.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
-from typing import Any, Mapping
+from contextvars import ContextVar
+from typing import Any, Iterator, Mapping, Sequence
 
-__all__ = ["REDACTED", "redact_text", "redact"]
+__all__ = ["REDACTED", "redact_text", "redact", "redaction_scope"]
 
 REDACTED = "[REDACTED]"
 
@@ -72,9 +80,33 @@ def _environment_secrets() -> list[str]:
     return sorted(values, key=lambda value: (-len(value), value))
 
 
+#: The environment secrets of the innermost active :func:`redaction_scope`, or None outside any scope.
+_SCOPED_SECRETS: ContextVar[tuple[str, ...] | None] = ContextVar("science_gate_scoped_secrets", default=None)
+
+
+@contextlib.contextmanager
+def redaction_scope() -> Iterator[None]:
+    """Read the secret-named environment variables once, for everything redacted inside the block.
+
+    An operation that starts after a secret is set sees it; the snapshot is
+    only a cache of what the environment held when the operation began.
+    Scopes nest: an inner scope takes a fresh snapshot.
+    """
+    token = _SCOPED_SECRETS.set(tuple(_environment_secrets()))
+    try:
+        yield
+    finally:
+        _SCOPED_SECRETS.reset(token)
+
+
+def _secrets() -> Sequence[str]:
+    scoped = _SCOPED_SECRETS.get()
+    return _environment_secrets() if scoped is None else scoped
+
+
 def redact_text(text: str) -> str:
     """Return ``text`` with every secret-looking value replaced by :data:`REDACTED`."""
-    for secret in _environment_secrets():
+    for secret in _secrets():
         text = text.replace(secret, REDACTED)
     for pattern in _SHAPES:
         text = pattern.sub(REDACTED, text)
@@ -85,14 +117,22 @@ def redact(value: Any) -> Any:
     """Recursively redact the strings inside a JSON-like value.
 
     Mapping keys are redacted too: a column name or record key is quoted text
-    like any other. Non-string leaves are returned unchanged.
+    like any other. Non-string leaves are returned unchanged. The environment
+    is read once per call, not once per string.
     """
+    if _SCOPED_SECRETS.get() is None:
+        with redaction_scope():
+            return _redact_value(value)
+    return _redact_value(value)
+
+
+def _redact_value(value: Any) -> Any:
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, Mapping):
-        return {redact_text(key) if isinstance(key, str) else key: redact(item) for key, item in value.items()}
+        return {redact_text(key) if isinstance(key, str) else key: _redact_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [redact(item) for item in value]
+        return [_redact_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
-        return frozenset(redact(item) for item in value)
+        return frozenset(_redact_value(item) for item in value)
     return value

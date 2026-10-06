@@ -1008,7 +1008,7 @@ class CommandTests(MutationTestCase):
         self.assertEqual(code, 1)
         self.assertTrue(lines[0].startswith("FAIL (INVALID_BASELINE) mut-"), lines[0])
         self.assertIn(INVALID_BASELINE_MESSAGE, lines[0])
-        expected = [output / "mutation-report.json", output / "mutation-report.md"]
+        expected = [output / "mutation-report.json", output / "mutation-report.md", output / "mutation-report.html"]
         self.assertEqual([Path(line) for line in lines[1:]], expected)
         document = json.loads((output / "mutation-report.json").read_text(encoding="utf-8"))
         self.assertEqual(document["reason"], "INVALID_BASELINE")
@@ -1063,15 +1063,37 @@ class CommandTests(MutationTestCase):
         report_id = first.stdout.split()[2].rstrip(":")
         default_dir = first_cwd / DEFAULT_RUNS_DIR / report_id
         written = [Path(line) for line in first.stdout.splitlines()[1:]]
-        self.assertEqual(written, [default_dir / "mutation-report.json", default_dir / "mutation-report.md"])
-        for name in ("mutation-report.json", "mutation-report.md"):
+        names = ("mutation-report.json", "mutation-report.md", "mutation-report.html")
+        self.assertEqual(written, [default_dir / name for name in names])
+        for name in names:
             with self.subTest(file=name):
                 self.assertEqual((default_dir / name).read_bytes(), (self.tmp / "second" / name).read_bytes())
 
-    def test_write_mutation_report_writes_both_files(self) -> None:
+    def test_write_mutation_report_writes_json_markdown_and_the_page(self) -> None:
         paths = write_mutation_report(invalid_report(), self.tmp / "direct")
-        self.assertEqual([path.name for path in paths], ["mutation-report.json", "mutation-report.md"])
+        names = ["mutation-report.json", "mutation-report.md", "mutation-report.html"]
+        self.assertEqual([path.name for path in paths], names)
         self.assertTrue(all(path.is_file() for path in paths))
+        page = paths[2].read_text(encoding="utf-8")
+        self.assertIn(INVALID_BASELINE_MESSAGE, page, "an invalid baseline shows no figure, only the reason")
+
+    def test_the_page_shows_the_baseline_run_and_every_mutation(self) -> None:
+        report = mutate(self.rich / "manifest-core.json", operators=["M03_deleted_accepted_row"])
+        self.assertEqual(report.baseline_run["run_id"], report.baseline.run_id)
+        self.assertEqual(report.baseline_run["status"], "PASS")
+        self.assertNotIn("science-gate-mutate-", json.dumps(report.baseline_run), "no temporary path is shown")
+        (_, _, page_path) = write_mutation_report(report, self.tmp / "page")
+        page = page_path.read_text(encoding="utf-8")
+        self.assertIn(report.baseline.run_id, page)
+        for record in report.mutations:
+            with self.subTest(mutation=record.mutation_id):
+                self.assertIn(record.mutation_id, page)
+
+    def test_without_a_renderer_only_the_json_and_markdown_are_written(self) -> None:
+        with mock.patch.object(mutations, "render_html", return_value=(None, "renderer unavailable")):
+            paths = write_mutation_report(invalid_report(), self.tmp / "plain")
+        self.assertEqual([path.name for path in paths], ["mutation-report.json", "mutation-report.md"])
+        self.assertFalse((self.tmp / "plain" / "mutation-report.html").exists())
 
 
 # ---------------------------------------------------------------------------

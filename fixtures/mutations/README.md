@@ -7,13 +7,18 @@ anything scientific.
 
 ## `rich/`
 
-One evidence tree with two manifests. Both verify as PASS, which is the
-accepting baseline that mutation testing (ARCHITECTURE.md section 10) requires.
+One evidence tree with three manifests. All three verify as PASS, which is
+the accepting baseline that mutation testing (ARCHITECTURE.md section 10)
+requires.
 
 | manifest | checks | operators with a target |
 |---|---|---|
 | `manifest-core.json` | the verifier's own kinds: row count, columns, duplicates, snapshot, two numeric agreements, reviewers, time source, summary | 15 (every operator except M08, M09, M13, M18, M19) |
 | `manifest.json` | the same, plus `verification_log`, `citation_resolver`, `citation_metadata`, `claim_registry` and `dependency_currency` | all 20 |
+| `manifest-blind-spot.json` | `manifest-core.json` without the `reviewer_protocol` check | 15, of which M05 and M06 escape as blind spots: the pinned summary turns those mutants FAIL, but the detector each expects never runs |
+
+`science-gate demo` runs the mutation suite on `manifest-blind-spot.json`,
+so its report shows detections and blind spots side by side.
 
 What the tree holds:
 

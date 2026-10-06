@@ -45,6 +45,7 @@ import html
 import json
 import math
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -139,14 +140,16 @@ _MUTATION_STYLE = {
     SKIPPED: ("muted", "dash"),
     NOT_APPLICABLE_MUTATION: ("muted", "dash"),
 }
-_MUTATION_COUNT_KEYS = (
-    "applicable_mutations",
-    "executed_mutations",
-    "detected_mutations",
-    "escaped_mutations",
-    "skipped_mutations",
-    "not_applicable_mutations",
+#: The six section 10 counts, in the order the page shows them, with their labels.
+_MUTATION_COUNTS = (
+    ("applicable_mutations", "Applicable"),
+    ("executed_mutations", "Executed"),
+    ("detected_mutations", "Detected"),
+    ("escaped_mutations", "Blind spots"),
+    ("skipped_mutations", "Skipped"),
+    ("not_applicable_mutations", "Not applicable"),
 )
+_MUTATION_COUNT_KEYS = tuple(key for key, _ in _MUTATION_COUNTS)
 
 _FUNNEL = ("expected", "discovered", "opened", "parsed", "examined")
 _DISPOSITIONS = ("admitted", "excluded", "deferred", "unresolved", "failed")
@@ -178,6 +181,8 @@ _MAX_INPUT_ROWS = 40
 _MAX_RING_SEGMENTS = 60
 _MAX_CHAIN_LINKS = 40
 _MAX_STARS_PER_GROUP = 150
+#: The masthead names at most this many decisive findings; the Findings section lists all of them.
+_WHY_LIMIT = 3
 #: invocation positions are derived by hashing every seq up to ledger_length.
 #: A tampered length must not make rendering slow.
 _MAX_DERIVED_SEQ = 50_000
@@ -266,9 +271,24 @@ _UNSAFE = re.compile(
 )
 
 
+#: Cleaned text by display string, for the render in progress (None outside one).
+#: ``redact_text`` re-reads the whole environment on every call, and a page shows
+#: the same few hundred strings many times over. Cleaning depends only on the
+#: string and the environment, which a single render does not see change, so a
+#: memo scoped to one :func:`render` call cannot serve a stale redaction.
+_CLEANED: ContextVar[dict[str, str] | None] = ContextVar("science_gate_html_cleaned", default=None)
+
+
 def _clean(value: Any) -> str:
     """Display text, redacted, with every character that can hide or reorder text made visible."""
-    return _UNSAFE.sub("\ufffd", redact_text(_plain(value)))
+    text = _plain(value)
+    memo = _CLEANED.get()
+    cleaned = memo.get(text) if memo is not None else None
+    if cleaned is None:
+        cleaned = _UNSAFE.sub("\ufffd", redact_text(text))
+        if memo is not None:
+            memo[text] = cleaned
+    return cleaned
 
 
 def _e(value: Any) -> str:
@@ -315,9 +335,7 @@ class _Plane:
 
     @property
     def light(self) -> float:
-        """Mean facet weight, from 0 (dark) to 1 (every facet lit)."""
-        if not self.facets:
-            return 0.0
+        """Mean facet weight, from 0 (dark) to 1 (every facet lit). A plane always has its full facet list."""
         return sum(_FACET_WEIGHT[facet.state] for facet in self.facets) / len(self.facets)
 
     @property
@@ -800,9 +818,80 @@ def _ledger_view(doc: Mapping[str, Any]) -> _LedgerView:
     )
 
 
+FIRED, NOT_FIRED, FIRING_NOT_RECORDED, NOT_EXECUTED = "FIRED", "NOT FIRED", "NOT RECORDED", "NOT EXECUTED"
+_FIRING_STYLE = {
+    FIRED: ("good", "check"),
+    NOT_FIRED: ("critical", "cross"),
+    FIRING_NOT_RECORDED: ("warning", "question"),
+    NOT_EXECUTED: ("muted", "dash"),
+}
+
+
+@dataclass(frozen=True)
+class _DetectorRule:
+    """What counts as the expected detector firing, as the mutation record itself states it (section 10).
+
+    A fired finding matches when it comes from ``label``, has one of
+    ``statuses``, and, when ``signals`` is non-empty, raises one of them as
+    its reason or a failure mode. A record that does not state statuses or
+    signals is matched on the label alone, which is the most it allows.
+    """
+
+    label: Any
+    statuses: tuple[str, ...]
+    signals: tuple[str, ...]
+
+    def matches(self, fired: Any) -> bool:
+        label = _str(self.label)
+        if label is None:
+            return False
+        if not isinstance(fired, dict):
+            return _is(fired, label)
+        if not _is(fired.get("detector"), label):
+            return False
+        status = fired.get("status")
+        if self.statuses and not (isinstance(status, str) and status in self.statuses):
+            return False
+        raised = [fired.get("reason"), *_strs(fired.get("failure_modes"))]
+        return not self.signals or any(isinstance(signal, str) and signal in self.signals for signal in raised)
+
+
+def _detector_rule(record: Mapping[str, Any]) -> _DetectorRule:
+    """The record's detector rule: ``expected_result`` states it in full; ``expected_detector`` names it."""
+    expected = _dict(record.get("expected_result"))
+    label = expected.get("detector") if _str(expected.get("detector")) else record.get("expected_detector")
+    return _DetectorRule(
+        label, tuple(_strs(expected.get("detector_statuses"))), tuple(_strs(expected.get("detector_signals")))
+    )
+
+
+def _actual_status(record: Mapping[str, Any]) -> str | None:
+    """The status the mutant's verify recorded: ``actual_result.status``, or the result itself when it is a word."""
+    actual = record.get("actual_result")
+    value = actual.get("status") if isinstance(actual, dict) else actual
+    return value if isinstance(value, str) else None
+
+
+def _firing(record: Mapping[str, Any], rule: _DetectorRule) -> str:
+    """Whether the record's own evidence shows its expected detector firing.
+
+    Only an executed mutation can fire anything. A skipped or not-applicable
+    record is NOT EXECUTED even if it carries a fired list, which it should
+    not; that list is still shown as recorded.
+    """
+    if not _is(record.get("execution_state"), "CHECKED") or record.get("applicable") is False:
+        return NOT_EXECUTED
+    fired = record.get("detecting_invariants_fired")
+    if not isinstance(fired, list):
+        return FIRING_NOT_RECORDED
+    return FIRED if any(rule.matches(item) for item in fired) else NOT_FIRED
+
+
 @dataclass(frozen=True)
 class _Mutation:
     record: Mapping[str, Any]
+    rule: _DetectorRule
+    firing: str
     group: str
     note: str | None
 
@@ -818,12 +907,17 @@ class _Mutation:
         return match.group(0) if match else text[:6]
 
 
-def _classify_mutation(record: Mapping[str, Any]) -> tuple[str, str | None]:
-    """Group one mutation record. A detection counts only for a mutation that executed.
+def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str | None]:
+    """Group one mutation record. A detection counts only when the record's own evidence supports it.
 
     A mutation that was skipped, not applicable, or has no recorded execution
     state is never a detection, whatever its ``detected`` field says
-    (requirement 27). The disagreement is reported as a note.
+    (requirement 27). An executed mutation is a detection only when the
+    record says so *and* its recorded evidence agrees: the actual status is
+    not PASS and the expected detector is among the fired detectors. A claim
+    the evidence contradicts is grouped UNRESOLVED. A blind spot the evidence
+    seems to contradict stays a blind spot, because the page never upgrades
+    a result. Every disagreement is reported as a note.
     """
     state, detected, blind = record.get("execution_state"), record.get("detected"), record.get("blind_spot")
     claims = " but the record says detected=true; it is not counted as a detection" if detected is True else ""
@@ -833,11 +927,29 @@ def _classify_mutation(record: Mapping[str, Any]) -> tuple[str, str | None]:
         return SKIPPED, ("skipped" + claims) if claims else None
     if not _is(state, "CHECKED"):
         return UNRESOLVED, f"execution state {_plain(state)} is not CHECKED" + claims
+    actual = _actual_status(record)
     if detected is True:
+        if _is(actual, "PASS"):
+            return UNRESOLVED, "the actual result is PASS" + claims
+        if firing == NOT_FIRED:
+            return UNRESOLVED, "the expected detector is not among the recorded fired detectors" + claims
+        if firing == FIRING_NOT_RECORDED:
+            return UNRESOLVED, "no fired detector is recorded" + claims
         return DETECTED, "the record also says blind_spot=true" if blind is True else None
     if detected is False:
-        return BLIND_SPOT, "the record says blind_spot=false although nothing detected it" if blind is False else None
+        notes = ["the record says blind_spot=false although nothing detected it"] if blind is False else []
+        if firing == FIRED and actual is not None and actual != "PASS":
+            notes.append(
+                "its recorded evidence shows the expected detector firing on a non-PASS result; it stays a blind spot"
+            )
+        return BLIND_SPOT, "; ".join(notes) or None
     return UNRESOLVED, "executed, but no detection result is recorded"
+
+
+def _mutation(record: Mapping[str, Any]) -> _Mutation:
+    rule = _detector_rule(record)
+    firing = _firing(record, rule)
+    return _Mutation(record, rule, firing, *_classify_mutation(record, firing))
 
 
 @dataclass(frozen=True)
@@ -847,7 +959,8 @@ class _MutationView:
     baseline_valid: bool
     counts: Mapping[str, int | None]
     tallies: Mapping[str, int]
-    sensitivity: tuple[Any, Any] | None
+    #: ``(fraction, decimal, rounding)`` as the report states them, shown only when the records agree.
+    sensitivity: tuple[Any, Any, Any] | None
     discrepancies: tuple[str, ...]
 
     def group(self, name: str) -> list[_Mutation]:
@@ -863,6 +976,7 @@ def _tally(mutations: Sequence[_Mutation]) -> dict[str, int]:
     """
     groups = [item.group for item in mutations]
     return {
+        "applicable_mutations": len(groups) - groups.count(NOT_APPLICABLE_MUTATION),
         "executed_mutations": sum(
             1
             for item in mutations
@@ -879,14 +993,16 @@ def _mutation_view(report: Mapping[str, Any]) -> _MutationView:
     """Read a mutation report (section 10) without trusting its arithmetic.
 
     The baseline is valid only when the report records a baseline status of
-    PASS and nothing in it names INVALID_BASELINE. With no valid baseline, or
-    with no executed mutation, no sensitivity figure is shown, even if the
-    report carries one. Counts are re-tallied from the records, and any
-    disagreement with the report's own counts is listed.
+    PASS and nothing in it names INVALID_BASELINE. Counts are re-tallied from
+    the records, and any disagreement with the report's own counts or status
+    is listed. A sensitivity figure is shown only when the baseline is valid,
+    at least one mutation executed, and the figure the report carries is the
+    one its records give. Otherwise none is shown, even if the report
+    carries one.
     """
     mutations = tuple(
         sorted(
-            (_Mutation(record, *_classify_mutation(record)) for record in _dicts(report.get("mutations"))),
+            (_mutation(record) for record in _dicts(report.get("mutations"))),
             key=lambda item: (_plain(item.mutation_id), _plain(item.record.get("description"))),
         )
     )
@@ -901,22 +1017,36 @@ def _mutation_view(report: Mapping[str, Any]) -> _MutationView:
     counts = {key: _int(report.get(key)) for key in _MUTATION_COUNT_KEYS}
     tallies = _tally(mutations)
     figure = _dict(report.get("sensitivity"))
-    fraction, decimal = figure.get("fraction"), figure.get("decimal")
     # Anything non-null under "sensitivity" is a figure the report carries, even a malformed one.
     carries_figure = report.get("sensitivity") is not None
+    sensitivity = None
     if valid:
         discrepancies = [
             f"the report states {key} {_count(counts[key])}, but its records give {tally}"
             for key, tally in tallies.items()
             if key in present and counts[key] != tally
         ]
+        unresolved = sum(1 for item in mutations if item.group == UNRESOLVED)
+        if _is(report.get("status"), "PASS") and (tallies["escaped_mutations"] or unresolved):
+            discrepancies.append(
+                f"the report states PASS, but its records include {tallies['escaped_mutations']} blind spot(s) "
+                f"and {unresolved} unresolved mutation(s)"
+            )
+        executed, detected = tallies["executed_mutations"], tallies["detected_mutations"]
+        if carries_figure and executed > 0:
+            if _is(figure.get("fraction"), f"{detected}/{executed}"):
+                sensitivity = (figure["fraction"], figure.get("decimal"), figure.get("decimal_rounding"))
+            else:
+                discrepancies.append(
+                    f"the report states sensitivity {_plain(figure.get('fraction'))}, but its records give "
+                    f"{detected}/{executed}; no figure is shown"
+                )
     else:
         discrepancies = (
             [f"the report carries {', '.join(present)} although its baseline is invalid; not shown"] if present else []
         )
         if carries_figure:
             discrepancies.append("the report carries a sensitivity figure although its baseline is invalid; not shown")
-    sensitivity = (fraction, decimal) if valid and tallies["executed_mutations"] > 0 and carries_figure else None
     return _MutationView(mutations, status, valid, counts, tallies, sensitivity, tuple(discrepancies))
 
 
@@ -975,22 +1105,18 @@ def _glyph_path(kind: str, cx: float, cy: float, size: float) -> str:
 
 
 def _glyph(kind: str | None, cx: float, cy: float, size: float, *, on_fill: bool) -> str:
-    if kind is None or kind in ("half", "hollow"):
+    """A drawn glyph, or nothing for a kind that has no stroke shape (the legend-only ``half`` and ``hollow``)."""
+    path = _glyph_path(kind, cx, cy, size) if kind is not None else ""
+    if not path:
         return ""
     css = "glyph glyph-on" if on_fill else "glyph glyph-tone"
     width = max(1.3, size * 0.17)
-    return f'<path class="{css}" stroke-width="{_n(width)}" d="{_glyph_path(kind, cx, cy, size)}"/>'
+    return f'<path class="{css}" stroke-width="{_n(width)}" d="{path}"/>'
 
 
 def _marker(tone: str, glyph: str | None, cx: float, cy: float, r: float, *, filled: bool = True) -> str:
-    """A status disc: filled with the tone, or hollow, or half-filled; the glyph repeats the meaning."""
-    if glyph == "half":
-        half = f"M{_n(cx)} {_n(cy - r)}A{_n(r)} {_n(r)} 0 0 0 {_n(cx)} {_n(cy + r)}Z"
-        return (
-            f'<g class="t-{tone}"><circle class="hollow" cx="{_n(cx)}" cy="{_n(cy)}" r="{_n(r)}"/>'
-            f'<path class="fill-tone" d="{half}"/></g>'
-        )
-    if not filled or glyph == "hollow":
+    """A status disc, filled with the tone or hollow; the glyph repeats the meaning, so color is never alone."""
+    if not filled:
         return (
             f'<g class="t-{tone}"><circle class="hollow" cx="{_n(cx)}" cy="{_n(cy)}" r="{_n(r)}"/>'
             f"{_glyph(glyph, cx, cy, r * 1.1, on_fill=False)}</g>"
@@ -1352,12 +1478,11 @@ def _polar(radius: float, angle: float) -> str:
 
 
 def _ring_svg(rows: Sequence[_InvariantRow]) -> str:
+    """One segment per invariant. ``rows`` is never empty: every contract invariant has a row, recorded or not."""
     size, center, outer, inner = 2 * _RING_CENTER, _RING_CENTER, 118.0, 92.0
     shown = rows[:_MAX_RING_SEGMENTS]
     parts = []
-    if not shown:
-        parts.append(f'<circle class="ring-empty" cx="{_n(center)}" cy="{_n(center)}" r="{_n((outer + inner) / 2)}"/>')
-    step = 2 * math.pi / max(len(shown), 1)
+    step = 2 * math.pi / len(shown)
     gap = min(3.0 / ((outer + inner) / 2), step * 0.25)
     for index, row in enumerate(shown):
         a0 = -math.pi / 2 + index * step + gap / 2
@@ -1588,6 +1713,42 @@ def _hash(value: Any) -> str:
     return f'<code class="wrap">{_e(value)}</code>'
 
 
+def _wbr(value: Any, separators: str = "_:") -> str:
+    """Escaped text with a ``<wbr>`` break opportunity after each separator.
+
+    The break is inserted into the already-escaped text. No separator used
+    here is ever part of an HTML entity, so no entity can be split.
+    """
+    text = _e(value)
+    for separator in separators:
+        text = text.replace(separator, separator + "<wbr>")
+    return text
+
+
+def _breakable(value: Any, separators: str = "_:") -> str:
+    """An identifier that may wrap after ``_`` or ``:``, so ``invariant:ledger_chain_intact`` stays readable.
+
+    It wraps only there, never inside a word.
+    """
+    return f'<code class="brk">{_wbr(value, separators)}</code>'
+
+
+def _path(value: Any) -> str:
+    """A relative path that wraps after a separator, so ``data/measurements.csv`` never breaks mid-name."""
+    return _breakable(value, "/\\_-")
+
+
+def _sub(content: str, *, words: bool = False) -> str:
+    """A secondary line inside a table cell; ``content`` must already be escaped.
+
+    A line may break anywhere, because diagnostics quote ids with no spaces.
+    ``words`` keeps words whole instead, for a line such as an evidence digest
+    whose short hash must not be split.
+    """
+    css = "cell-sub words" if words else "cell-sub"
+    return f'<div class="{css}">{content}</div>'
+
+
 def _chips(values: Any) -> str:
     items = values if isinstance(values, list) else []
     if not items:
@@ -1596,16 +1757,29 @@ def _chips(values: Any) -> str:
 
 
 def _table(
-    caption: str, headers: Sequence[str], rows: Sequence[Sequence[str]], *, equivalent_of: str, empty: str
+    caption: str,
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    *,
+    equivalent_of: str | None,
+    empty: str,
+    css: str = "",
 ) -> str:
-    """A table of already-escaped cells, marked as the text equivalent of one figure."""
+    """A table of already-escaped cells.
+
+    ``equivalent_of`` names the figure the table is the text equivalent of;
+    None marks a table that stands on its own. ``css`` is an extra class
+    from this module's own constants, never document text.
+    """
     head = "".join(f'<th scope="col">{_e(header)}</th>' for header in headers)
     if rows:
         body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows)
     else:
         body = f'<tr><td colspan="{len(headers)}" class="muted">{_e(empty)}</td></tr>'
+    marker = f' data-equivalent-of="{equivalent_of}"' if equivalent_of is not None else ""
+    classes = f"table-wrap {css}" if css else "table-wrap"
     return (
-        f'<div class="table-wrap" data-equivalent-of="{equivalent_of}" role="region" tabindex="0" '
+        f'<div class="{classes}"{marker} role="region" tabindex="0" '
         f'aria-label="{_e(caption)}"><table><caption>{_e(caption)}</caption>'
         f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
     )
@@ -1664,6 +1838,38 @@ def _stat(label: str, value: str, note: str, *, known: bool) -> str:
     )
 
 
+def _why(doc: Mapping[str, Any]) -> str:
+    """The recorded grounds for a status other than PASS, so the first screen says why and not only what.
+
+    The grounds are the findings recorded with the displayed status, in the
+    order the decision weighed them. A status with no such finding is said to
+    be unexplained rather than left blank, because a verdict without grounds
+    is itself a defect worth seeing. A failed re-verification is explained by
+    its own banner instead: the recorded findings belong to the status it
+    rejected, so listing them here would explain the wrong verdict.
+    """
+    status = doc.get("status")
+    if not isinstance(status, str) or status not in _STATUS_STYLE or status == "PASS":
+        return ""
+    reverification = doc.get("reverification")
+    if isinstance(reverification, dict) and reverification.get("ok") is not True:
+        return ""
+    grounds = [
+        f"<strong>{_e(finding.get('reason'))}</strong> {_code(finding.get('source'))} "
+        f'<span class="why-detail">{_e(finding.get("detail"))}</span>'
+        for finding in _dicts(doc.get("findings"))
+        if _is(finding.get("status"), status)
+    ]
+    if not grounds:
+        body = '<p class="why-none">No recorded finding carries this status, so nothing on record explains it.</p>'
+    else:
+        items = "".join(f"<li>{ground}</li>" for ground in grounds[:_WHY_LIMIT])
+        more = len(grounds) - _WHY_LIMIT
+        tail = f'<p class="why-more"><a href="#findings">{more} more under Findings</a></p>' if more > 0 else ""
+        body = f'<ol class="why-list">{items}</ol>{tail}'
+    return f'<div class="why"><p class="why-label">Why {_e(status)}</p>{body}</div>'
+
+
 def _masthead(
     doc: Mapping[str, Any], gaps: Sequence[str], invariants: Sequence[_InvariantRow], readable: bool
 ) -> str:
@@ -1686,7 +1892,7 @@ def _masthead(
             f'<p class="verdict-note">Re-verification failed, so the recorded status {_e(recorded)} '
             "is not trusted.</p>"
         )
-        reasons_label, modes_label = "Recorded reasons", "recorded failure modes"
+        reasons_label, modes_label = "Recorded reasons", "Recorded failure modes"
         stats_note = (
             '<p class="stats-note">The figures below are shown as recorded. Re-verification did not confirm '
             "them.</p>"
@@ -1742,8 +1948,9 @@ def _masthead(
         f'<div class="verdict t-{tone}" id="status">{_verdict_disc(tone, glyph)}'
         f'<div class="verdict-body"><div class="verdict-line"><span class="verdict-word">{_e(status)}</span>'
         f'<span class="verdict-reason">{_e(reason)} \u00b7 exit code {_e(_count(doc.get("exit_code")))}</span></div>'
-        f'<p class="verdict-chips">{reasons_label} {_chips(doc.get("reasons"))} \u00b7 {modes_label} '
-        f'{_chips(doc.get("failure_modes"))}</p>{qualifier}</div></div>'
+        f'<dl class="verdict-chips"><div><dt>{reasons_label}</dt><dd>{_chips(doc.get("reasons"))}</dd></div>'
+        f'<div><dt>{modes_label}</dt><dd>{_chips(doc.get("failure_modes"))}</dd></div></dl>'
+        f"{_why(doc)}{qualifier}</div></div>"
         f'{stats_note}<div class="stats">{stats}</div>'
         f'<dl class="meta">{rows_html}</dl>'
         '<p class="scope">This page shows integrity and the declared evaluation only. '
@@ -1895,21 +2102,31 @@ def _evidence_digest(check: Mapping[str, Any]) -> str:
 
 
 def _check_cells(row: _LatticeRow) -> list[str]:
-    """One row of the lattice's table. A declared check with no result keeps its row, with empty details."""
-    cells = [_code(row.check_id), _e(row.kind)] + [
+    """One row of the lattice's table. A declared check with no result keeps its row, with empty details.
+
+    Each secondary fact sits under the one it qualifies: the kind under the
+    check, the reason under the verdict, the evidence digest under the
+    invocation that recorded it, and the diagnostics under the failure
+    modes. Seven columns fit a laptop screen, so nothing needs a sideways
+    scroll to be seen.
+    """
+    expected, executed, terminal = (
         _pill(cell.label, cell.tone, cell.glyph) for cell in (row.expected, row.executed, row.terminal)
-    ]
+    )
+    check = _code(row.check_id) + _sub(_e(row.kind))
     if row.result is None:
-        return cells + ["", "", "", "", "", ""]
+        return [check, expected, executed, terminal, "", "", ""]
     result = row.result
     diagnostics = result.get("diagnostics")
-    return cells + [
-        _e(result.get("reason")),
-        _code(result.get("invocation_id")),
+    return [
+        check,
+        expected,
+        executed,
+        terminal + _sub(_wbr(result.get("reason"), "_"), words=True),
         _e(_count(result.get("rows_examined"))),
-        _chips(result.get("failure_modes")),
-        f'<span class="nowrap">{_e(_evidence_digest(result))}</span>',
-        "<br>".join(_e(text) for text in (diagnostics if isinstance(diagnostics, list) else [])),
+        _code(result.get("invocation_id")) + _sub(_e(_evidence_digest(result)), words=True),
+        _chips(result.get("failure_modes"))
+        + "".join(_sub(_e(text)) for text in (diagnostics if isinstance(diagnostics, list) else [])),
     ]
 
 
@@ -1956,11 +2173,12 @@ def _lattice_section(doc: Mapping[str, Any], lattice: Sequence[_LatticeRow]) -> 
     )
     table = _table(
         "Checks: expected, executed, terminal",
-        ("Check", "Kind", "Expected", "Executed", "Terminal", "Reason", "Invocation", "Rows examined",
-         "Failure modes", "Evidence", "Diagnostics"),
+        ("Check and kind", "Expected", "Executed", "Terminal and reason", "Rows examined", "Invocation and evidence",
+         "Failure modes and diagnostics"),
         [_check_cells(row) for row in lattice],
         equivalent_of="lattice",
         empty="no check was declared or recorded",
+        css="check-table",
     )
     tallies = [
         [_code(item.get("check_id")), _e(item.get("subject")), _e(_count(item.get("claimed"))),
@@ -1994,11 +2212,14 @@ def _invariant_section(invariants: Sequence[_InvariantRow]) -> str:
         "A hollow one is not applicable or has no recorded outcome.",
         "scroll-ring",
     )
+    # A list item laid out as a grid loses its marker, so the number the ring
+    # refers to is written out. The ``value`` keeps the list's own numbering.
     items = []
     for index, row in enumerate(invariants, start=1):
         tone, glyph = _INVARIANT_STYLE[row.state]
         items.append(
-            f'<li value="{index}">{_pill(row.state, tone, glyph)}<span class="facet-name">{_code(row.name)}</span>'
+            f'<li value="{index}"><span class="inv-num" aria-hidden="true">{index}</span>'
+            f'{_pill(row.state, tone, glyph)}<span class="facet-name">{_code(row.name)}</span>'
             f'<span class="plane-tag">{row.plane}</span><span class="facet-detail">{_e(row.detail)}</span></li>'
         )
     listing = f'<ol class="invariant-list" data-equivalent-of="invariants">{"".join(items)}</ol>'
@@ -2089,13 +2310,134 @@ def _result_text(value: Any) -> Any:
     return value
 
 
-def _fired_labels(value: Any) -> list[Any]:
-    """Fired detectors as ``detector STATUS`` labels; items of any other shape are kept as recorded."""
+def _fired_label(item: Any) -> Any:
+    """A fired detector as ``detector STATUS``; an item of any other shape is kept as recorded."""
+    if isinstance(item, dict) and "detector" in item:
+        return f"{_plain(item.get('detector'))} {_plain(item.get('status'))}"
+    return item
+
+
+def _fired_cell(item: _Mutation) -> str:
+    """The detectors a mutant's verify fired, with the expected one first and marked.
+
+    The expected detector is what decides a detection, so it is listed in
+    the open. The other findings are folded into a ``details`` element: they
+    stay in the page (and in its text) but do not bury the one that matters.
+    """
+    fired = item.record.get("detecting_invariants_fired")
+    if not isinstance(fired, list):
+        return '<span class="muted">none recorded</span>'
+    if not fired:
+        return '<span class="muted">none</span>'
+    hits = [entry for entry in fired if item.rule.matches(entry)]
+    others = [entry for entry in fired if not item.rule.matches(entry)]
+    parts = []
+    if hits:
+        rows = "".join(
+            f'<li class="hit">{_e(_fired_label(entry))}<em class="hit-tag">expected</em></li>' for entry in hits
+        )
+        parts.append(f'<ul class="fired">{rows}</ul>')
+    if others:
+        summary = (
+            f"{len(others)} other finding(s)" if hits else f"{len(others)} finding(s), none from the expected detector"
+        )
+        rows = "".join(f"<li>{_e(_fired_label(entry))}</li>" for entry in others)
+        parts.append(f'<details class="fired-more"><summary>{summary}</summary><ul class="fired">{rows}</ul></details>')
+    return "".join(parts)
+
+
+def _mutation_head(report: Mapping[str, Any]) -> str:
+    """The mutation report's own outcome and identity, as recorded.
+
+    The page does not re-decide the report's status. It shows it beside the
+    records, and :func:`_mutation_view` lists anything the records contradict.
+    """
+    manifest = _dict(report.get("manifest"))
+    operators, selected = report.get("operators"), report.get("selected_operators")
+    selection = (
+        f"{len(selected)} of {len(operators)} operators selected"
+        if isinstance(operators, list) and isinstance(selected, list)
+        else "operator selection not recorded"
+    )
+    facts = [
+        ("Report", _code(report.get("report_id"))),
+        ("Generated", _e(report.get("generated_at"))),
+        ("Manifest", f"{_code(manifest.get('file'))} sha256 {_hash(manifest.get('sha256'))}"),
+        ("Operators", _e(selection)),
+        ("Baseline run", _code(_dict(report.get("baseline")).get("run_id"))),
+    ]
+    rows = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
+    message = report.get("message")
+    return (
+        '<div class="mut-head"><p class="kicker">Mutation report, as recorded</p>'
+        f'<div class="mut-line">{_status_pill(report.get("status"))}<span class="mut-reason">'
+        f'{_e(report.get("reason"))} \u00b7 exit code {_e(_count(report.get("exit_code")))}</span></div>'
+        + (f'<p class="mut-message">{_e(message)}</p>' if message is not None else "")
+        + f'<dl class="meta compact">{rows}</dl></div>'
+    )
+
+
+def _mutation_figures(report: Mapping[str, Any], view: _MutationView) -> str:
+    """Baseline and sensitivity tiles, the six counts, and why a figure is missing when it is."""
+    baseline = _dict(report.get("baseline"))
+    reason = baseline.get("reason")
+    note = (f"{_e(reason)} \u00b7 " if reason is not None else "") + "must be PASS for any figure"
+    tiles = [_stat("Baseline", _e(view.baseline_status), note, known=view.baseline_valid)]
+    if not view.baseline_valid:
+        diagnostics = "".join(f"<li>{_e(text)}</li>" for text in _strs(baseline.get("diagnostics")))
+        return (
+            f'<div class="stats">{"".join(tiles)}</div>'
+            f'<div class="notice t-serious"><p>{_e(NO_SENSITIVITY_SENTENCE)}</p>'
+            + (f"<ul>{diagnostics}</ul>" if diagnostics else "")
+            + "</div>"
+        )
+    if view.sensitivity is not None:
+        fraction, decimal, rounding = view.sensitivity
+        detail = f"detected / executed = {_e(decimal)}" + (f" ({_e(rounding)})" if rounding is not None else "")
+        tiles.append(_stat("Sensitivity", _e(fraction), detail, known=True))
+    else:
+        why_none = "no figure: nothing executed, or none the records support"
+        tiles.append(_stat("Sensitivity", "none", why_none, known=False))
+    unknown = ' class="unknown"'
+    strip = "".join(
+        f"<div><dt>{_e(label)}</dt><dd{'' if view.counts[key] is not None else unknown}>"
+        f"{_e(_count(view.counts[key]))}</dd></div>"
+        for key, label in _MUTATION_COUNTS
+    )
+    return (
+        f'<div class="stats">{"".join(tiles)}</div>'
+        f'<dl class="count-strip">{strip}</dl>'
+        '<p class="small muted strip-note">Counts as the report states them. The page re-tallies them from the '
+        "records below and lists any disagreement.</p>"
+    )
+
+
+def _mutation_row(item: _Mutation) -> list[str]:
+    """One table row. Notes sit under the outcome they qualify, so a disagreement is read with the group.
+
+    Only a disagreement between the record and its own evidence is
+    highlighted. The record's diagnostics (such as why an operator did not
+    apply) are ordinary lines, so the highlight keeps its meaning.
+    """
+    record = item.record
+    target = record.get("target")
+    firing_tone, firing_glyph = _FIRING_STYLE[item.firing]
+    note = f'<div class="cell-note">{_e(item.note)}</div>' if item.note else ""
+    diagnostics = "".join(_sub(_e(text)) for text in _strs(record.get("diagnostics")))
+    # The recorded execution state is shown when it adds to the group: CHECKED
+    # under DETECTED does, a second SKIPPED under SKIPPED does not.
+    state = record.get("execution_state")
+    state_line = "" if _is(state, item.group) else _sub(_e(state))
     return [
-        f"{_plain(item.get('detector'))} {_plain(item.get('status'))}"
-        if isinstance(item, dict) and "detector" in item
-        else item
-        for item in (value if isinstance(value, list) else [])
+        _breakable(item.mutation_id)
+        + _sub(_e(record.get("description")))
+        # The target is a sentence ("delete the accepted record at line 7 ..."), not an identifier, so it wraps.
+        + (_sub(f"Target: {_e(target)}") if target is not None else ""),
+        _pill(item.group, *_MUTATION_STYLE[item.group]) + state_line + note + diagnostics,
+        _e(_result_text(record.get("expected_result"))),
+        _e(_result_text(record.get("actual_result"))),
+        _pill(item.firing, firing_tone, firing_glyph) + _sub(_breakable(item.rule.label)),
+        _fired_cell(item),
     ]
 
 
@@ -2109,31 +2451,6 @@ def _mutation_section(report: Any) -> str:
             "sensitivity figure is given.</p>",
         )
     view = _mutation_view(report)
-    tiles = [
-        _stat("Baseline", _e(view.baseline_status), "must be PASS for any figure", known=view.baseline_valid)
-    ]
-    if view.baseline_valid:
-        labels = {
-            "executed_mutations": "Executed",
-            "detected_mutations": "Detected",
-            "escaped_mutations": "Blind spots",
-            "skipped_mutations": "Skipped",
-            "not_applicable_mutations": "Not applicable",
-        }
-        tiles += [
-            _stat(label, _e(_count(view.counts[key])), "as the report states", known=view.counts[key] is not None)
-            for key, label in labels.items()
-        ]
-        if view.sensitivity is not None:
-            fraction, decimal = view.sensitivity
-            tiles.append(_stat("Sensitivity", _e(fraction), f"detected / executed = {_e(decimal)}", known=True))
-        else:
-            tiles.append(
-                _stat("Sensitivity", "none", "no figure: nothing executed or none recorded", known=False)
-            )
-        notice = ""
-    else:
-        notice = f'<p class="notice t-serious">{_e(NO_SENSITIVITY_SENTENCE)}</p>'
     discrepancies = "".join(f"<li>{_e(text)}</li>" for text in view.discrepancies)
     discrepancy_html = (
         f'<div class="notice t-warning"><p>The mutation report is inconsistent with its own records:</p>'
@@ -2153,37 +2470,41 @@ def _mutation_section(report: Any) -> str:
         if view.mutations
         else ""
     )
-    rows = [
-        [
-            _code(item.mutation_id),
-            _pill(item.group, *_MUTATION_STYLE[item.group]),
-            _e(item.record.get("description")),
-            _e(item.record.get("execution_state")),
-            _e(item.record.get("expected_detector")),
-            _chips(_fired_labels(item.record.get("detecting_invariants_fired"))),
-            _e(_result_text(item.record.get("expected_result"))),
-            _e(_result_text(item.record.get("actual_result"))),
-            "; ".join(_e(text) for text in ([item.note] if item.note else []) + _strs(item.record.get("diagnostics"))),
-        ]
-        for item in view.mutations
-    ]
     table = _table(
         "Mutations",
-        ("Mutation", "Group", "Description", "Execution", "Expected detector", "Detectors fired",
-         "Expected result", "Actual result", "Notes"),
-        rows,
+        ("Mutation", "Outcome and notes", "Expected result", "Actual result", "Expected detector", "Detectors fired"),
+        [_mutation_row(item) for item in view.mutations],
         equivalent_of="mutations",
         empty="no mutation record",
+        css="mutation-table",
     )
+    diagnostics = "".join(f"<li>{_e(text)}</li>" for text in _strs(report.get("diagnostics")))
+    not_proven = "".join(f"<li>{_e(text)}</li>" for text in _strs(report.get("not_proven")))
     return _section(
         "mutations",
         "Mutation constellation",
         "detected vs blind spot",
-        f'<div class="stats">{"".join(tiles)}</div>{notice}{discrepancy_html}{figure}{table}',
+        _mutation_head(report)
+        + _mutation_figures(report, view)
+        + discrepancy_html
+        + figure
+        + table
+        + (f'<h3 class="sub-h">Report diagnostics</h3><ul class="plain-list">{diagnostics}</ul>' if diagnostics else "")
+        + (
+            f'<h3 class="sub-h">What this mutation report does not prove</h3><ul class="plain-list">{not_proven}</ul>'
+            if not_proven
+            else ""
+        ),
     )
 
 
 def _findings_section(doc: Mapping[str, Any]) -> str:
+    """Every recorded finding, then every manifest issue.
+
+    Manifest issues get their own table because they are sometimes the only
+    explanation there is: a re-rendered run whose run.json is unusable
+    carries nothing else.
+    """
     items = []
     for finding in _dicts(doc.get("findings")):
         items.append(
@@ -2192,12 +2513,34 @@ def _findings_section(doc: Mapping[str, Any]) -> str:
             f'<div class="finding-detail">{_e(finding.get("detail"))}</div></li>'
         )
     body = f'<ol class="findings">{"".join(items)}</ol>' if items else '<p class="muted">No finding was recorded.</p>'
+    issues = [
+        # An empty pointer is the document root, written "/" as the manifest module prints it.
+        [_code(issue.get("code")), _code("/" if issue.get("pointer") == "" else issue.get("pointer")),
+         _e(issue.get("message"))]
+        for issue in _dicts(_dict(doc.get("manifest")).get("issues"))
+    ]
+    if issues:
+        body += _table(
+            "Manifest issues", ("Code", "Where", "Message"), issues, equivalent_of=None, empty="none"
+        )
     return _section("findings", "Findings", "in the order the decision weighed them", body)
 
 
 def _required_word(value: Any) -> str:
     """Only the booleans count: ``1`` is not ``true`` here, and a list is not a flag."""
     return "required" if value is True else "optional" if value is False else "unknown"
+
+
+def _digest_cell(computed: Any, declared: Any, outcome: str) -> str:
+    """The computed SHA-256, with the declared one beneath it and how the two compare.
+
+    Both digests share one column so that each can wrap in two lines instead
+    of being squeezed into a column of four-character fragments.
+    """
+    if _str(declared) is None:
+        return _hash(computed) + _sub("no digest declared")
+    verdict = f"<strong>{_e(outcome)}</strong>" if outcome == "mismatch" else _e(outcome)
+    return _hash(computed) + _sub(f"declared {_hash(declared)} \u00b7 {verdict}")
 
 
 def _inputs_section(doc: Mapping[str, Any]) -> str:
@@ -2208,33 +2551,34 @@ def _inputs_section(doc: Mapping[str, Any]) -> str:
         [
             _code(item.get("id")),
             _e(_required_word(item.get("required"))),
-            _hash(item.get("path")),
+            _path(item.get("path")),
             _e(item.get("state")),
-            _hash(item.get("sha256")),
-            _hash(item.get("declared_sha256")),
+            _digest_cell(item.get("sha256"), item.get("declared_sha256"), _digest_outcome(item)),
             _e(_count(item.get("bytes"))),
-            "<br>".join(_e(text) for text in _strs(item.get("diagnostics"))),
+            "<br>".join(_e(text) for text in _strs(item.get("diagnostics"))) or '<span class="muted">none</span>',
         ]
         for item in records
     ]
     rows += [
-        [_code(spec.get("id")), _e("declared"), _hash(spec.get("path")), _e("NO RECORD"), _hash(None),
-         _hash(spec.get("sha256")), _e("unknown"), _e("declared in the manifest but absent from the accounting")]
+        [_code(spec.get("id")), _e("declared"), _path(spec.get("path")), _e("NO RECORD"),
+         _digest_cell(None, spec.get("sha256"), "not compared"), _e("unknown"),
+         _e("declared in the manifest but absent from the accounting")]
         for spec in _dicts(_dict(doc.get("declared")).get("inputs"))
         if spec.get("id") not in recorded
     ]
     inputs = _table(
         "Inputs",
-        ("Input", "Required", "Path", "State", "SHA-256", "Declared SHA-256", "Bytes", "Diagnostics"),
+        ("Input", "Required", "Path", "State", "SHA-256 computed, then declared", "Bytes", "Diagnostics"),
         rows,
         equivalent_of="accounting",
         empty="no input was declared or recorded",
+        css="input-table",
     )
     documents = _table(
         "Other documents read",
         ("Path", "Roles", "State", "SHA-256", "Bytes", "Diagnostic"),
         [
-            [_hash(item.get("path")), _chips(item.get("roles")), _e(item.get("state")), _hash(item.get("sha256")),
+            [_path(item.get("path")), _chips(item.get("roles")), _e(item.get("state")), _hash(item.get("sha256")),
              _e(_count(item.get("bytes"))), _e(item.get("diagnostic"))]
             for item in _dicts(doc.get("documents"))
         ],
@@ -2242,6 +2586,23 @@ def _inputs_section(doc: Mapping[str, Any]) -> str:
         empty="none",
     )
     return _section("inputs", "Inputs and documents", "every declared file, including missing ones", inputs + documents)
+
+
+def _signature_check(receipt: Mapping[str, Any]) -> str:
+    """What re-verification established about the receipt's signature, in words.
+
+    ``signature_verified`` is None both for an unsigned receipt and for a
+    signed one checked without its key. The two are told apart, because
+    "not checked" must never read as "verified" or as "nothing to check".
+    """
+    verified = receipt.get("signature_verified")
+    if verified is True:
+        return "signature verified"
+    if verified is False:
+        return "signature did NOT verify"
+    if _is(receipt.get("signature_state"), "UNSIGNED"):
+        return "no signature to verify"
+    return "signature not checked"
 
 
 def _reverification_section(reverification: Mapping[str, Any]) -> str:
@@ -2252,24 +2613,27 @@ def _reverification_section(reverification: Mapping[str, Any]) -> str:
         ("Result", _pill("PASSED" if ok else "FAILED", "good" if ok else "critical", "check" if ok else "cross")),
         (
             "Receipt",
-            f"content intact {_e(receipt.get('content_intact'))}, signature {_e(receipt.get('signature_state'))}, "
-            f"signature verified {_e(receipt.get('signature_verified'))}",
+            f"content intact {_e(receipt.get('content_intact'))} \u00b7 signature {_e(receipt.get('signature_state'))} "
+            f"\u00b7 {_e(_signature_check(receipt))}",
         ),
         (
             "Ledger chain",
-            f"intact {_e(ledger.get('intact'))}, {_e(_count(ledger.get('observed_length')))} entries, head "
+            f"intact {_e(ledger.get('intact'))} \u00b7 {_e(_count(ledger.get('observed_length')))} entries \u00b7 head "
             f"{_hash(ledger.get('observed_head'))}",
         ),
     ]
     for item in _dicts(reverification.get("invariants")):
-        facts.append((f"Invariant {_e(item.get('name'))}", f"holds {_e(item.get('holds'))}: {_e(item.get('detail'))}"))
+        name, holds, detail = _breakable(item.get("name")), _e(item.get("holds")), _e(item.get("detail"))
+        facts.append((f"Invariant {name}", f"holds {holds}: {detail}"))
     fact_html = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
     problems = "".join(f"<li>{_e(text)}</li>" for text in _strs(reverification.get("problems")))
     notes = "".join(f"<li>{_e(text)}</li>" for text in _strs(reverification.get("notes")))
+    lists = [
+        f'<ul class="plain-list">{items}</ul>' if items else '<p class="muted">none</p>' for items in (problems, notes)
+    ]
     body = (
         f'<dl class="meta compact">{fact_html}</dl>'
-        f'<h3>Problems</h3>{f"<ul>{problems}</ul>" if problems else "<p class=muted>none</p>"}'
-        f'<h3>Not checked</h3>{f"<ul>{notes}</ul>" if notes else "<p class=muted>none</p>"}'
+        f'<h3 class="sub-h">Problems</h3>{lists[0]}<h3 class="sub-h">Not checked</h3>{lists[1]}'
     )
     return _section("reverification", "Re-verification", "science-gate report RUN_DIR re-read this directory", body)
 
@@ -2388,7 +2752,8 @@ h3{font-size:15px;font-weight:650}
 p{margin:0}
 code{font-family:ui-monospace,"Cascadia Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:.9em}
 code.wrap{overflow-wrap:anywhere}
-td code:not(.wrap){white-space:nowrap}
+td code:not(.wrap):not(.brk){white-space:nowrap}
+code.brk{overflow-wrap:break-word}
 .small{font-size:12px}
 .muted{color:var(--ink-2)}
 .t-good{--tone:var(--good);--tone-soft:var(--good-soft);--on-tone:var(--on-good)}
@@ -2402,15 +2767,27 @@ td code:not(.wrap){white-space:nowrap}
 .verdict{display:flex;align-items:center;gap:20px;padding:20px 22px;background:var(--surface);
   border:1px solid var(--border);border-left:6px solid var(--tone);border-radius:16px;box-shadow:var(--shadow)}
 .verdict-disc{width:56px;height:56px;flex:none}
+@media (max-width:560px){.verdict{flex-direction:column;align-items:flex-start;gap:12px;padding:18px}
+  .verdict-disc{width:44px;height:44px}.verdict-chips dt{min-width:0;width:100%}}
 .verdict-body{display:grid;gap:8px;min-width:0}
 .verdict-line{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 14px}
 .verdict-word{font-size:44px;font-weight:750;letter-spacing:-0.02em;line-height:1;overflow-wrap:anywhere}
 .verdict-reason{font-size:15px;color:var(--ink-2)}
-.verdict-chips{font-size:13px;color:var(--ink-2)}
+.verdict-chips{display:grid;gap:5px;margin:0;font-size:13px;color:var(--ink-2)}
+.verdict-chips div{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
+.verdict-chips dt{min-width:124px}
+.verdict-chips dd{margin:0;display:flex;flex-wrap:wrap;gap:4px}
+.why{display:grid;gap:6px;padding:10px 14px;border-radius:10px;background:var(--tone-soft)}
+.why-label,.kicker{font-size:11px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.why-list{margin:0;padding-left:20px;display:grid;gap:6px;font-size:13px}
+.why-list li{overflow-wrap:anywhere}
+.why-detail{color:var(--ink-2)}
+.why-none,.why-more{font-size:13px}
+.why-more a,.fired-more summary{color:var(--accent)}
 .verdict-note{font-size:14px;padding:8px 12px;border-radius:10px;background:var(--tone-soft)}
 .chip{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--surface-2);
   border:1px solid var(--border);font-size:12px;color:var(--ink)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .stat{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px 16px}
 .stat-label{font-size:12px;color:var(--ink-2)}
 .stat-value{font-size:26px;font-weight:650;margin-top:2px;overflow-wrap:anywhere}
@@ -2420,7 +2797,7 @@ td code:not(.wrap){white-space:nowrap}
   font-size:13px}
 .meta div{display:grid;grid-template-columns:130px minmax(0,1fr);gap:10px;padding:6px 0;
   border-top:1px solid var(--grid)}
-.meta dt{color:var(--ink-2)}
+.meta dt{color:var(--ink-2);min-width:0;overflow-wrap:anywhere}
 .meta dd{margin:0;min-width:0;overflow-wrap:anywhere}
 .meta.compact{margin-top:14px}
 .scope{font-size:13px;color:var(--ink-2)}
@@ -2477,14 +2854,20 @@ figcaption{font-size:13px;color:var(--ink-2);margin-top:10px}
 .recorded{font-size:12px;color:var(--ink-2);overflow-wrap:anywhere}
 .plane-card.void .recorded{color:var(--void-ink)}
 .facets,.invariant-list,.findings{margin:0;padding:0;display:grid;gap:10px}
-.facets{list-style:none}
-.facets li,.invariant-list li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 10px;align-items:baseline;
-  font-size:13px}
-.invariant-list{padding-left:28px}
-.invariant-list li{grid-template-columns:auto minmax(0,1fr) auto}
+.facets{list-style:none;grid-template-columns:auto minmax(0,1fr)}
+.invariant-list{list-style:none;grid-template-columns:auto auto minmax(0,1fr) auto}
+.facets li,.invariant-list li{grid-column:1 / -1;display:grid;grid-template-columns:auto minmax(0,1fr);
+  grid-template-columns:subgrid;gap:2px 10px;align-items:baseline;font-size:13px}
+.invariant-list li{grid-template-columns:auto auto minmax(0,1fr) auto;grid-template-columns:subgrid}
+.inv-num{min-width:1.4em;text-align:right;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.facets .pill,.invariant-list .pill{justify-self:start}
 .facet-name{font-weight:600;min-width:0;overflow-wrap:anywhere}
 .facet-detail{grid-column:2 / -1;color:var(--ink-2);font-size:12px;overflow-wrap:anywhere}
+.invariant-list .facet-detail{grid-column:3 / -1}
 .plane-tag{font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.06em}
+@media (max-width:560px){.invariant-list{grid-template-columns:auto auto minmax(0,1fr)}
+  .invariant-list li{grid-template-columns:auto auto minmax(0,1fr);grid-template-columns:subgrid}
+  .plane-tag{grid-column:3}}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px 2px 3px;border-radius:999px;
   background:var(--tone-soft);color:var(--ink);font-size:12px;font-weight:600;white-space:nowrap;max-width:100%}
 .pill-dot{display:inline-grid;place-items:center;width:17px;height:17px;border-radius:50%;background:var(--tone);
@@ -2497,14 +2880,46 @@ table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:ta
 caption{text-align:left;padding:10px 12px;font-weight:600;font-size:13px}
 th,td{padding:7px 10px;text-align:left;vertical-align:top;border-top:1px solid var(--grid)}
 td:last-child{min-width:200px}
-.nowrap{white-space:nowrap}
-thead th{background:var(--surface-2);font-size:12px;font-weight:600;color:var(--ink-2);white-space:nowrap}
+thead th{background:var(--surface-2);font-size:12px;font-weight:600;color:var(--ink-2)}
 .findings{padding-left:24px}
 .findings li{font-size:13px}
 .finding-detail{color:var(--ink-2);margin-top:4px;overflow-wrap:anywhere}
 .notice{margin-top:14px;padding:12px 16px;border-radius:12px;background:var(--tone-soft);border:1px solid var(--tone);
   font-size:14px}
 .notice ul{margin:8px 0 0;padding-left:20px}
+.mut-head{display:grid;gap:8px;margin-bottom:16px}
+.mut-line{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px}
+.mut-line .pill{font-size:13px}
+.mut-reason{font-size:14px;color:var(--ink-2)}
+.mut-message{font-size:14px}
+.count-strip{display:flex;flex-wrap:wrap;gap:1px;margin:12px 0 0;background:var(--grid);border:1px solid var(--border);
+  border-radius:14px;overflow:hidden}
+.count-strip div{flex:1 1 120px;background:var(--surface);padding:10px 16px}
+.count-strip dt{font-size:12px;color:var(--ink-2)}
+.count-strip dd{margin:0;font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.count-strip dd.unknown{color:var(--muted)}
+.strip-note{margin-top:6px}
+.cell-sub{font-size:12px;color:var(--ink-2);margin-top:3px;overflow-wrap:anywhere}
+.cell-sub.words{overflow-wrap:normal}
+.cell-note{font-size:12px;margin-top:6px;padding:4px 8px;border-radius:8px;background:var(--warning-soft);
+  overflow-wrap:anywhere}
+.fired{margin:0;padding:0;list-style:none;display:grid;gap:3px;font-size:12px}
+.fired li{overflow-wrap:anywhere;color:var(--ink-2)}
+.fired li.hit{color:var(--ink);font-weight:600}
+.hit-tag{font-style:normal;font-size:10.5px;font-weight:650;margin-left:6px;padding:0 6px;border-radius:999px;
+  background:var(--good-soft);color:var(--ink)}
+.fired-more{margin-top:4px;font-size:12px}
+.fired-more summary{cursor:pointer}
+.fired-more .fired{margin-top:4px}
+.mutation-table td{min-width:110px}
+.mutation-table td:first-child{min-width:190px}
+.mutation-table td:last-child{min-width:220px}
+.mutation-table td .pill{white-space:nowrap}
+.input-table td:nth-child(5){min-width:250px}
+.input-table td:last-child{overflow-wrap:anywhere}
+.check-table td:first-child{min-width:150px}
+.check-table td:last-child{min-width:220px}
+.sub-h{margin:22px 0 8px}
 .plain-list{margin:0;padding-left:20px;display:grid;gap:8px;font-size:14px}
 .disclaimer{margin-top:14px;font-size:13px;color:var(--ink-2)}
 .footer{margin-top:28px;font-size:12px;color:var(--ink-2)}
@@ -2545,7 +2960,6 @@ svg text{font-family:inherit}
 .beam-cap{fill:var(--accent)}
 .beam-source{fill:var(--accent)}
 .ring-figure{font-size:26px;font-weight:650;fill:var(--ink)}
-.ring-empty{fill:none;stroke:var(--axis);stroke-width:26}
 .link{fill:var(--surface);stroke:var(--axis);stroke-width:1.25}
 .link-start{fill:var(--accent);stroke:var(--accent);stroke-width:1.25}
 .link-empty{fill:none;stroke:var(--axis);stroke-width:1.25}
@@ -2581,21 +2995,40 @@ def render(run: Any, mutation: Any = None) -> str:
     missing parts are shown as missing, and the function never raises on
     the document's shape.
 
-    ``mutation`` is a section 10 mutation report. The renderer reads:
+    ``mutation`` is a section 10 mutation report (``mutation-report.json``).
+    The renderer reads:
 
     * ``mutations``: the list of records, with ``mutation_id``,
-      ``description``, ``expected_result``, ``actual_result``,
-      ``applicable``, ``execution_state``, ``expected_detector``,
+      ``description``, ``target``, ``expected_result`` (its ``rule``, and
+      the ``detector``, ``detector_statuses`` and ``detector_signals`` that
+      define the expected detector), ``actual_result``, ``applicable``,
+      ``execution_state``, ``expected_detector``,
       ``detecting_invariants_fired``, ``detected``, ``blind_spot`` and
       ``diagnostics``;
     * the six count keys, at top level;
-    * ``baseline.status``, where any ``status`` or ``reason`` of
-      ``INVALID_BASELINE`` also invalidates the baseline;
-    * ``sensitivity.fraction`` and ``sensitivity.decimal``.
+    * ``baseline`` (``status``, ``reason``, ``run_id``, ``diagnostics``),
+      where any ``status`` or ``reason`` of ``INVALID_BASELINE`` also
+      invalidates the baseline;
+    * ``sensitivity`` (``fraction``, ``decimal``, ``decimal_rounding``);
+    * the report's own ``status``, ``reason``, ``exit_code``, ``message``,
+      ``report_id``, ``generated_at``, ``manifest``, ``operators``,
+      ``selected_operators``, ``diagnostics`` and ``not_proven``, shown as
+      recorded.
 
-    The figure is shown only when the baseline is valid and at least one
-    mutation executed.
+    A detection is counted only when the record's own evidence supports it,
+    and the sensitivity figure is shown only when the baseline is valid, at
+    least one mutation executed, and the figure equals the one the records
+    give.
     """
+    token = _CLEANED.set({})
+    try:
+        return _page(run, mutation)
+    finally:
+        _CLEANED.reset(token)
+
+
+def _page(run: Any, mutation: Any) -> str:
+    """The whole page; :func:`render` documents what it reads."""
     doc = _dict(run)
     invariants = _invariant_rows(doc)
     lattice = _lattice_rows(doc)

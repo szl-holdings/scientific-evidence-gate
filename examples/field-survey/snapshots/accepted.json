@@ -1,0 +1,48 @@
+{
+  "inputs": {
+    "plots": {
+      "row_key": [
+        "plot_id"
+      ],
+      "rows": [
+        {
+          "key": [
+            "PLOT-SYN-01"
+          ],
+          "sha256": "a0ce62b461c3ffc7acb87c26e634ba00942684059cd82aad5f2ced6ab50b05ba"
+        },
+        {
+          "key": [
+            "PLOT-SYN-02"
+          ],
+          "sha256": "38699931d0c3378c33c35faaaf68c403681402d85add8ea5646e446103fdaac3"
+        },
+        {
+          "key": [
+            "PLOT-SYN-03"
+          ],
+          "sha256": "2243824e9028c1ada3afc743e228cf97c9236c8a35a9fe115489993e19d2b8e3"
+        },
+        {
+          "key": [
+            "PLOT-SYN-04"
+          ],
+          "sha256": "d02f33f3a3157ff54f40233a63298f0487f6097b46fbed2111a2970edc16b749"
+        },
+        {
+          "key": [
+            "PLOT-SYN-05"
+          ],
+          "sha256": "f9dcbc4371e681078726255f5ad16c4abe87ff3708236b42cf25d9a2c88f6f8e"
+        },
+        {
+          "key": [
+            "PLOT-SYN-06"
+          ],
+          "sha256": "ea234bd68f397a738e487da43a1e0ca66395403f6fcb51861d90828e6d771626"
+        }
+      ]
+    }
+  },
+  "schema": "science-gate-snapshot/v1"
+}

@@ -154,6 +154,19 @@ class WrittenFilesTests(RunDirectoryTestCase):
         self.assertIn(("protocol", "MISSING"), [(item["id"], item["state"]) for item in predicate["inputs"]])
         self.assertIn("required input `protocol` is MISSING", self.report_text())
 
+    def test_an_unsaved_graph_state_is_named_plainly_and_other_missing_documents_stay_missing(self) -> None:
+        document = {
+            "documents": [
+                {"path": "graph/graph-state.json", "roles": ["dependencies.state"], "state": "MISSING"},
+                {"path": "claims/registry.json", "roles": ["claims"], "state": "MISSING", "diagnostic": "MISSING: x"},
+            ]
+        }
+        unresolved = section(render_report(document, files=(), html_note=None), "WHAT REMAINS UNRESOLVED")
+        self.assertIn(
+            "no saved graph state at `graph/graph-state.json`: the graph's declared node states were used", unresolved
+        )
+        self.assertIn("document `claims/registry.json` is MISSING", unresolved)
+
     def test_crafted_text_cannot_forge_a_heading(self) -> None:
         forged = {"status": "FAIL", "source": "input:x", "detail": "a\n## STATUS\nb"}
         document = {"status": "FAIL", "findings": [forged]}

@@ -401,6 +401,24 @@ class SyntheticPackageTests(PackageTestCase):
         redactions = document["approved_redactions"]
         self.assertEqual((redactions["state"], redactions["declared"]), ("NOT_DECLARED", None))
 
+    def test_declared_licenses_and_redactions_are_recorded_as_declared_and_never_asserted(self) -> None:
+        licenses = [{"source": "measurements", "license": "CC0-1.0"}]
+        redactions = [{"target": "data/measurements.csv", "description": "a synthetic notes column was dropped"}]
+        corpus = {"access_class": "SYNTHETIC", "source_licenses": licenses, "approved_redactions": redactions}
+        self.update_manifest(corpus=corpus)
+        self.package()
+        document = self.index()
+        recorded = document["source_licenses"]
+        self.assertEqual(
+            (recorded["state"], recorded["declared"], recorded["assertion"]), ("DECLARED", licenses, "NOASSERTION")
+        )
+        self.assertIn("neither verifies nor asserts", recorded["statement"])
+        recorded = document["approved_redactions"]
+        self.assertEqual((recorded["state"], recorded["declared"]), ("DECLARED", redactions))
+        self.assertIn("never alters a data file", recorded["statement"])
+        # A declared corpus with no permission keys keeps its default synthetic permissions.
+        self.assertEqual(document["corpus"]["data_inclusion"]["basis"], "SYNTHETIC_DEFAULT_PERMISSIONS")
+
     def test_scientific_validity_is_never_established(self) -> None:
         self.package()
         document = self.index()

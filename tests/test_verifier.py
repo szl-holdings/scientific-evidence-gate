@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import shutil
 import unittest
 from typing import Any
 
-from _helpers import TempDirTestCase, build_scenario
+from _helpers import REPO_ROOT, TempDirTestCase, build_scenario
 from _project import (
     EMPTY_MANIFEST,
     REVIEWERS,
@@ -19,7 +20,7 @@ from _project import (
     time_document,
 )
 
-from science_gate._canonical import sha256_canonical
+from science_gate._canonical import sha256_bytes, sha256_canonical
 from science_gate.discovery import discover
 from science_gate.invariants import ClaimTally
 from science_gate.ledger import index_invocations
@@ -598,6 +599,78 @@ class ContextTests(ProjectTestCase):
         _, opened = discover(load_manifest(EMPTY_MANIFEST))
         with self.assertRaises(ValueError):
             build_snapshot(opened.values())
+
+
+DEPENDENCIES = REPO_ROOT / "fixtures" / "dependencies" / "current"
+#: Node files of the dependency fixture other than its declared input (data/measurements.csv).
+NODE_DOCUMENTS = [
+    "analysis/run-output.json",
+    "analysis/site-means.csv",
+    "conclusions/conclusion-1.md",
+    "conclusions/conclusion-2.md",
+    "design/protocol.md",
+    "evidence/admitted.csv",
+    "figures/figure-1.csv",
+    "figures/table-2.csv",
+]
+
+
+class PreloadTests(TempDirTestCase):
+    """Files specialist checks read are read before any check runs (verifier.PRELOADS)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixed_clock()
+        self.project = self.tmp / "project"
+        shutil.copytree(DEPENDENCIES, self.project)
+
+    def manifest(self) -> dict[str, Any]:
+        return json.loads((self.project / "manifest.json").read_text(encoding="utf-8"))
+
+    def test_node_files_are_read_before_any_check_and_feed_the_run_id(self) -> None:
+        manifest = load_manifest(self.project / "manifest.json")
+        _, opened = discover(manifest)
+        ctx = CheckContext(manifest, opened)
+        ctx.preload(spec.kind for spec in manifest.checks)
+        roles = {item["path"]: item["roles"] for item in ctx.read_log()}
+        self.assertEqual(roles["figures/figure-1.csv"], ["dependencies.node"])
+        self.assertIn("dependencies.state", roles["graph/graph-state.json"])
+        self.assertNotIn("graph/graph-state.json", ctx.preloaded_evidence(), "a missing file has no digest to pin")
+        self.assertIn("figures/figure-1.csv", ctx.preloaded_evidence())
+        before = verify(self.project / "manifest.json").result.run_id
+        figure = self.project / "figures" / "figure-1.csv"
+        figure.write_bytes(figure.read_bytes() + b"synthetic-extra,0\n")
+        self.assertNotEqual(verify(self.project / "manifest.json").result.run_id, before)
+
+    def test_kinds_without_a_preload_read_only_role_documents(self) -> None:
+        manifest = load_manifest(self.project / "manifest.json")
+        _, opened = discover(manifest)
+        ctx = CheckContext(manifest, opened)
+        ctx.preload(["row_count"])
+        self.assertEqual([item["path"] for item in ctx.read_log()], ["graph/graph.json"])
+
+    def test_a_summary_that_does_not_pin_node_files_reports_them_as_blind_spots(self) -> None:
+        document = self.manifest()
+        document["summary_claim"] = "claims/summary.json"
+        document["checks"].append({"id": "summary", "kind": "summary_consistency", "version": "1"})
+        (self.project / "manifest.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
+        data = (self.project / "data" / "measurements.csv").read_bytes()
+        graph = (self.project / "graph" / "graph.json").read_bytes()
+        summary = {
+            "schema": SUMMARY_SCHEMA,
+            "status": "PASS",
+            "pinned": {
+                "inputs": {"measurements": {"sha256": sha256_bytes(data)}},
+                "documents": {"graph/graph.json": sha256_bytes(graph)},
+            },
+        }
+        (self.project / "claims").mkdir()
+        (self.project / "claims" / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        run = verify(self.project / "manifest.json")
+        (result,) = [item for item in run.result.checks if item.check_id == "summary"]
+        self.assertEqual((result.verdict, result.reason), (Status.ABSTAIN, Reason.BLIND_SPOT))
+        # The declared input is pinned as an input, never also demanded as a document.
+        self.assertEqual(result.evidence["blind_spots"], {"inputs": [], "documents": NODE_DOCUMENTS})
 
 
 class DecideTests(TempDirTestCase):

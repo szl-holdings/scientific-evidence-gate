@@ -83,6 +83,7 @@ from . import TOOL_NAME, __version__
 from ._canonical import StrictJSONError, normalize, pretty_json_bytes, sha256_bytes, strict_loads
 from ._clock import now
 from ._redact import redact, redact_text
+from ._resources import bundled_dir
 from ._safeio import (
     SafeIOError,
     UnsafePathError,
@@ -92,7 +93,7 @@ from ._safeio import (
     safe_read,
     safe_write,
 )
-from .manifests import MAX_MANIFEST_BYTES, Manifest, ManifestError, load_manifest
+from .manifests import MAX_MANIFEST_BYTES, ApprovedRedaction, Manifest, ManifestError, SourceLicense, load_manifest
 from .models import EXIT_CODE, AccessClass, InputState, Permissions, Status
 from .receipts import SCIENTIFIC_VALIDITY, build_run_receipt, receipt_bytes
 from .verifier import NetworkPolicy, VerificationRun, verify
@@ -131,10 +132,11 @@ EVALUATION_DIR = "evaluation"
 SCHEMAS_DIR = "schemas"
 EXPECTED_RECEIPT = "expected/receipt.json"
 
-#: The schemas ship with the source tree (``<repo>/schemas``), not inside the
-#: importable package. An installation without them still packages, but the
-#: package records the schemas as INCOMPLETE rather than silently omitting them.
-SOURCE_SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schemas"
+#: The bundled schemas: ``science_gate/_schemas`` in an installed wheel,
+#: ``<repo>/schemas`` in a source checkout (see :mod:`science_gate._resources`).
+#: None when neither exists; the package then records its schemas as
+#: INCOMPLETE rather than silently omitting them.
+SOURCE_SCHEMAS_DIR = bundled_dir("schemas")
 
 #: The schemas that describe the package's own documents. Without both, a
 #: recipient cannot interpret what they were given.
@@ -985,24 +987,8 @@ def _package_document(
         "permission_statement": permission_statement(
             permissions, training_declared="training_allowed" in declared_permissions
         ),
-        "source_licenses": {
-            "state": "NOT_DECLARED",
-            "declared": None,
-            "assertion": "NOASSERTION",
-            "statement": (
-                "The science-gate-manifest/v1 schema has no field for source licenses, so none were declared and "
-                "none are asserted here. Check each source's own terms before any use beyond local evaluation."
-            ),
-        },
-        "approved_redactions": {
-            "state": "NOT_DECLARED",
-            "declared": None,
-            "statement": (
-                "No redaction was declared or approved. Packaging never alters a data file, because any change "
-                "would break its recorded digest: a file is either copied byte for byte or withheld whole with its "
-                "digest (basis SECRET_PATTERN_IN_CONTENT when its content matches a secret pattern)."
-            ),
-        },
+        "source_licenses": _source_licenses(manifest.corpus.source_licenses),
+        "approved_redactions": _approved_redactions(manifest.corpus.approved_redactions),
         "files": [item.to_dict() for item in ordered],
         "schemas": {
             "state": "INCOMPLETE" if schema_problem else "INCLUDED",
@@ -1026,6 +1012,55 @@ def _package_document(
             "scientific_validity": SCIENTIFIC_VALIDITY,
         },
         "disclaimer": DISCLAIMER,
+    }
+
+
+#: Why packaging never applies a redaction itself, whatever the manifest declares.
+_NEVER_ALTERED = (
+    "Packaging never alters a data file, because any change would break its recorded digest: a file is either "
+    "copied byte for byte or withheld whole with its digest (basis SECRET_PATTERN_IN_CONTENT when its content "
+    "matches a secret pattern)."
+)
+
+
+def _source_licenses(declared: Sequence[SourceLicense] | None) -> dict[str, Any]:
+    """The ``source_licenses`` block: what the manifest declared, and that this tool asserts none of it."""
+    if declared is None:
+        return {
+            "state": "NOT_DECLARED",
+            "declared": None,
+            "assertion": "NOASSERTION",
+            "statement": (
+                "The manifest declares no source licenses (corpus.source_licenses), so none are recorded and none "
+                "are asserted here. Check each source's own terms before any use beyond local evaluation."
+            ),
+        }
+    return {
+        "state": "DECLARED",
+        "declared": [item.to_dict() for item in declared],
+        "assertion": "NOASSERTION",
+        "statement": (
+            "Recorded exactly as the manifest declares them (corpus.source_licenses). This tool neither verifies "
+            "nor asserts any license; check each source's own terms before any use beyond local evaluation."
+        ),
+    }
+
+
+def _approved_redactions(declared: Sequence[ApprovedRedaction] | None) -> dict[str, Any]:
+    """The ``approved_redactions`` block: what the manifest declared as approved, recorded as declared."""
+    if declared is None:
+        return {
+            "state": "NOT_DECLARED",
+            "declared": None,
+            "statement": f"No redaction was declared or approved (corpus.approved_redactions). {_NEVER_ALTERED}",
+        }
+    return {
+        "state": "DECLARED",
+        "declared": [item.to_dict() for item in declared],
+        "statement": (
+            "Recorded exactly as the manifest declares them (corpus.approved_redactions): redactions the data "
+            f"owner made before the files were digested. {_NEVER_ALTERED}"
+        ),
     }
 
 

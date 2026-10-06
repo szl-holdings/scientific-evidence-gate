@@ -16,6 +16,8 @@ it.
 from __future__ import annotations
 
 import copy
+import hashlib
+import html
 import json
 import os
 import re
@@ -34,7 +36,8 @@ from _helpers import FIXED_TIME, REPO_ROOT, SRC_DIR
 from science_gate import _html
 from science_gate._html import NO_SENSITIVITY_SENTENCE, VALIDITY_LABEL, render
 from science_gate.cli import scaffold_project
-from science_gate.receipts import HMAC_KEY_FILE_ENV, build_run_receipt
+from science_gate.mutations import mutate
+from science_gate.receipts import build_run_receipt
 from science_gate.reports import REPORT_HTML, REPORT_MD, RUN_JSON, report_run_dir, run_document, write_run
 from science_gate.verifier import VerificationRun, verify
 
@@ -53,6 +56,8 @@ JUNK = [None, 1, "x", {"k": []}, [2], True]
 
 RUNS: dict[str, VerificationRun] = {}
 DOCS: dict[str, dict[str, Any]] = {}
+#: Mutation reports exactly as ``mutate`` writes them: one with a valid baseline, one without.
+REPORTS: dict[str, dict[str, Any]] = {}
 _PAGES: dict[str, str] = {}
 _WORKSPACE: list[Path] = []
 
@@ -66,11 +71,19 @@ def _document(run: VerificationRun) -> dict[str, Any]:
     return run_document(run, receipt)
 
 
+#: The only variables this module's code sees, besides the fixed clock. Redaction scans the whole
+#: environment for every string it cleans, and a page cleans hundreds, so a machine's hundred-odd variables
+#: would dominate every render. A pinned environment also makes the pages independent of whatever
+#: secret-named variables the machine happens to hold, and leaves out the signing-key variable, so every
+#: receipt here is UNSIGNED. These few are what the interpreter and the temporary-directory lookup need.
+_KEPT_VARIABLES = frozenset({"PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "PYTHONHASHSEED"})
+
+
 def setUpModule() -> None:
-    environment = mock.patch.dict(os.environ, {"SCIENCE_GATE_FIXED_TIME": FIXED_TIME})
+    kept = {name: value for name, value in os.environ.items() if name.upper() in _KEPT_VARIABLES}
+    environment = mock.patch.dict(os.environ, kept | {"SCIENCE_GATE_FIXED_TIME": FIXED_TIME}, clear=True)
     environment.start()
     unittest.addModuleCleanup(environment.stop)
-    os.environ.pop(HMAC_KEY_FILE_ENV, None)
     workspace = Path(tempfile.mkdtemp(prefix="science-gate-html-")).resolve()
     unittest.addModuleCleanup(shutil.rmtree, workspace, ignore_errors=True)
     _WORKSPACE.append(workspace)
@@ -92,11 +105,25 @@ def setUpModule() -> None:
     data.write_text(data.read_text(encoding="utf-8").replace("12.40", "12.41"), encoding="utf-8")
     RUNS["hash"] = verify(changed / "manifest.json")
 
+    # An accepted row is deleted and the digest re-declared, so only the checks themselves can catch it.
+    deleted = project("deleted")
+    data = deleted / "data" / "measurements.csv"
+    data.write_bytes(b"".join(line for line in data.read_bytes().splitlines(True) if not line.startswith(b"SYN-0003")))
+    manifest = json.loads((deleted / "manifest.json").read_text(encoding="utf-8"))
+    manifest["inputs"][0]["sha256"] = hashlib.sha256(data.read_bytes()).hexdigest()
+    (deleted / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    RUNS["deleted"] = verify(deleted / "manifest.json")
+
     broken = project("error")
     (broken / "manifest.json").write_text('{"schema": "not-a-science-gate-manifest/v0"}', encoding="utf-8")
     RUNS["error"] = verify(broken / "manifest.json")
 
     DOCS.update({name: _document(run) for name, run in RUNS.items()})
+
+    REPORTS["valid"] = mutate(project("mutate") / "manifest.json").to_dict()
+    unaccepting = project("mutate-invalid")
+    (unaccepting / "data" / "measurements.csv").unlink()
+    REPORTS["invalid"] = mutate(unaccepting / "manifest.json").to_dict()
 
 
 def doc(name: str = "pass") -> dict[str, Any]:
@@ -261,6 +288,73 @@ class SelfContainedPageTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# The masthead: what the status is, and why
+# ---------------------------------------------------------------------------
+
+
+def finding(status: str, reason: str, detail: str) -> dict[str, Any]:
+    return {"status": status, "reason": reason, "failure_modes": [], "source": "input:synthetic", "detail": detail}
+
+
+class MastheadTests(unittest.TestCase):
+    def verdict(self, source: str) -> str:
+        return Page(source).text("#status")
+
+    def test_an_error_says_why_on_the_first_screen(self) -> None:
+        verdict = self.verdict(page_source("error"))
+        self.assertIn("Why ERROR", verdict)
+        self.assertIn("SCHEMA_MISMATCH at /schema", verdict)
+
+    def test_a_failure_names_only_the_findings_that_decided_it(self) -> None:
+        document = doc("hash")
+        document["findings"] = [
+            finding("ABSTAIN", "INSUFFICIENT_EVIDENCE", "synthetic abstention, not decisive"),
+            finding("FAIL", "SOURCE_MISMATCH", "synthetic digest disagreement"),
+        ]
+        verdict = self.verdict(render(document))
+        self.assertIn("Why FAIL", verdict)
+        self.assertIn("synthetic digest disagreement", verdict)
+        self.assertNotIn("synthetic abstention", verdict)
+        self.assertIn("HASH_MISMATCH", self.verdict(page_source("hash")))
+
+    def test_many_grounds_are_capped_with_a_link_to_all_of_them(self) -> None:
+        document = doc("hash")
+        document["findings"] = [finding("FAIL", "SOURCE_MISMATCH", f"synthetic ground {n}") for n in range(5)]
+        source = render(document)
+        verdict = self.verdict(source)
+        self.assertIn("synthetic ground 2", verdict)
+        self.assertNotIn("synthetic ground 3", verdict)
+        self.assertIn("2 more under Findings", verdict)
+        self.assertIn('<a href="#findings">', source)
+        self.assertIn("synthetic ground 4", Page(source).text("#findings"))
+
+    def test_a_status_with_no_recorded_grounds_is_called_unexplained(self) -> None:
+        document = doc("hash")
+        document["findings"] = []
+        self.assertIn("nothing on record explains it", self.verdict(render(document)))
+
+    def test_a_pass_and_a_rejected_run_carry_no_why(self) -> None:
+        self.assertNotIn("Why", self.verdict(page_source("pass")))
+        rejected = doc("hash") | {"status": "ERROR", "recorded_status": "FAIL", "reverification": {"ok": False}}
+        verdict = self.verdict(render(rejected))
+        self.assertNotIn("Why", verdict)
+        self.assertIn("the recorded status FAIL is not trusted", verdict)
+
+    def test_reasons_and_failure_modes_are_labelled_rows(self) -> None:
+        verdict = self.verdict(page_source("hash"))
+        self.assertRegex(verdict, r"Reasons( [A-Z_]+)+ Failure modes( [A-Z_]+)+")
+
+    def test_manifest_issues_are_listed_with_their_location(self) -> None:
+        table = Page(page_source("error")).text("#findings")
+        self.assertIn("Manifest issues", table)
+        self.assertIn("SCHEMA_MISMATCH /schema", table)
+        document = doc("error")
+        document["manifest"]["issues"] = [{"code": "RUN_UNREADABLE", "pointer": "", "message": "synthetic"}]
+        self.assertIn("RUN_UNREADABLE / synthetic", Page(render(document)).text("#findings"))
+        self.assertNotIn("Manifest issues", page_source("pass"))
+
+
+# ---------------------------------------------------------------------------
 # The hologram: three planes, lit only by evidence
 # ---------------------------------------------------------------------------
 
@@ -338,6 +432,37 @@ class HologramTests(unittest.TestCase):
         integrity = states(planes(failed)[0])
         self.assertEqual(integrity["Hash chain"], "BROKEN")
         self.assertEqual(integrity["Re-verification"], "BROKEN")
+        forged = doc()
+        forged["receipt"]["signature_state"] = "SIGNED_HMAC_SHA256"
+        forged["reverification"] = {"ok": False, "receipt": {"signature_verified": False}, "ledger": {"intact": True}}
+        self.assertEqual(states(planes(forged)[0])["Signature"], "BROKEN")
+
+    def test_a_deleted_row_breaks_the_evaluation(self) -> None:
+        """Requirement 9 as the page shows it: the checks catch the deletion, and the Performance plane reads broken."""
+        self.assertEqual(DOCS["deleted"]["status"], "FAIL")
+        performance = states(planes(doc("deleted"))[1])
+        for name in ("Required checks passed", "Row closures", "Evaluation invariants"):
+            self.assertEqual(performance[name], "BROKEN", name)
+        self.assertEqual(states(planes(doc("deleted"))[0])["Declared digests"], "LIT")
+        terminal = {row.check_id: row.terminal.label for row in _html._lattice_rows(doc("deleted"))}
+        self.assertEqual(terminal["snapshot"], "FAIL")
+        page = Page(page_source("deleted"))
+        self.assertIn("Why FAIL", page.text("#status"))
+        self.assertIn("OMITTED_POPULATION", page.text("data-equivalent-of=lattice"))
+        self.assertIn('class="plane-edge broken"', page.source)
+
+    def test_a_signature_not_checked_never_reads_as_verified(self) -> None:
+        """Re-verification records None both for an unsigned receipt and for a signature checked without its key."""
+        words = {
+            (True, "SIGNED_HMAC_SHA256"): "signature verified",
+            (False, "SIGNED_HMAC_SHA256"): "signature did NOT verify",
+            (None, "UNSIGNED"): "no signature to verify",
+            (None, "SIGNED_HMAC_SHA256"): "signature not checked",
+            (None, None): "signature not checked",
+        }
+        for (verified, state), expected in words.items():
+            receipt = {"signature_verified": verified, "signature_state": state}
+            self.assertEqual(_html._signature_check(receipt), expected, receipt)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +502,33 @@ class AccountingTests(unittest.TestCase):
                                                           "accounted": 6}
         self.assertIn("Closure BROKEN \u00b7 6 accounted of 7 expected", render(document))
         self.assertEqual(states(planes(document)[1])["Row closures"], "BROKEN")
+        document = doc()
+        document["accounting"]["closure"] = {"source": "INDEPENDENT", "holds": False, "expected": 2, "accounted": 1}
+        self.assertIn("Closure BROKEN \u00b7 1 accounted of 2 expected", render(document))
+        self.assertEqual(states(planes(document)[1])["Input closure"], "BROKEN")
+
+    def test_closures_without_an_independent_count_leave_the_row_facet_partial(self) -> None:
+        document = doc()
+        extra = copy.deepcopy(document["accounting"]["inputs"][0])
+        extra.update(id="synthetic-extra", closure={"source": "OBSERVED", "holds": None, "expected": None,
+                                                    "accounted": 6})
+        document["accounting"]["inputs"].append(extra)
+        (facet,) = [item for item in planes(document)[1].facets if item.name == "Row closures"]
+        self.assertEqual((facet.state, facet.detail),
+                         ("PARTIAL", "1 of 2 input(s) close; the rest have no INDEPENDENT expected_rows"))
+
+    def test_partly_unknown_dispositions_and_tiny_counts_stay_visible(self) -> None:
+        """One failed file among a thousand is still drawn, and an unknown disposition is never added as zero."""
+        document = doc()
+        counters = document["accounting"]["counters"]
+        for name in ("expected", "discovered", "opened", "parsed", "examined"):
+            counters[name]["value"] = 1000
+        counters["admitted"]["value"], counters["failed"]["value"], counters["deferred"]["value"] = 999, 1, None
+        source = render(document)
+        funnel = svg_of(source, "accounting")
+        self.assertIn("1000 + unknown (deferred)", funnel)
+        self.assertIn("<title>failed: 1</title>", funnel)
+        self.assertIn("<td>deferred</td><td>unknown</td>", source)
 
     def test_missing_required_input_stays_visible(self) -> None:
         """Requirement 6 as the page shows it: the missing file keeps its row and its state."""
@@ -386,6 +538,38 @@ class AccountingTests(unittest.TestCase):
         self.assertIn("0 of 6 \u00b7 MISSING", svg_of(page.source, "accounting"))
         facet = [item for item in planes(doc("missing"))[1].facets if item.name == "Required inputs parsed"][0]
         self.assertEqual((facet.state, facet.detail), ("DARK", "0 of 1 required input(s) PARSED; measurements MISSING"))
+
+
+class InputsTableTests(unittest.TestCase):
+    def test_computed_and_declared_digests_are_read_together(self) -> None:
+        """Requirement 23 as the page shows it: a changed input is read against its declared digest."""
+        record = DOCS["hash"]["accounting"]["inputs"][0]
+        text = Page(page_source("hash")).text("#inputs")
+        self.assertIn(f"{record['sha256']} declared {record['declared_sha256']} \u00b7 mismatch", text)
+        self.assertIn("\u00b7 <strong>mismatch</strong>", page_source("hash"))
+        unchanged = DOCS["pass"]["accounting"]["inputs"][0]
+        self.assertIn(f"{unchanged['sha256']} declared {unchanged['sha256']} \u00b7 match",
+                      Page(page_source("pass")).text("#inputs"))
+        undeclared = doc()
+        undeclared["accounting"]["inputs"][0]["declared_sha256"] = None
+        self.assertIn(f"{unchanged['sha256']} no digest declared", Page(render(undeclared)).text("#inputs"))
+
+    def test_a_declared_input_with_no_accounting_record_keeps_a_row(self) -> None:
+        document = doc()
+        document["accounting"]["inputs"] = []
+        text = Page(render(document)).text("#inputs")
+        declared = DOCS["pass"]["declared"]["inputs"][0]
+        self.assertIn("NO RECORD", text)
+        self.assertIn(f"none declared {declared['sha256']} \u00b7 not compared", text)
+        self.assertIn("declared in the manifest but absent from the accounting", text)
+
+    def test_paths_wrap_only_at_separators_and_empty_diagnostics_say_none(self) -> None:
+        source = page_source("pass")
+        self.assertIn('<code class="brk">data/<wbr>measurements.csv</code>', source)
+        start = source.index('<div class="table-wrap input-table"')
+        row = source[start : source.index("</tr>", source.index("<tbody>", start))]
+        self.assertTrue(row.endswith('<td><span class="muted">none</span></td>'), row[-120:])
+        self.assertEqual(_html._path("a\\b_c-d&e"), '<code class="brk">a\\<wbr>b_<wbr>c-<wbr>d&amp;e</code>')
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +608,20 @@ class LatticeTests(unittest.TestCase):
         self.assertEqual(self.cells(document)[check_id][2], "NO INVOCATION")
         self.assertIn(f"required check {check_id} has no invocation", gaps(document))
 
+    def test_every_fact_of_a_check_sits_in_its_row(self) -> None:
+        """Seven columns, with each secondary fact under the one it qualifies, so none needs a sideways scroll."""
+        source = page_source("hash")
+        start = source.index('<div class="table-wrap check-table"')
+        table = source[start : source.index("</table>", start)]
+        self.assertEqual(table.count('<th scope="col">'), 7)
+        check = DOCS["hash"]["checks"][0]
+        row = table[table.index(f"<code>{check['check_id']}</code>") :]
+        row = row[: row.index("</tr>")]
+        self.assertEqual(row.count("<td>"), 6)  # the row's first cell opened before the slice
+        for fact in (check["kind"], check["reason"], check["invocation_id"], *check["failure_modes"],
+                     *check["diagnostics"], "field(s), sha256"):
+            self.assertIn(html.escape(fact), row)
+
     def test_partial_execution_cannot_look_complete(self) -> None:
         """Requirement 7 as the page shows it."""
         source = page_source("empty")
@@ -433,6 +631,22 @@ class LatticeTests(unittest.TestCase):
         partial = doc()
         partial["checks_executed"] = 5
         self.assertIn("checks_executed is 5 but checks_expected is 6", gaps(partial))
+        excessive = doc()
+        excessive["checks_executed"] = 7
+        self.assertEqual(states(planes(excessive)[1])["Required checks executed"], "BROKEN")
+        self.assertIn("checks_executed is 7 but checks_expected is 6", gaps(excessive))
+
+    def test_an_optional_check_that_did_not_run_is_shown_but_does_not_decide(self) -> None:
+        """An optional check stays visible as OPTIONAL and SKIPPED; like ``decide``, the page does not hold it
+        against a PASS."""
+        document = doc()
+        (spec,) = [item for item in document["declared"]["checks"] if item["id"] == "rows"]
+        (result,) = [item for item in document["checks"] if item["check_id"] == "rows"]
+        spec["required"] = False
+        result.update(required=False, execution_state="SKIPPED", verdict="ABSTAIN", reason="INSUFFICIENT_EVIDENCE")
+        self.assertEqual(self.cells(document)["rows"], ("OPTIONAL", "SKIPPED", "ABSTAIN"))
+        self.assertEqual(gaps(document), [])
+        self.assertIn(">5 required + 1<", svg_of(render(document), "lattice"))
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +659,18 @@ class InvariantRingTests(unittest.TestCase):
         ring = svg_of(page_source("pass"), "invariants")
         self.assertEqual(ring.count("<title>"), 10)  # one tooltip per segment; the figure's own title has an id
         self.assertIn(">10 of 10<", ring)
+
+    def test_the_list_shows_the_numbers_the_ring_refers_to(self) -> None:
+        """A grid list item loses its marker, so the numbers are written out and must match the ring's labels."""
+        source = page_source("pass")
+        start = source.index('<ol class="invariant-list"')
+        listing = source[start : source.index("</ol>", start)]
+        written = re.findall(r'<li value="(\d+)"><span class="inv-num" aria-hidden="true">(\d+)</span>', listing)
+        self.assertEqual(written, [(str(n), str(n)) for n in range(1, 11)])
+        labels = re.findall(r'text-anchor="middle">(\d+)</text>', svg_of(source, "invariants"))
+        self.assertEqual(sorted(labels, key=int), [str(n) for n in range(1, 11)])
+        listed = Page(source).text("data-equivalent-of=invariants")
+        self.assertIn(f"1 {_html._GLYPH_TEXT['check']} HOLDS checked_claims_le_invocations", listed)
 
     def test_contract_invariants_missing_from_the_document_are_listed(self) -> None:
         document = doc()
@@ -621,15 +847,161 @@ class MutationConstellationTests(unittest.TestCase):
         )
         skipped = mutation_record("M09_changed_doi", state="NOT_APPLICABLE", detected=None, applicable=False)
         skipped.update(actual_result=None, detecting_invariants_fired=None, blind_spot=None)
-        table = Page(render(DOCS["pass"], mutation_report([executed, skipped]))).text("data-equivalent-of=mutations")
+        source = render(DOCS["pass"], mutation_report([executed, skipped]))
+        table = Page(source).text("data-equivalent-of=mutations")
         self.assertIn("the status is not PASS and check:snapshot_completeness reports FAIL", table)
         self.assertIn("FAIL (SOURCE_MISMATCH)", table)
         self.assertIn("check:snapshot_completeness FAIL", table)
         self.assertIn("NOT_APPLICABLE", table)
+        # The recorded execution state is shown under the group only when it adds something.
+        self.assertIn('DETECTED</span><div class="cell-sub">CHECKED</div>', source)
+        self.assertNotIn('NOT_APPLICABLE</span><div class="cell-sub">NOT_APPLICABLE</div>', source)
 
     def test_an_unusable_report_is_said_to_be_unusable(self) -> None:
         self.assertIn("The mutation report is not a JSON object", render(DOCS["pass"], ["not", "a", "report"]))
         self.assertNotIn('id="mutations"', page_source("pass"))
+
+
+def ruled_record(mutation_id: str, fired: list[Any] | None, *, actual: str = "FAIL",
+                 detected: bool | None = True) -> dict[str, Any]:
+    """A record in the shape ``mutate`` writes, whose expected detector is stated in full."""
+    record = mutation_record(mutation_id, detected=detected)
+    record.update(
+        expected_detector="check:snapshot_completeness",
+        expected_result={"status": "not PASS", "detector": "check:snapshot_completeness",
+                         "detector_statuses": ["FAIL"], "detector_signals": ["OMITTED_POPULATION"],
+                         "rule": "the status is not PASS and check:snapshot_completeness reports FAIL with "
+                                 "OMITTED_POPULATION"},
+        actual_result={"mode": "verify", "status": actual, "reason": "SOURCE_MISMATCH", "run_id": "run-synthetic"},
+        detecting_invariants_fired=fired,
+    )
+    return record
+
+
+def fired(detector: str, status: str, reason: str = "SOURCE_MISMATCH", modes: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {"detector": detector, "source": "check:snapshot", "status": status, "reason": reason,
+            "failure_modes": list(modes), "detail": "synthetic"}
+
+
+EXPECTED_FIRE = fired("check:snapshot_completeness", "FAIL", modes=("OMITTED_POPULATION",))
+
+
+class MutationEvidenceTests(unittest.TestCase):
+    """The page re-reads each mutation record's own evidence rather than trusting its ``detected`` flag."""
+
+    def test_a_real_report_renders_without_a_contradiction(self) -> None:
+        report = REPORTS["valid"]
+        view = _html._mutation_view(report)
+        self.assertEqual(view.discrepancies, ())
+        self.assertEqual({key: view.tallies[key] for key in _html._MUTATION_COUNT_KEYS},
+                         {key: report[key] for key in _html._MUTATION_COUNT_KEYS})
+        self.assertEqual(view.sensitivity[0], report["sensitivity"]["fraction"])
+        for item in view.mutations:
+            if item.group == "DETECTED":
+                self.assertEqual(item.firing, "FIRED", item.mutation_id)
+            if item.group == "NOT_APPLICABLE":
+                self.assertEqual(item.firing, "NOT EXECUTED", item.mutation_id)
+        text = Page(render(DOCS["pass"], report)).text("#mutations")
+        for expected in (report["report_id"], report["message"], "20 of 20 operators selected", "Applicable",
+                         report["sensitivity"]["decimal_rounding"], "What this mutation report does not prove",
+                         report["not_proven"][0]):
+            self.assertIn(expected, text)
+        self.assertNotIn("inconsistent with its own records", text)
+
+    def test_a_real_invalid_baseline_report_shows_no_figure_and_no_counts(self) -> None:
+        """Requirement 26 with the report ``mutate`` actually writes: no counts, no records, no figure."""
+        report = REPORTS["invalid"]
+        self.assertNotIn("sensitivity", report)
+        source = render(DOCS["pass"], report)
+        text = Page(source).text("#mutations")
+        self.assertIn(NO_SENSITIVITY_SENTENCE, text)
+        self.assertIn("INVALID_BASELINE", text)
+        self.assertNotIn('class="count-strip"', source)
+        self.assertNotIn('data-visual="mutations"', source)
+        self.assertNotIn("Sensitivity", text)
+        for diagnostic in report["baseline"]["diagnostics"]:
+            self.assertIn(" ".join(diagnostic.split()), text)
+
+    def test_the_expected_detector_rule_is_matched_in_full(self) -> None:
+        rule = _html._detector_rule(ruled_record("M03_deleted_accepted_row", []))
+        self.assertTrue(rule.matches(EXPECTED_FIRE))
+        self.assertFalse(rule.matches(fired("check:snapshot_completeness", "ABSTAIN", modes=("OMITTED_POPULATION",))))
+        self.assertFalse(rule.matches(fired("check:snapshot_completeness", "FAIL")))  # no stated signal raised
+        self.assertFalse(rule.matches(fired("check:row_count", "FAIL", modes=("OMITTED_POPULATION",))))
+        self.assertTrue(rule.matches(fired("check:snapshot_completeness", "FAIL", reason="OMITTED_POPULATION")))
+        self.assertFalse(_html._DetectorRule(None, (), ()).matches(EXPECTED_FIRE))
+
+    def test_a_detection_its_own_evidence_contradicts_is_unresolved(self) -> None:
+        """A detected flag is not enough: the actual status and the expected detector must agree with it."""
+        records = [
+            ruled_record("M01_supported", [fired("check:row_count", "FAIL"), EXPECTED_FIRE]),
+            ruled_record("M02_actual_pass", [EXPECTED_FIRE], actual="PASS"),
+            ruled_record("M03_wrong_detector", [fired("check:row_count", "FAIL")]),
+            ruled_record("M04_nothing_recorded", None),
+        ]
+        view = _html._mutation_view(mutation_report(records, status="PASS", detected_mutations=4))
+        groups = {item.short: (item.group, item.firing) for item in view.mutations}
+        self.assertEqual(groups, {"M01": ("DETECTED", "FIRED"), "M02": ("UNRESOLVED", "FIRED"),
+                                  "M03": ("UNRESOLVED", "NOT FIRED"), "M04": ("UNRESOLVED", "NOT RECORDED")})
+        self.assertEqual(view.tallies["detected_mutations"], 1)
+        self.assertIn("the report states detected_mutations 4, but its records give 1", view.discrepancies)
+        self.assertIn("the report states PASS, but its records include 0 blind spot(s) and 3 unresolved mutation(s)",
+                      view.discrepancies)
+        table = Page(render(DOCS["pass"], mutation_report(records))).text("data-equivalent-of=mutations")
+        self.assertEqual(table.count("it is not counted as a detection"), 3)
+        self.assertIn("check:snapshot_completeness FAIL expected", table)
+        self.assertIn("1 finding(s), none from the expected detector", table)
+
+    def test_a_blind_spot_is_never_upgraded(self) -> None:
+        record = ruled_record("M20_metadata_change_under_unchanged_pass_summary", [EXPECTED_FIRE], detected=False)
+        (item,) = _html._mutation_view(mutation_report([record])).mutations
+        self.assertEqual((item.group, item.firing), ("BLIND_SPOT", "FIRED"))
+        self.assertIn("it stays a blind spot", item.note)
+
+    def test_an_executed_mutation_without_a_detection_result_is_unresolved(self) -> None:
+        """Neither a detection nor a blind spot can be assumed when the record does not say which it was."""
+        (item,) = _html._mutation_view(mutation_report([mutation_record("M07_changed_source_hash",
+                                                                        detected=None)])).mutations
+        self.assertEqual((item.group, item.note), ("UNRESOLVED", "executed, but no detection result is recorded"))
+
+    def test_skipped_mutations_never_fire(self) -> None:
+        record = ruled_record("M15_skipped_required_checker", [EXPECTED_FIRE])
+        record["execution_state"] = "SKIPPED"
+        (item,) = _html._mutation_view(mutation_report([record])).mutations
+        self.assertEqual((item.group, item.firing), ("SKIPPED", "NOT EXECUTED"))
+
+    def test_a_sensitivity_figure_the_records_do_not_give_is_withheld(self) -> None:
+        report = mutation_report(detected_records(), sensitivity={"fraction": "3/3", "decimal": "1.0000"})
+        view = _html._mutation_view(report)
+        self.assertIsNone(view.sensitivity)
+        self.assertIn("the report states sensitivity 3/3, but its records give 2/3; no figure is shown",
+                      view.discrepancies)
+        text = Page(render(DOCS["pass"], report)).text("#mutations")
+        self.assertIn("Sensitivity none", text)
+        self.assertNotIn("1.0000", text)
+
+    def test_unknown_counts_read_unknown(self) -> None:
+        report = mutation_report(detected_records(), executed_mutations=3)
+        source = render(DOCS["pass"], report)
+        self.assertIn('<dt>Detected</dt><dd class="unknown">unknown</dd>', source)
+        self.assertIn("<dt>Executed</dt><dd>3</dd>", source)
+
+    def test_only_a_disagreement_is_highlighted(self) -> None:
+        """A record's own diagnostic is an ordinary line; the warning highlight is kept for contradictions."""
+        record = ruled_record("M03_wrong_detector", [fired("check:row_count", "FAIL")])
+        record["diagnostics"] = ["synthetic operator diagnostic"]
+        source = render(DOCS["pass"], mutation_report([record]))
+        notes = re.findall(r'<div class="cell-note">([^<]*)</div>', source)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("the expected detector is not among the recorded fired detectors", notes[0])
+        self.assertIn('<div class="cell-sub">synthetic operator diagnostic</div>', source)
+
+    def test_long_identifiers_may_wrap_and_stay_escaped(self) -> None:
+        self.assertEqual(_html._breakable("M20_a<b"), '<code class="brk">M20_<wbr>a&lt;b</code>')
+        self.assertEqual(_html._breakable("check:a&b_c"), '<code class="brk">check:<wbr>a&amp;b_<wbr>c</code>')
+        source = render(DOCS["pass"], REPORTS["valid"])
+        self.assertIn("M20_<wbr>metadata_<wbr>change_<wbr>under_<wbr>unchanged_<wbr>pass_<wbr>summary", source)
+        self.assertEqual(Page(source).problems, [])
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +1086,17 @@ class EscapingTests(unittest.TestCase):
         self.assertNotIn(shaped_token, source)
         self.assertIn("[REDACTED]", source)
 
+    def test_redaction_is_never_reused_from_an_earlier_render(self) -> None:
+        """Cleaned text is memoized for one render only: a secret set between two renders is still redacted."""
+        value = "synthetic-rotating-secret-7b1e"
+        document = doc()
+        document["manifest"]["run_label"] = value
+        self.assertIn(value, render(document))
+        self.assertIsNone(_html._CLEANED.get())
+        with mock.patch.dict(os.environ, {"SCIENCE_GATE_HTML_TEST_TOKEN": value}):
+            self.assertNotIn(value, render(document))
+        self.assertIsNone(_html._CLEANED.get())
+
 
 # ---------------------------------------------------------------------------
 # The PASS contract
@@ -756,7 +1139,7 @@ class PassContractTests(unittest.TestCase):
         self.assert_unsupported(document, "invariant ledger_chain_intact is NOT_RECORDED")
 
     def test_other_statuses_are_never_called_contradictions(self) -> None:
-        for name in ("empty", "missing", "hash", "error"):
+        for name in ("empty", "missing", "hash", "deleted", "error"):
             self.assertEqual(gaps(doc(name)), [], name)
 
 
@@ -793,25 +1176,45 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(render(DOCS["pass"], shuffled), first)
 
     def test_output_does_not_depend_on_the_hash_seed(self) -> None:
-        """Requirement 13 for the page: two interpreters with different hash seeds write identical bytes."""
+        """Requirement 13 for the page: an interpreter with another hash seed writes identical bytes.
+
+        One child process is enough: its seed is pinned to a value this
+        process does not use, and its page is compared with this process's.
+        """
         report = mutation_report(detected_records())
         case = _WORKSPACE[0] / "determinism-case.json"
         case.write_text(json.dumps({"run": DOCS["pass"], "mutation": report}), encoding="utf-8")
-        outputs = []
-        for seed in ("0", "4242"):
-            environment = {
-                **os.environ,
-                "PYTHONHASHSEED": seed,
-                "PYTHONPATH": str(SRC_DIR),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-            completed = subprocess.run(
-                [sys.executable, "-c", _RENDER_SCRIPT, str(case)], env=environment, capture_output=True, timeout=120
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
-            outputs.append(completed.stdout)
-        self.assertEqual(outputs[0], outputs[1])
-        self.assertEqual(outputs[0], render(DOCS["pass"], report).encode("utf-8"))
+        seed = "0" if os.environ.get("PYTHONHASHSEED") == "4242" else "4242"
+        environment = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": str(SRC_DIR), "PYTHONDONTWRITEBYTECODE": "1"}
+        completed = subprocess.run(
+            [sys.executable, "-c", _RENDER_SCRIPT, str(case)], env=environment, capture_output=True, timeout=120
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        self.assertEqual(completed.stdout, render(DOCS["pass"], report).encode("utf-8"))
+
+
+class LargeDocumentTests(unittest.TestCase):
+    def test_figures_draw_a_prefix_and_tables_keep_every_row(self) -> None:
+        """A figure says how much it left out; its text equivalent never leaves anything out."""
+        document = doc()
+        check, spec = document["checks"][0], document["declared"]["checks"][0]
+        record = document["accounting"]["inputs"][0]
+        document["checks"] = [dict(check, check_id=f"synthetic-check-{n:03}") for n in range(90)]
+        document["declared"]["checks"] = [dict(spec, id=f"synthetic-check-{n:03}") for n in range(90)]
+        document["accounting"]["inputs"] = [dict(record, id=f"synthetic-input-{n:03}") for n in range(45)]
+        document["invariants"] += [{"name": f"synthetic_invariant_{n:03}", "applicable": False, "holds": None,
+                                    "detail": "synthetic"} for n in range(55)]
+        report = mutation_report([mutation_record(f"M{n:03}-synthetic") for n in range(160)])
+        source = render(document, report)
+        self.assertIn("10 more check(s) are listed in the table.", svg_of(source, "lattice"))
+        self.assertIn("5 more input(s) are listed in the table.", svg_of(source, "accounting"))
+        self.assertIn("5 more in the list", svg_of(source, "invariants"))
+        self.assertIn("10 more in the table", svg_of(source, "mutations"))
+        page = Page(source)
+        self.assertIn("synthetic-check-089", page.text("data-equivalent-of=lattice"))
+        self.assertIn("synthetic-input-044", page.text("#inputs"))
+        self.assertIn("synthetic_invariant_054", page.text("data-equivalent-of=invariants"))
+        self.assertIn("M159-synthetic", page.text("data-equivalent-of=mutations"))
 
 
 class RobustnessTests(unittest.TestCase):
@@ -916,6 +1319,8 @@ class RunDirectoryIntegrationTests(unittest.TestCase):
         report_run_dir(run_dir, environ={})
         page = Page((run_dir / REPORT_HTML).read_text(encoding="utf-8"))
         self.assertIn("PASSED", page.text("#reverification"))
+        self.assertIn("signature UNSIGNED \u00b7 no signature to verify", page.text("#reverification"))
+        self.assertIn('<dt>Invariant <code class="brk">ledger_<wbr>chain_<wbr>intact</code></dt>', page.source)
         self.assertIn("LIT Re-verification receipt, ledger chain and run.json re-verified from disk",
                       page.text("data-equivalent-of=hologram"))
         self.assertNotIn("Re-verification failed", page.source)

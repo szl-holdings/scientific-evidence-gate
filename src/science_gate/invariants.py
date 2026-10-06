@@ -450,7 +450,9 @@ def pass_requires_examined_rows(ctx: InvariantContext) -> InvariantResult:
     )
     if ctx.run_claims_pass and total < 1:
         problems.append("the run claims PASS but examined no rows")
-    return _judged(name, problems, f"rows_examined={total}")
+    # A sum over checks counts a row once per check that read it, so it is
+    # labelled as such: run.json's rows_examined counts distinct rows.
+    return _judged(name, problems, f"per-check rows examined total={total}")
 
 
 def input_accounting_closure(ctx: InvariantContext) -> InvariantResult:
@@ -585,13 +587,34 @@ def _check_marks(thousands: str | None, decimal_point: str) -> None:
         raise ValueError("thousands and decimal_point must differ")
 
 
-def _as_text(value: str | int | Decimal) -> str:
+def _fixed_point_length(value: Decimal) -> int:
+    """How many characters ``format(value, "f")`` would produce, computed without producing them.
+
+    A Decimal parsed from JSON such as ``1e999999999`` is tiny in memory but
+    expands to a billion digits in fixed point, so the length must be known
+    before the text is built.
+    """
+    sign, digits, raw_exponent = value.as_tuple()
+    exponent = int(raw_exponent)  # an int for every finite value, the only kind callers pass
+    if exponent >= 0:
+        body = len(digits) + exponent
+    else:
+        body = max(len(digits), -exponent + 1) + 1  # leading "0" and the decimal point
+    return body + sign
+
+
+def _as_text(value: str | int | Decimal) -> str | None:
+    """The printed form of ``value``, or None when it would exceed :data:`MAX_NUMBER_LENGTH`."""
     if isinstance(value, bool) or isinstance(value, float):
         raise TypeError(f"{type(value).__name__} is not accepted: pass the printed string")
     if isinstance(value, Decimal):
+        if not value.is_finite():
+            return str(value)
+        if _fixed_point_length(value) > MAX_NUMBER_LENGTH:
+            return None
         # Fixed-point rendering keeps the printed precision ("1.50" stays
         # "1.50") and never produces exponent notation.
-        return format(value, "f") if value.is_finite() else str(value)
+        return format(value, "f")
     if isinstance(value, (str, int)):
         return str(value)
     raise TypeError(f"{type(value).__name__} is not a printed number")
@@ -615,6 +638,9 @@ def parse_decimal(
     """
     _check_marks(thousands, decimal_point)
     raw = _as_text(text)
+    if raw is None:
+        # Shown in exponent form, which is short and exact.
+        return ParsedDecimal(str(text), NOT_A_NUMBER, detail=f"longer than {MAX_NUMBER_LENGTH} characters")
     stripped = raw.strip()
     if not stripped:
         return ParsedDecimal(raw, NOT_A_NUMBER, detail="empty")

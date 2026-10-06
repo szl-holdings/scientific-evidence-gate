@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from . import __version__
 from ._canonical import pretty_json_bytes, sha256_bytes
+from ._redact import redaction_scope
 from ._safeio import SafeIOError, safe_write
 from .discovery import discover
 from .manifests import MANIFEST_SCHEMA, load_manifest
@@ -310,7 +311,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(err, f"run '{PROG} --help' for the commands; argument errors exit {_ERROR}, never 2 (2 means ABSTAIN)")
         return _ERROR
     try:
-        return _HANDLERS[args.command](args, out)
+        # Every command redacts what it prints and writes; read the environment's secrets once for all of it.
+        with redaction_scope():
+            return _HANDLERS[args.command](args, out)
     except Exception as exc:  # the last line of defence: an exit code and a message, never a traceback
         _emit(out, f"ERROR {args.command}: internal error ({type(exc).__name__}: {exc})")
         return _ERROR

@@ -44,7 +44,7 @@ from ._canonical import (
     strict_loads,
 )
 from ._clock import ClockError, format_utc, now, parse_utc
-from ._redact import redact_text
+from ._redact import redact_text, redaction_scope
 from ._safeio import (
     ABSOLUTE_PATH,
     DRIVE_PATH,
@@ -103,6 +103,11 @@ __all__ = [
     "CheckOutcome",
     "CheckParamError",
     "CheckUnavailable",
+    "PRELOADS",
+    "Findings",
+    "takes_no_inputs",
+    "document_unavailable",
+    "malformed_document",
     "resolve_check",
     "row_digest",
     "build_snapshot",
@@ -143,6 +148,19 @@ REGISTRY: Mapping[str, str] = MappingProxyType(
         "claim_registry": "science_gate.claims:check_claim_registry",
         "dependency_currency": "science_gate.dependencies:check_dependency_currency",
         "summary_consistency": "science_gate.verifier:check_summary_consistency",
+    }
+)
+
+#: Files a specialist check reads beyond the role documents (stored claim
+#: outputs, dependency node files, saved graph state), keyed by check kind.
+#: Each ``"module:function"`` takes the :class:`CheckContext` and reads those
+#: files through it before any check runs. Reading them up front puts their
+#: digests into the run id, so two runs over different files never share an
+#: id, and lets ``summary_consistency`` see them as evidence it should pin.
+PRELOADS: Mapping[str, str] = MappingProxyType(
+    {
+        "claim_registry": "science_gate.claims:preload_stored_outputs",
+        "dependency_currency": "science_gate.dependencies:preload_graph_files",
     }
 )
 
@@ -286,6 +304,7 @@ class CheckContext:
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     _files: dict[str, _FileRead] = field(default_factory=dict, init=False, repr=False)
     _roles: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
+    _preloaded: set[str] = field(default_factory=set, init=False, repr=False)
 
     @property
     def root(self) -> Path:
@@ -352,6 +371,27 @@ class CheckContext:
         """
         for role, _ in ROLE_DOCUMENTS:
             self.role_document(role)
+
+    def preload(self, kinds: Iterable[str], preloads: Mapping[str, str] = PRELOADS) -> None:
+        """Read every role document, then the files the declared check kinds name (:data:`PRELOADS`).
+
+        Everything read here is read before any check runs, so it is the
+        same for every check and it can feed the run id. A preload that
+        cannot be imported is skipped: the check of that kind is then
+        unavailable too, and the engine records it as ERROR.
+        """
+        self.preload_roles()
+        for kind in sorted(set(kinds) & set(preloads)):
+            try:
+                read_files = resolve_check(preloads[kind])
+            except CheckUnavailable:
+                continue
+            read_files(self)
+        self._preloaded.update(self._files)
+
+    def preloaded_evidence(self) -> tuple[str, ...]:
+        """Paths read by :meth:`preload` that exist and were hashed, sorted."""
+        return tuple(sorted(path for path in self._preloaded if self._files[path].sha256 is not None))
 
     def read_log(self) -> tuple[dict[str, Any], ...]:
         """Every file read through this context, sorted by path, without content."""
@@ -447,12 +487,14 @@ class _FormatError(ValueError):
     """A role document whose structure does not match its declared schema."""
 
 
-class _Findings:
+class Findings:
     """Collects one check's findings and turns them into a single outcome.
 
     A definite contradiction (FAIL) outranks missing evidence (ABSTAIN), and
     PASS is returned only when nothing at all was found. The first finding at
     the winning level supplies the reason, so the outcome is deterministic.
+    Specialist checks use this same class, so every check folds its findings
+    into a verdict by one rule.
     """
 
     def __init__(self) -> None:
@@ -485,6 +527,7 @@ class _Findings:
         rows_examined: int | None,
         evidence: Mapping[str, Any],
         execution_state: ExecutionState = ExecutionState.CHECKED,
+        claim_tallies: tuple[ClaimTally, ...] = (),
     ) -> CheckOutcome:
         verdict, reason = Status.PASS, Reason.VERIFIED
         for status in (Status.FAIL, Status.ABSTAIN):
@@ -500,6 +543,7 @@ class _Findings:
             rows_examined=rows_examined,
             evidence=evidence,
             diagnostics=tuple(self.diagnostics),
+            claim_tallies=claim_tallies,
         )
 
     def not_applicable(self, reason: Reason, detail: str, evidence: Mapping[str, Any]) -> CheckOutcome:
@@ -527,7 +571,7 @@ def _params(spec: CheckSpec, allowed: Iterable[str] = (), required: Iterable[str
     return spec.params
 
 
-def _takes_no_inputs(spec: CheckSpec, source: str) -> None:
+def takes_no_inputs(spec: CheckSpec, source: str) -> None:
     """Refuse declared inputs on a check that reads a role document instead.
 
     Accepting them would let a reader believe the check examined those
@@ -581,7 +625,7 @@ _UNUSABLE_INPUT: Mapping[InputState, tuple[Reason, tuple[FailureMode, ...]]] = M
 )
 
 
-def _examinable(ctx: CheckContext, spec: CheckSpec, findings: _Findings) -> list[OpenedInput]:
+def _examinable(ctx: CheckContext, spec: CheckSpec, findings: Findings) -> list[OpenedInput]:
     """The check's inputs that have admitted rows, in declaration order.
 
     Each input that cannot be examined adds an ABSTAIN finding. A PARTIAL
@@ -610,7 +654,7 @@ def _examinable(ctx: CheckContext, spec: CheckSpec, findings: _Findings) -> list
     return usable
 
 
-def _no_rows_to_examine(spec: CheckSpec, findings: _Findings, evidence: Mapping[str, Any]) -> CheckOutcome:
+def _no_rows_to_examine(spec: CheckSpec, findings: Findings, evidence: Mapping[str, Any]) -> CheckOutcome:
     """NOT_APPLICABLE, citing the first recorded cause (e.g. SOURCE_MISMATCH for a digest mismatch)."""
     if not spec.inputs:
         return findings.not_applicable(Reason.OUT_OF_SCOPE, f"{spec.kind} was given no inputs", evidence)
@@ -618,7 +662,7 @@ def _no_rows_to_examine(spec: CheckSpec, findings: _Findings, evidence: Mapping[
     return findings.not_applicable(reason, "no input has rows to examine", evidence)
 
 
-def _document_unavailable(document: Document, evidence: Mapping[str, Any]) -> CheckOutcome:
+def document_unavailable(document: Document, evidence: Mapping[str, Any]) -> CheckOutcome:
     """A declared role document that could not be read or parsed: never PASS.
 
     Absence or damage is missing evidence (ABSTAIN), not a verdict about content.
@@ -635,7 +679,7 @@ def _document_unavailable(document: Document, evidence: Mapping[str, Any]) -> Ch
     )
 
 
-def _malformed_document(document: Document, problem: str, evidence: Mapping[str, Any]) -> CheckOutcome:
+def malformed_document(document: Document, problem: str, evidence: Mapping[str, Any]) -> CheckOutcome:
     return CheckOutcome(
         execution_state=ExecutionState.SKIPPED,
         verdict=Status.ABSTAIN,
@@ -703,7 +747,7 @@ def check_row_count(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     expected is a mismatch. Fewer means a population was omitted.
     """
     _params(spec)
-    findings = _Findings()
+    findings = Findings()
     usable = _examinable(ctx, spec, findings)
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     if not usable:
@@ -737,7 +781,7 @@ def check_required_columns(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     admitted row. JSON records are checked one by one.
     """
     columns = _text_list(_params(spec, ("columns",), ("columns",))["columns"], "columns")
-    findings = _Findings()
+    findings = Findings()
     usable = _examinable(ctx, spec, findings)
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     evidence: dict[str, Any] = {"columns": list(columns), "inputs": per_input}
@@ -782,7 +826,7 @@ def check_duplicate_rows(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     manifest itself declared.
     """
     _params(spec)
-    findings = _Findings()
+    findings = Findings()
     usable = _examinable(ctx, spec, findings)
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     if not usable:
@@ -868,7 +912,7 @@ def _parse_snapshot(document: Any) -> dict[str, _AcceptedInput]:
     return accepted
 
 
-def _report_absent(opened: OpenedInput, count: int, what: str, findings: _Findings) -> None:
+def _report_absent(opened: OpenedInput, count: int, what: str, findings: Findings) -> None:
     """Accepted rows not among the admitted records: deleted only if the input is complete.
 
     When some records were deferred, unresolved or malformed, the missing
@@ -890,7 +934,7 @@ def _report_absent(opened: OpenedInput, count: int, what: str, findings: _Findin
         )
 
 
-def _compare_snapshot(opened: OpenedInput, accepted: _AcceptedInput, findings: _Findings) -> dict[str, Any]:
+def _compare_snapshot(opened: OpenedInput, accepted: _AcceptedInput, findings: Findings) -> dict[str, Any]:
     """Compare one input's admitted rows with its accepted rows."""
     summary: dict[str, Any] = {
         "accepted_rows": len(accepted.rows),
@@ -950,16 +994,16 @@ def check_snapshot_completeness(ctx: CheckContext, spec: CheckSpec) -> CheckOutc
     """
     _params(spec)
     snapshot = ctx.accepted_snapshot
-    findings = _Findings()
+    findings = Findings()
     evidence: dict[str, Any] = {"snapshot": snapshot.to_dict()}
     if not snapshot.declared:
         return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no accepted_snapshot", evidence)
     if not snapshot.loaded:
-        return _document_unavailable(snapshot, evidence)
+        return document_unavailable(snapshot, evidence)
     try:
         accepted = _parse_snapshot(snapshot.content)
     except _FormatError as exc:
-        return _malformed_document(snapshot, str(exc), evidence)
+        return malformed_document(snapshot, str(exc), evidence)
     usable = _examinable(ctx, spec, findings)
     per_input: dict[str, Any] = {}
     compared: list[OpenedInput] = []
@@ -1050,7 +1094,7 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     expected = _expected_values(params["expected"])
     if len(spec.inputs) != 1:
         raise CheckParamError("INVALID_INPUTS: numeric_agreement compares exactly one input")
-    findings = _Findings()
+    findings = Findings()
     usable = _examinable(ctx, spec, findings)
     evidence: dict[str, Any] = {
         "input": spec.inputs[0],
@@ -1138,19 +1182,19 @@ def check_reviewer_protocol(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     trimming and case folding, so "Reviewer-A" cannot pose as a second reviewer.
     """
     _params(spec)
-    _takes_no_inputs(spec, "reviews.verdicts document")
-    findings = _Findings()
+    takes_no_inputs(spec, "reviews.verdicts document")
+    findings = Findings()
     reviews = ctx.manifest.reviews
     if reviews is None:
         return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no review protocol", {})
     document = ctx.role_document("reviews.verdicts")
     evidence: dict[str, Any] = {"required_reviewers": list(reviews.required_reviewers)}
     if not document.loaded:
-        return _document_unavailable(document, evidence)
+        return document_unavailable(document, evidence)
     try:
         verdicts = _parse_verdicts(document.content)
     except _FormatError as exc:
-        return _malformed_document(document, str(exc), evidence)
+        return malformed_document(document, str(exc), evidence)
 
     def identity(name: str) -> str:
         return name.strip().casefold()
@@ -1294,18 +1338,18 @@ def check_time_source(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     SOURCE_MISMATCH. A missing or unresolvable declaration is ABSTAIN.
     """
     _params(spec)
-    _takes_no_inputs(spec, "time_sources document")
-    findings = _Findings()
+    takes_no_inputs(spec, "time_sources document")
+    findings = Findings()
     document = ctx.role_document("time_sources")
     evidence: dict[str, Any] = {"document": document.to_dict()}
     if not document.declared:
         return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no time_sources", evidence)
     if not document.loaded:
-        return _document_unavailable(document, evidence)
+        return document_unavailable(document, evidence)
     try:
         window, events = _parse_time_sources(document.content)
     except _FormatError as exc:
-        return _malformed_document(document, str(exc), evidence)
+        return malformed_document(document, str(exc), evidence)
     evidence["window"] = {"start": format_utc(window[0]), "end": format_utc(window[1])}
     if not events:
         return findings.not_applicable(Reason.INSUFFICIENT_EVIDENCE, "the time sources list no events", evidence)
@@ -1368,7 +1412,7 @@ def _parse_summary(document: Any) -> tuple[str, dict[str, Mapping[str, Any]], di
 
 
 def _compare_pinned_input(
-    ctx: CheckContext, input_id: str, pin: Mapping[str, Any], findings: _Findings
+    ctx: CheckContext, input_id: str, pin: Mapping[str, Any], findings: Findings
 ) -> dict[str, Any]:
     """Compare one pinned input with what this run read."""
     entry: dict[str, Any] = {"pinned_sha256": pin["sha256"], "pinned_rows": pin.get("rows")}
@@ -1401,7 +1445,7 @@ def _compare_pinned_input(
     return {**entry, "outcome": "UNCHANGED"}
 
 
-def _compare_pinned_document(ctx: CheckContext, path: str, digest: str, findings: _Findings) -> dict[str, Any]:
+def _compare_pinned_document(ctx: CheckContext, path: str, digest: str, findings: Findings) -> dict[str, Any]:
     """Compare one pinned document's digest with the bytes on disk now."""
     current = ctx.read_document(path, role="summary_claim.pinned", parse="bytes")
     entry: dict[str, Any] = {"pinned_sha256": digest, "current_sha256": current.sha256, "state": current.state}
@@ -1427,18 +1471,18 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
     they keep the check from passing (ABSTAIN with BLIND_SPOT).
     """
     _params(spec)
-    _takes_no_inputs(spec, "summary_claim document")
-    findings = _Findings()
+    takes_no_inputs(spec, "summary_claim document")
+    findings = Findings()
     document = ctx.role_document("summary_claim")
     evidence: dict[str, Any] = {"summary": document.to_dict()}
     if not document.declared:
         return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no summary_claim", evidence)
     if not document.loaded:
-        return _document_unavailable(document, evidence)
+        return document_unavailable(document, evidence)
     try:
         status, pinned_inputs, pinned_documents = _parse_summary(document.content)
     except _FormatError as exc:
-        return _malformed_document(document, str(exc), evidence)
+        return malformed_document(document, str(exc), evidence)
     evidence["stored_status"] = status
     if status != Status.PASS.value:
         return findings.not_applicable(
@@ -1459,16 +1503,21 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
     compared_documents = {
         path: _compare_pinned_document(ctx, path, digest, findings) for path, digest in sorted(pinned_documents.items())
     }
-    # Every declared evidence file other than the summary itself should be
-    # pinned. Role paths were validated by the manifest, so they normalize.
+    # Every evidence file other than the summary itself should be pinned:
+    # each declared role document, and each file a specialist check reads
+    # (stored claim outputs, dependency node files), as preloaded before any
+    # check ran. Declared inputs are pinned as inputs instead. Role paths
+    # were validated by the manifest, so they normalize.
     own_role = "summary_claim"
-    declared_documents = {
+    evidence_documents = {
         normalize_relpath(path)
         for role, _ in ROLE_DOCUMENTS
         if role != own_role and (path := ctx.role_path(role)) is not None
     }
+    evidence_documents.update(ctx.preloaded_evidence())
+    evidence_documents -= {document.path, *(opened.record.path for opened in ctx.inputs.values())}
     blind_inputs = sorted(input_id for input_id in ctx.inputs if input_id not in pinned_inputs)
-    blind_documents = sorted(path for path in declared_documents if path not in pinned_documents)
+    blind_documents = sorted(path for path in evidence_documents if path not in pinned_documents)
     evidence.update(
         {
             "inputs": compared_inputs,
@@ -2110,7 +2159,15 @@ def verify(
     Exceptions raised by checks are recorded as ERROR results. An exception
     escaping this function is a defect in the engine itself.
     """
-    path = Path(manifest_path)
+    # One run redacts thousands of strings; the environment is read once for all of them.
+    with redaction_scope():
+        return _verify(Path(manifest_path), live=live, network=network, registry=registry)
+
+
+def _verify(
+    path: Path, *, live: bool, network: NetworkPolicy | None, registry: Mapping[str, str]
+) -> VerificationRun:
+    """The body of :func:`verify`, run inside one redaction scope."""
     started_at = now()
     base_policy = network or NetworkPolicy()
     try:
@@ -2123,7 +2180,7 @@ def verify(
 
     accounting, opened = discover(manifest)
     ctx = CheckContext(manifest, opened, policy)
-    ctx.preload_roles()
+    ctx.preload(spec.kind for spec in manifest.checks)
     run_id = _run_id(
         {
             "manifest_sha256": manifest.sha256,

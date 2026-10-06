@@ -128,6 +128,7 @@ __all__ = [
     "render_markdown",
     "headline",
     "check_dependency_currency",
+    "preload_graph_files",
     "cli_impact",
     "cli_revalidate",
 ]
@@ -1599,6 +1600,34 @@ def _state_outcome(state: Document, evidence: dict[str, Any]) -> CheckOutcome:
         "a saved graph state is never ignored"
     )
     return _unexamined(ExecutionState.SKIPPED, Status.ABSTAIN, Reason.PROTOCOL_BROKEN, diagnostic, evidence)
+
+
+def preload_graph_files(ctx: CheckContext) -> None:
+    """Read the saved graph state and every node file, before any check runs (``verifier.PRELOADS``).
+
+    Reading them up front puts their digests into the run id and in front of
+    ``summary_consistency``, which then reports an unpinned node file as a
+    blind spot. The dependency_currency check later reads the same bytes
+    from the context. An unusable graph reads nothing here: the check
+    reports why.
+    """
+    document = ctx.role_document("dependencies")
+    if not document.loaded:
+        return
+    try:
+        graph = parse_graph(
+            document.content,
+            graph_path=document.path,
+            graph_sha256=document.sha256,
+            root=ctx.root,
+            max_bytes=ctx.limits.max_file_bytes,
+        )
+    except GraphError:
+        return
+    ctx.read_document(graph.state_path, role=STATE_ROLE, parse="json")
+    for node in graph.nodes:
+        if node.path is not None:
+            ctx.read_document(node.path, role=NODE_ROLE, parse="bytes")
 
 
 def check_dependency_currency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:

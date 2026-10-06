@@ -42,7 +42,7 @@ import weakref
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ._clock import ClockError, parse_utc
 from .adapters import frozen as frozen_adapter
@@ -61,7 +61,7 @@ from .adapters.records import (
 from .invariants import ClaimTally
 from .manifests import IDENTIFIER_PATTERN, CheckSpec
 from .models import ExecutionState, FailureMode, InputState, MetadataState, Reason, ResolverState, Status
-from .verifier import MAX_LISTED, CheckContext, CheckOutcome, CheckParamError, Document
+from .verifier import MAX_LISTED, CheckContext, CheckOutcome, CheckParamError, Document, Findings
 
 __all__ = [
     "ENTRIES_SCHEMA",
@@ -180,52 +180,6 @@ COMPARISON_RULES: Mapping[str, str] = {
 # ---------------------------------------------------------------------------
 # Outcome helpers
 # ---------------------------------------------------------------------------
-
-
-class _Findings:
-    """One check's findings, folded into one verdict.
-
-    A recorded fact that contradicts a citation (FAIL) outranks missing
-    evidence (ABSTAIN), and PASS needs no finding at all. The first finding at
-    the winning level names the reason, so the verdict depends only on the
-    order of the documents.
-    """
-
-    def __init__(self) -> None:
-        self._levels: list[tuple[Status, Reason]] = []
-        self._modes: set[FailureMode] = set()
-        self._diagnostics: list[str] = []
-
-    def fail(self, reason: Reason, detail: str, *modes: FailureMode) -> None:
-        self._add(Status.FAIL, reason, detail, modes)
-
-    def abstain(self, reason: Reason, detail: str, *modes: FailureMode) -> None:
-        self._add(Status.ABSTAIN, reason, detail, modes)
-
-    def _add(self, status: Status, reason: Reason, detail: str, modes: Iterable[FailureMode]) -> None:
-        self._levels.append((status, reason))
-        self._modes.update(modes)
-        self._diagnostics.append(detail)
-
-    def outcome(
-        self, *, rows_examined: int, evidence: Mapping[str, Any], claim_tallies: tuple[ClaimTally, ...] = ()
-    ) -> CheckOutcome:
-        verdict, reason = Status.PASS, Reason.VERIFIED
-        for status in (Status.FAIL, Status.ABSTAIN):
-            first = next((level for level in self._levels if level[0] is status), None)
-            if first is not None:
-                verdict, reason = first
-                break
-        return CheckOutcome(
-            execution_state=ExecutionState.CHECKED,
-            verdict=verdict,
-            reason=reason,
-            failure_modes=tuple(sorted(self._modes, key=lambda mode: mode.value)),
-            rows_examined=rows_examined,
-            evidence=evidence,
-            diagnostics=tuple(self._diagnostics),
-            claim_tallies=claim_tallies,
-        )
 
 
 def _not_applicable(reason: Reason, detail: str, evidence: Mapping[str, Any]) -> CheckOutcome:
@@ -442,7 +396,7 @@ def _invocation_summary(log: _Log) -> dict[str, Any]:
     }
 
 
-def _log_coverage(ctx: CheckContext, logged: Sequence[str], findings: _Findings) -> dict[str, Any]:
+def _log_coverage(ctx: CheckContext, logged: Sequence[str], findings: Findings) -> dict[str, Any]:
     """Compare the logged citation ids with the bibliography, when one is declared.
 
     A declared bibliography that cannot be read is missing evidence (ABSTAIN):
@@ -537,7 +491,7 @@ def check_verification_log(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     }
     itemized_verified = len(by_outcome[BACKED]) + len(by_outcome[NARRATED])
 
-    findings = _Findings()
+    findings = Findings()
     if by_outcome[NARRATED]:
         findings.abstain(
             Reason.UNVERIFIED,
@@ -681,7 +635,7 @@ def check_resolver(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     cited_as: dict[str, list[str]] = {}
     for citation in prepared.citations:
         cited_as.setdefault(citation.work.doi, []).append(citation.citation_id)
-    findings = _Findings()
+    findings = Findings()
     for doi, citation_ids in cited_as.items():
         answer = answers[doi]
         label = f"{doi} (cited as {', '.join(citation_ids)})"
@@ -930,7 +884,7 @@ def check_metadata(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
         return prepared
     answers = _resolve(ctx, prepared)
     pool = _reference_pool(prepared.frozen, answers)
-    findings = _Findings()
+    findings = Findings()
     assessments = [_assess(citation, answers[citation.work.doi], pool) for citation in prepared.citations]
     for item in assessments:
         label = f"citation {item.citation.citation_id} ({item.citation.work.doi})"

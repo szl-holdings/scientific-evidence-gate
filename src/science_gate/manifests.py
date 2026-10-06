@@ -44,6 +44,8 @@ __all__ = [
     "CITATIONS_KEYS",
     "REVIEWS_KEYS",
     "CORPUS_KEYS",
+    "SOURCE_LICENSE_KEYS",
+    "APPROVED_REDACTION_KEYS",
     "DEFAULT_LIMITS",
     "UNSAFE_KEYS",
     "INPUT_FORMATS",
@@ -55,6 +57,8 @@ __all__ = [
     "Limits",
     "CitationsSpec",
     "ReviewsSpec",
+    "SourceLicense",
+    "ApprovedRedaction",
     "CorpusSpec",
     "Manifest",
     "load_manifest",
@@ -94,7 +98,10 @@ CHECK_KEYS = frozenset({"id", "kind", "version", "required", "inputs", "params"}
 REQUIRED_CHECK_KEYS = frozenset({"id", "kind", "version"})
 CITATIONS_KEYS = frozenset({"entries", "log", "frozen", "live"})
 REVIEWS_KEYS = frozenset({"required_reviewers", "verdicts"})
-CORPUS_KEYS = frozenset({"access_class", "permissions"})
+CORPUS_KEYS = frozenset({"access_class", "permissions", "source_licenses", "approved_redactions"})
+#: The two text fields of each ``corpus.source_licenses`` and ``corpus.approved_redactions`` entry.
+SOURCE_LICENSE_KEYS = ("source", "license")
+APPROVED_REDACTION_KEYS = ("target", "description")
 DEFAULT_LIMITS: Mapping[str, int] = MappingProxyType(
     {"max_file_bytes": 52_428_800, "max_files": 10_000, "max_rows": 1_000_000}
 )
@@ -217,17 +224,43 @@ class ReviewsSpec:
 
 
 @dataclass(frozen=True)
+class SourceLicense:
+    """The license a data source is declared to carry. Recorded as declared, never verified."""
+
+    source: str
+    license: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"source": self.source, "license": self.license}
+
+
+@dataclass(frozen=True)
+class ApprovedRedaction:
+    """A redaction the data owner declared approved for one target (a file, column or field)."""
+
+    target: str
+    description: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"target": self.target, "description": self.description}
+
+
+@dataclass(frozen=True)
 class CorpusSpec:
-    """Access class and permissions of the corpus.
+    """Access class, permissions, source licenses and approved redactions of the corpus.
 
     When a manifest does not declare a corpus, it is treated as
     CONTROLLED_LOCAL, the most restrictive class. Its data is then never
     copied by packaging, because an undeclared corpus must not be assumed
-    redistributable.
+    redistributable. ``source_licenses`` and ``approved_redactions`` are None
+    when not declared, which packaging reports as NOT_DECLARED; an empty
+    tuple means the manifest declared an empty list.
     """
 
     access_class: AccessClass = AccessClass.CONTROLLED_LOCAL
     permissions: Permissions = field(default_factory=Permissions)
+    source_licenses: tuple[SourceLicense, ...] | None = None
+    approved_redactions: tuple[ApprovedRedaction, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -537,7 +570,42 @@ class _Validator:
         access = AccessClass.CONTROLLED_LOCAL
         if "access_class" in obj:
             access = self.enum(AccessClass, obj["access_class"], _pointer(pointer, "access_class")) or access
-        return CorpusSpec(access, self.permissions(obj.get("permissions", {}), _pointer(pointer, "permissions")))
+        licenses = redactions = None
+        if "source_licenses" in obj:
+            where = _pointer(pointer, "source_licenses")
+            pairs = self.text_pairs(obj["source_licenses"], where, SOURCE_LICENSE_KEYS)
+            licenses = tuple(SourceLicense(*pair) for pair in pairs)
+        if "approved_redactions" in obj:
+            where = _pointer(pointer, "approved_redactions")
+            pairs = self.text_pairs(obj["approved_redactions"], where, APPROVED_REDACTION_KEYS)
+            redactions = tuple(ApprovedRedaction(*pair) for pair in pairs)
+        permissions = self.permissions(obj.get("permissions", {}), _pointer(pointer, "permissions"))
+        return CorpusSpec(access, permissions, licenses, redactions)
+
+    def text_pairs(self, value: Any, pointer: str, names: tuple[str, str]) -> tuple[tuple[str, str], ...]:
+        """A list of objects holding exactly the two text fields ``names``; the first must not repeat.
+
+        A malformed entry is reported and dropped, so validation fails and
+        nothing half-declared reaches a package.
+        """
+        if not isinstance(value, list):
+            self.add(INVALID_TYPE, pointer, f"must be a list of objects with {list(names)}")
+            return ()
+        pairs: list[tuple[str, str]] = []
+        for index, item in enumerate(value):
+            where = _pointer(pointer, index)
+            obj = self.mapping(item, where, "entry")
+            if obj is None:
+                continue
+            self.keys(obj, frozenset(names), frozenset(names), where)
+            texts = [self.text(obj.get(name), _pointer(where, name), name) for name in names if name in obj]
+            if len(texts) != len(names) or None in texts:
+                continue
+            if any(pair[0] == texts[0] for pair in pairs):
+                self.add(DUPLICATE_ID, _pointer(where, names[0]), f"{texts[0]!r} is listed twice")
+                continue
+            pairs.append((texts[0], texts[1]))
+        return tuple(pairs)
 
     def permissions(self, value: Any, pointer: str) -> Permissions:
         obj = self.mapping(value, pointer, "permissions")

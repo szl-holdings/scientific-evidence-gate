@@ -2,6 +2,6 @@ __pycache__/
 *.pyc
 build/
 dist/
-*.egg-info/
+*.egg-info
 science-gate-runs/
-.venv*/
+.venv*

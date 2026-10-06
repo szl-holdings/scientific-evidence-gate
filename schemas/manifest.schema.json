@@ -199,6 +199,32 @@
             "public_display_allowed": {"type": "boolean", "default": false},
             "commercial_use_allowed": {"type": "boolean", "default": false}
           }
+        },
+        "source_licenses": {
+          "description": "Licenses of the data sources, as the data owner declares them. Packages record them as declared; this tool never verifies or asserts a license. Absent means NOT_DECLARED.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["source", "license"],
+            "additionalProperties": false,
+            "properties": {
+              "source": {"type": "string", "minLength": 1, "description": "An input id, a path or a source name; unique within the list."},
+              "license": {"type": "string", "minLength": 1, "description": "The declared license, for example an SPDX expression."}
+            }
+          }
+        },
+        "approved_redactions": {
+          "description": "Redactions the data owner declares approved. Packages record them as declared; packaging itself never alters a file. Absent means NOT_DECLARED.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["target", "description"],
+            "additionalProperties": false,
+            "properties": {
+              "target": {"type": "string", "minLength": 1, "description": "What was redacted (a file, column or field); unique within the list."},
+              "description": {"type": "string", "minLength": 1}
+            }
+          }
         }
       }
     }

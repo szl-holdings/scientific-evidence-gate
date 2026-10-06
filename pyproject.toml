@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61"]
+# 62.3 is the first setuptools that expands "**" in package-data globs.
+requires = ["setuptools>=62.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,7 +15,20 @@ dependencies = []
 science-gate = "science_gate.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+# The repository's fixtures/ and schemas/ ship inside the package as the
+# data-only subpackages science_gate._fixtures and science_gate._schemas, so
+# `science-gate demo` and `science-gate package` work from an installed wheel.
+# science_gate._resources finds them there or, in a checkout, at the root.
+packages = ["science_gate", "science_gate.adapters", "science_gate._fixtures", "science_gate._schemas"]
+# Data comes only from the package-data globs below, never from version-control
+# or MANIFEST.in discovery, so the wheel holds exactly what is listed here.
+include-package-data = false
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools.package-dir]
+"" = "src"
+"science_gate._fixtures" = "fixtures"
+"science_gate._schemas" = "schemas"
+
+[tool.setuptools.package-data]
+"science_gate._fixtures" = ["**/*"]
+"science_gate._schemas" = ["*.schema.json"]

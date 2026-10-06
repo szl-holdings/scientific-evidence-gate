@@ -99,23 +99,49 @@
       "required": ["state", "declared", "assertion", "statement"],
       "additionalProperties": false,
       "properties": {
-        "state": {"const": "NOT_DECLARED"},
-        "declared": {"type": "null"},
+        "state": {"enum": ["NOT_DECLARED", "DECLARED"]},
+        "declared": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["source", "license"],
+                "additionalProperties": false,
+                "properties": {"source": {"type": "string", "minLength": 1}, "license": {"type": "string", "minLength": 1}}
+              }
+            }
+          ]
+        },
         "assertion": {"const": "NOASSERTION"},
         "statement": {"type": "string", "minLength": 1}
       },
-      "description": "The v1 manifest has no field for source licenses, so none are declared and none are asserted (NOASSERTION)."
+      "description": "The manifest's corpus.source_licenses, recorded as declared (null and NOT_DECLARED when absent). The tool itself never asserts a license (NOASSERTION)."
     },
     "approved_redactions": {
       "type": "object",
       "required": ["state", "declared", "statement"],
       "additionalProperties": false,
       "properties": {
-        "state": {"const": "NOT_DECLARED"},
-        "declared": {"type": "null"},
+        "state": {"enum": ["NOT_DECLARED", "DECLARED"]},
+        "declared": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["target", "description"],
+                "additionalProperties": false,
+                "properties": {"target": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}}
+              }
+            }
+          ]
+        },
         "statement": {"type": "string", "minLength": 1}
       },
-      "description": "The v1 manifest has no field for approved redactions. Packaging never alters a file; a file matching a secret pattern is withheld whole instead."
+      "description": "The manifest's corpus.approved_redactions, recorded as declared (null and NOT_DECLARED when absent). Packaging never alters a file; a file matching a secret pattern is withheld whole instead."
     },
     "files": {
       "type": "array",

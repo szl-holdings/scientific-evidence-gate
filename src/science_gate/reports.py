@@ -22,7 +22,8 @@ receipt attests (see :func:`implied_predicate`), and that every check result
 matches its terminal ledger entry. If any of that fails, the recorded status
 is not trusted: the report says so, with status ERROR.
 
-The HTML renderer contract is ``science_gate._html.render(document) -> str``.
+The HTML renderer contract is ``science_gate._html.render(document) -> str``,
+and ``render(document, mutation)`` for the page ``mutate`` writes.
 ``document`` is the ``run.json`` content as a dict, not a live object, so that
 ``verify`` and ``report RUN_DIR`` render from the same input. For a
 re-rendered run it also carries ``reverification``. A run that failed
@@ -51,6 +52,7 @@ from ._canonical import (
 )
 from ._redact import redact, redact_text
 from ._safeio import SafeIOError, safe_read, safe_write
+from .dependencies import STATE_ROLE as GRAPH_STATE_ROLE
 from .invariants import (
     InvariantContext,
     every_invocation_has_terminal_result,
@@ -85,6 +87,7 @@ __all__ = [
     "render_report",
     "sarif_classification",
     "build_sarif",
+    "render_html",
     "write_run",
     "reverify_run_dir",
     "report_run_dir",
@@ -183,7 +186,7 @@ _CHECK_PURPOSES: Mapping[str, str] = {
     "reviewer_protocol": "All required reviewers present, no duplicate verdicts.",
     "time_source": "Declared timezone and normalized UTC exist, agree, and fall inside the window.",
     "verification_log": "Claimed verifications are backed by invocation records.",
-    "citation_resolver": "DOIs resolve in the frozen record set.",
+    "citation_resolver": "DOIs resolve in the frozen record set; live lookups, when enabled, only fill its gaps.",
     "citation_metadata": "Citation metadata matches the resolved records.",
     "claim_registry": "Manuscript numbers are registered claims with a derivation.",
     "dependency_currency": "No stale dependency blocks publication.",
@@ -597,7 +600,12 @@ def _unresolved_section(
         if closure.get("holds") is None:
             items.append(f"row closure of input {_code(record.get('id'))} not evaluated ({_md(closure.get('source'))})")
     for document in doc.get("documents") or []:
-        if document.get("state") != "PARSED":
+        if document.get("state") == "MISSING" and GRAPH_STATE_ROLE in (document.get("roles") or ()):
+            # Normal for a graph no impact or revalidate command has touched yet.
+            items.append(
+                f"no saved graph state at {_code(document.get('path'))}: the graph's declared node states were used"
+            )
+        elif document.get("state") != "PARSED":
             state = f"{_md(document.get('state'))}: {_md(document.get('diagnostic'))}"
             items.append(f"document {_code(document.get('path'))} is {state}")
     for check in doc.get("checks") or []:
@@ -865,33 +873,37 @@ class WrittenRun:
     paths: tuple[Path, ...]
 
 
-def _render_html(document: Mapping[str, Any], root: Path) -> tuple[str | None, str | None]:
-    """Render ``report.html`` with ``science_gate._html.render(document)`` if installed.
+def render_html(
+    document: Mapping[str, Any], root: Path, *, mutation: Mapping[str, Any] | None = None, name: str = REPORT_HTML
+) -> tuple[str | None, str | None]:
+    """Render a page with ``science_gate._html.render(document, mutation)`` if installed.
 
     Returns ``(html, note)``. ``note`` is None when the page was rendered,
-    and otherwise says why it was not. The dashboard is a view of the run,
-    not evidence, so a missing or failing renderer is reported in
-    ``report.md`` rather than changing the decided status. An older
-    ``report.html`` already in ``root`` is left alone, and the note says so,
-    so a stale page is never mistaken for a view of this run.
+    and otherwise says why it was not. The page is a view of the run (and,
+    for ``mutate``, of its mutation report), not evidence, so a missing or
+    failing renderer is reported rather than changing any status. An older
+    page called ``name`` already in ``root`` is left alone, and the note
+    says so, so a stale page is never mistaken for a view of this run.
     """
     try:
         spec = importlib.util.find_spec(HTML_RENDERER)
     except (ImportError, ValueError):  # a half-registered module: treat it as absent
         spec = None
     if spec is None:
-        note = f"report.html was not written: the HTML renderer ({HTML_RENDERER}) is not installed"
+        note = f"{name} was not written: the HTML renderer ({HTML_RENDERER}) is not installed"
     else:
         try:
-            html = importlib.import_module(HTML_RENDERER).render(document)
+            renderer = importlib.import_module(HTML_RENDERER).render
+            # A run page keeps the one-argument contract; only a mutation page passes the report too.
+            html = renderer(document) if mutation is None else renderer(document, mutation)
         except Exception as exc:  # a view must never take the run's evidence down with it
-            note = redact_text(f"report.html was not written: the HTML renderer failed ({type(exc).__name__}: {exc})")
+            note = redact_text(f"{name} was not written: the HTML renderer failed ({type(exc).__name__}: {exc})")
         else:
             if isinstance(html, str):
                 return html, None
-            note = f"report.html was not written: the HTML renderer returned {type(html).__name__}, not text"
-    if (root / REPORT_HTML).is_file():
-        note += "; the report.html already in this directory was left unchanged and does not reflect this rendering"
+            note = f"{name} was not written: the HTML renderer returned {type(html).__name__}, not text"
+    if (root / name).is_file():
+        note += f"; the {name} already in this directory was left unchanged and does not reflect this rendering"
     return None, note
 
 
@@ -907,7 +919,7 @@ def write_run(run: VerificationRun, output_dir: str | Path, *, environ: Mapping[
         run.result, ledger_head_sha256=seal["ledger_head_sha256"], ledger_length=seal["ledger_length"], environ=environ
     )
     document = run_document(run, receipt)
-    html, html_note = _render_html(document, root)
+    html, html_note = render_html(document, root)
     names = [name for name in RUN_FILES if name != REPORT_HTML or html is not None]
     payloads = {
         RUN_JSON: pretty_json_bytes(document),
@@ -1163,7 +1175,7 @@ def report_run_dir(run_dir: str | Path, *, environ: Mapping[str, str] | None = N
         problem = f"MALFORMED_RUN: run.json could not be rendered ({type(exc).__name__})"
         reverification = replace(reverification, ok=False, problems=(*reverification.problems, problem))
         document = _placeholder_document(root)
-    html, html_note = _render_html(_html_view(document, reverification), root)
+    html, html_note = render_html(_html_view(document, reverification), root)
     written = [REPORT_MD] + ([REPORT_HTML] if html is not None else [])
     present = [name for name in RUN_FILES if name in written or (root / name).is_file()]
     text = render_report(document, files=present, html_note=html_note, reverification=reverification)

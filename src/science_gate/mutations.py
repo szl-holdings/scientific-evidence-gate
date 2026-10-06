@@ -74,6 +74,8 @@ from .discovery import row_key_of
 from .invariants import parse_decimal
 from .manifests import CheckSpec, InputSpec, Limits, Manifest, ManifestError, load_manifest
 from .models import EXIT_CODE, CheckResult, ExecutionState, FailureMode, InputAccounting, Reason, Status
+from .receipts import build_run_receipt
+from .reports import render_html, run_document
 from .verifier import (
     REGISTRY,
     CheckContext,
@@ -91,6 +93,7 @@ __all__ = [
     "MUTATION_REPORT_SCHEMA",
     "MUTATION_REPORT_JSON",
     "MUTATION_REPORT_MD",
+    "MUTATION_REPORT_HTML",
     "INVALID_BASELINE_MESSAGE",
     "NO_EXECUTION_MESSAGE",
     "COUNT_KEYS",
@@ -120,6 +123,7 @@ __all__ = [
 MUTATION_REPORT_SCHEMA = "science-gate-mutation-report/v1"
 MUTATION_REPORT_JSON = "mutation-report.json"
 MUTATION_REPORT_MD = "mutation-report.md"
+MUTATION_REPORT_HTML = "mutation-report.html"
 
 #: Printed, verbatim, whenever the accepting baseline is not PASS (section 10).
 INVALID_BASELINE_MESSAGE = "No sensitivity figure was produced because the verifier failed its accepting baseline."
@@ -1426,6 +1430,9 @@ class MutationReport:
     selected: tuple[str, ...]
     mutations: tuple[MutationRecord, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    #: The baseline run's ``run.json`` document, for the HTML view only. It is
+    #: not part of the report body, so it never affects ``report_id``.
+    baseline_run: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.baseline.valid and self.mutations:
@@ -1795,6 +1802,30 @@ def _limits(path: Path, registry: Mapping[str, str]) -> Limits:
         return Limits()
 
 
+def _scrubbed_value(value: Any, scrub: _Scrubber) -> Any:
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, Mapping):
+        return {key: _scrubbed_value(item, scrub) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrubbed_value(item, scrub) for item in value]
+    return value
+
+
+def _baseline_document(run: VerificationRun, scrub: _Scrubber) -> dict[str, Any]:
+    """The baseline's ``run.json`` document, for the page :func:`write_mutation_report` renders.
+
+    The baseline run lives only in the deleted workspace, so its receipt is
+    built here, unsigned, and never written. The page shows that receipt's
+    content hash; ``report RUN_DIR`` cannot re-verify a run nobody wrote.
+    """
+    seal = run.ledger.seal()
+    receipt = build_run_receipt(
+        run.result, ledger_head_sha256=seal["ledger_head_sha256"], ledger_length=seal["ledger_length"], environ={}
+    )
+    return _scrubbed_value(run_document(run, receipt), scrub)
+
+
 def _baseline_summary(run: VerificationRun, scrub: _Scrubber) -> BaselineSummary:
     counters = {name: run.result.counters.get(name) for name in _BASELINE_COUNTERS}
     findings = tuple({**finding.to_dict(), "detail": scrub(finding.detail)} for finding in run.findings)
@@ -1841,6 +1872,7 @@ def mutate(
             return MutationReport(**report, baseline=BaselineSummary(None, None, None, diagnostics=(str(exc),)))
         baseline = verify(pristine / source.name, network=_OFFLINE, registry=registry)
         summary = _baseline_summary(baseline, scrub)
+        report["baseline_run"] = _baseline_document(baseline, scrub)
         if not summary.valid or baseline.manifest is None:
             return MutationReport(**report, baseline=summary, diagnostics=notes)
         harness = _Harness(_Context(pristine, source.name, baseline, registry), workspace, frozenset(selected), scrub)
@@ -1962,12 +1994,23 @@ def render_markdown(report: MutationReport) -> str:
     return "\n".join(lines)
 
 
-def write_mutation_report(report: MutationReport, output_dir: str | Path) -> tuple[Path, Path]:
-    """Write ``mutation-report.json`` and ``mutation-report.md`` into ``output_dir`` with safe writes."""
+def write_mutation_report(report: MutationReport, output_dir: str | Path) -> tuple[Path, ...]:
+    """Write ``mutation-report.json``, ``mutation-report.md`` and ``mutation-report.html`` with safe writes.
+
+    The page is the section 12 view: the baseline run's evidence boundary
+    with the detected-versus-blind-spot constellation. Like ``report.html``
+    it is a view, not evidence, so without an HTML renderer only the JSON
+    and Markdown reports are written. Returns the paths in write order.
+    """
     root = Path(output_dir)
-    json_path = safe_write(root, MUTATION_REPORT_JSON, pretty_json_bytes(report.to_dict()))
-    md_path = safe_write(root, MUTATION_REPORT_MD, render_markdown(report).encode("utf-8"))
-    return json_path, md_path
+    paths = [
+        safe_write(root, MUTATION_REPORT_JSON, pretty_json_bytes(report.to_dict())),
+        safe_write(root, MUTATION_REPORT_MD, render_markdown(report).encode("utf-8")),
+    ]
+    html, _ = render_html(report.baseline_run or {}, root, mutation=report.to_dict(), name=MUTATION_REPORT_HTML)
+    if html is not None:
+        paths.append(safe_write(root, MUTATION_REPORT_HTML, html.encode("utf-8")))
+    return tuple(paths)
 
 
 def _emit(stream: TextIO, text: str) -> None:
@@ -1979,8 +2022,9 @@ def _emit(stream: TextIO, text: str) -> None:
 def cli_mutate(args: argparse.Namespace) -> int:
     """``science-gate mutate MANIFEST [--output DIR]``; returns the exit code.
 
-    Writes ``mutation-report.json`` and ``mutation-report.md`` into
-    ``--output`` (default ``./science-gate-runs/<report_id>/``), then prints
+    Writes ``mutation-report.json``, ``mutation-report.md`` and
+    ``mutation-report.html`` into ``--output`` (default
+    ``./science-gate-runs/<report_id>/``), then prints
     the headline and the paths. Exit 0 means a valid baseline and no blind
     spot. Exit 1 means INVALID_BASELINE or at least one blind spot. Exit 2
     means nothing executed. Exit 3 means the report could not be written.

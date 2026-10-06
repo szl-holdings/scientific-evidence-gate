@@ -9,7 +9,8 @@ import os
 import unittest
 from unittest import mock
 
-from science_gate._redact import REDACTED, redact, redact_text
+from science_gate import _redact
+from science_gate._redact import REDACTED, redact, redact_text, redaction_scope
 
 FAKE_ENV_SECRET = "synthetic-env-value-not-a-real-secret"
 
@@ -57,6 +58,28 @@ class RedactValueTests(unittest.TestCase):
         self.assertEqual(redacted[REDACTED], [REDACTED, ["ok", REDACTED]])
         self.assertEqual(redacted["set"], frozenset({REDACTED}))
         self.assertEqual((redacted["n"], redacted["none"]), (7, None))
+
+
+class RedactionScopeTests(unittest.TestCase):
+    def test_a_scope_reads_the_environment_once(self) -> None:
+        with mock.patch.dict(os.environ, {"SYNTHETIC_SERVICE_TOKEN": FAKE_ENV_SECRET}):
+            with mock.patch.object(_redact, "_environment_secrets", wraps=_redact._environment_secrets) as scan:
+                with redaction_scope():
+                    for _ in range(50):
+                        self.assertEqual(redact_text(FAKE_ENV_SECRET), REDACTED)
+                self.assertEqual(scan.call_count, 1)
+
+    def test_redact_reads_the_environment_once_per_call(self) -> None:
+        with mock.patch.dict(os.environ, {"SYNTHETIC_SERVICE_TOKEN": FAKE_ENV_SECRET}):
+            with mock.patch.object(_redact, "_environment_secrets", wraps=_redact._environment_secrets) as scan:
+                self.assertEqual(redact({"a": [FAKE_ENV_SECRET] * 20}), {"a": [REDACTED] * 20})
+                self.assertEqual(scan.call_count, 1)
+
+    def test_outside_a_scope_a_newly_set_secret_is_seen_at_once(self) -> None:
+        with redaction_scope():
+            pass
+        with mock.patch.dict(os.environ, {"SYNTHETIC_SERVICE_TOKEN": FAKE_ENV_SECRET}):
+            self.assertEqual(redact_text(FAKE_ENV_SECRET), REDACTED)
 
 
 if __name__ == "__main__":

@@ -122,6 +122,8 @@ class ValidManifestTests(TempDirTestCase):
         self.assertIs(manifest.inputs[0].denominator_source, DenominatorSource.UNAVAILABLE)
         self.assertIsNone(manifest.inputs[0].expected_rows)
         self.assertEqual((manifest.limits.max_file_bytes, manifest.limits.max_files), (52_428_800, 10_000))
+        self.assertIsNone(manifest.corpus.source_licenses, "nothing declared is not an empty declaration")
+        self.assertIsNone(manifest.corpus.approved_redactions)
         # An undeclared corpus is treated as the most restrictive class.
         self.assertIs(manifest.corpus.access_class, AccessClass.CONTROLLED_LOCAL)
         self.assertIsNone(manifest.reviews)
@@ -147,6 +149,25 @@ class ValidManifestTests(TempDirTestCase):
         document = manifest_document()
         document["inputs"][0]["path"] = "../outside.csv"
         self.assertEqual(parse(document).inputs[0].path, "../outside.csv")
+
+
+class CorpusDeclarationTests(unittest.TestCase):
+    def test_source_licenses_and_approved_redactions_are_kept_as_declared(self) -> None:
+        corpus = {
+            "access_class": "SYNTHETIC",
+            "source_licenses": [{"source": "measurements", "license": "CC0-1.0"}],
+            "approved_redactions": [
+                {"target": "data/measurements.csv", "description": "synthetic notes column removed"}
+            ],
+        }
+        manifest = parse(manifest_document(corpus=corpus))
+        self.assertEqual([item.to_dict() for item in manifest.corpus.source_licenses], corpus["source_licenses"])
+        self.assertEqual([item.to_dict() for item in manifest.corpus.approved_redactions], corpus["approved_redactions"])
+
+    def test_an_empty_list_is_a_declaration_of_none(self) -> None:
+        manifest = parse(manifest_document(corpus={"access_class": "SYNTHETIC", "source_licenses": []}))
+        self.assertEqual(manifest.corpus.source_licenses, ())
+        self.assertIsNone(manifest.corpus.approved_redactions)
 
 
 class InvalidManifestTests(TempDirTestCase):
@@ -290,6 +311,19 @@ class InvalidManifestTests(TempDirTestCase):
         corpus = {"access_class": "PUBLIC", "permissions": {"training_allowed": 1}}
         self.assertCodes(manifest_document(corpus=corpus), "INVALID_TYPE")
         self.assertCodes(manifest_document(citations={"live": "true"}), "INVALID_TYPE")
+
+    def test_declared_source_licenses_and_redactions_must_be_well_formed(self) -> None:
+        def corpus(**fields: Any) -> dict[str, Any]:
+            return manifest_document(corpus={"access_class": "SYNTHETIC", **fields})
+
+        self.assertCodes(corpus(source_licenses={"measurements": "CC0-1.0"}), "INVALID_TYPE")
+        self.assertCodes(corpus(source_licenses=[{"source": "measurements"}]), "MISSING_FIELD")
+        self.assertCodes(corpus(source_licenses=[{"source": "measurements", "license": " "}]), "INVALID_TYPE")
+        self.assertCodes(corpus(source_licenses=[{"source": "m", "license": "x", "url": "u"}]), "UNKNOWN_KEY")
+        twice = [{"source": "measurements", "license": "A"}, {"source": "measurements", "license": "B"}]
+        self.assertCodes(corpus(source_licenses=twice), "DUPLICATE_ID")
+        self.assertCodes(corpus(approved_redactions=[{"target": "data/x.csv"}]), "MISSING_FIELD")
+        self.assertCodes(corpus(approved_redactions=["column notes"]), "INVALID_TYPE")
 
     def test_all_problems_are_reported_together(self) -> None:
         document = manifest_document(extra=1, claims="../x.json")

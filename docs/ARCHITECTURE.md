@@ -532,3 +532,228 @@ prints a one-line status headline first, then the paths it wrote.
 - Determinism is tested by running the CLI twice, with `PYTHONHASHSEED=0` and
   `PYTHONHASHSEED=4242` and a fixed clock, and comparing the output
   byte-for-byte.
+- `tests/test_security.py` covers section 15, and `tests/test_determinism.py`
+  applies the two-seed comparison to `verify`, `report`, `mutate`,
+  `package`, `impact` and `revalidate`. The demo (17.11) is its own
+  acceptance test.
+
+## 17. Recorded implementation decisions
+
+Sections 0 to 16 are the contract. This section records how the code fills
+the places they leave open, so that readers and later changes do not have to
+rediscover them. Where tests enforce a decision, it binds like the rest of
+this file.
+
+### 17.1 Vocabulary, manifests and input accounting (sections 1 to 3)
+
+- `models.InputState` names an input's state: `PARSED`, `PARTIAL`, `EMPTY`,
+  `MISSING`, `REFUSED`, `OPEN_FAILED`, `PARSE_ERROR`, `HASH_MISMATCH`. Only
+  `PARSED` is complete. Each input lands in exactly one closure bucket:
+  PARSED is admitted, PARTIAL deferred, EMPTY and a required MISSING
+  unresolved, an optional MISSING excluded, and REFUSED, OPEN_FAILED,
+  PARSE_ERROR and HASH_MISMATCH failed.
+- Run-level counters count declared input files; row counts live per input.
+  `expected` is INDEPENDENT (it comes from the manifest) and `examined`
+  starts UNAVAILABLE until the verifier sets it. The meaningful closure is
+  per input: rows accounted against an INDEPENDENT `expected_rows`.
+- Some outcomes are unrepresentable: a CheckResult with PASS or FAIL is
+  CHECKED, PASS always pairs with VERIFIED, a closure holds only against an
+  INDEPENDENT source with known counts, and an absent count is UNAVAILABLE.
+- Manifests also accept the `jsonl` input format. Unknown keys are refused
+  at every object level (check `params` are free-form but still get the
+  unsafe-key refusal). `expected_rows` and a non-UNAVAILABLE
+  `denominator_source` are declared together.
+- `corpus` may also declare `source_licenses` (a list of
+  `{source, license}`) and `approved_redactions` (a list of
+  `{target, description}`). Both are recorded as declared and never
+  verified; absent means NOT_DECLARED.
+- `_safeio` adds the code `SYMLINK_LOOP`.
+
+### 17.2 Ledger and invariants (section 4)
+
+- Each invocation is two append-only entries that share one
+  `invocation_id`: a STARTED entry written before the check runs and a
+  terminal entry written after. The id derives from the STARTED entry's
+  `seq`, so `ledger_length` counts entries, not invocations, and a missing
+  terminal entry is provable.
+- The four `pass_requires_*` invariants apply only when a check result is
+  PASS or the run's tentative status is PASS; otherwise they are not
+  applicable (`holds` null). `invariants.VIOLATION_OUTCOMES` maps each
+  invariant to its status, reason and failure mode. The detail of
+  `pass_requires_examined_rows` is a per-check total ("per-check rows
+  examined total=N"); `run.json`'s `rows_examined` counts distinct rows.
+
+### 17.3 Engine and decision (sections 5 and 6)
+
+- `CheckOutcome` has one more field, `claim_tallies`, which feeds
+  `checked_claims_le_invocations`.
+- `verifier.Findings`, `takes_no_inputs`, `document_unavailable` and
+  `malformed_document` are public, so specialist checks fold findings into
+  a verdict by the same rule.
+- Before any check runs, the engine reads every declared role document and,
+  through `verifier.PRELOADS`, every file that a check of a declared kind
+  will read: stored claim outputs (`claims.preload_stored_outputs`), and
+  dependency node files and the saved graph state
+  (`dependencies.preload_graph_files`). Their digests feed the run id,
+  every check sees the same bytes, and `summary_consistency` can name them.
+- Run-level check counters count required checks only. A required check
+  counts as executed only if it reached CHECKED and has a terminal ledger
+  invocation. Extra counters: `checks_declared`, `checks_errored`,
+  `checks_skipped`, `checks_not_applicable`, `inputs_parsed`,
+  `inputs_examined`. Unknown values are null.
+- `decide()`: a FAIL or ABSTAIN from an optional check stays visible but
+  does not decide the run; an ERROR from any check always does. An input
+  REFUSED for a path-safety reason makes the run ERROR. HASH_MISMATCH on any
+  input makes the run FAIL. Findings are gathered in the order manifest,
+  inputs, checks, contract, invariants, and that order breaks ties for the
+  primary reason.
+- Role-document formats the verifier defines: `science-gate-snapshot/v1`,
+  `science-gate-reviews/v1`, `science-gate-time-sources/v1` (a window plus
+  events with `local_time`, `timezone` and `utc`) and
+  `science-gate-summary/v1` (`status`, `pinned.inputs`, `pinned.documents`).
+  Output schemas: `science-gate-run/v1`, and
+  `science-gate-evidence-manifest/v1`, whose `absent` list names missing
+  evidence instead of dropping it.
+- `time_source` accepts only `UTC`, `Z` or a fixed offset; a named zone is
+  ABSTAIN with REQUIRES_HUMAN_REVIEW. `snapshot_completeness` claims a
+  deleted row only for a fully PARSED input.
+- `summary_consistency`: a PASS summary that pins nothing is ABSTAIN with
+  UNVERIFIED. Every evidence file it does not pin is reported as ABSTAIN
+  with BLIND_SPOT: declared inputs, declared role documents, and preloaded
+  files that exist (stored outputs, node files), except the summary itself
+  and files that are declared inputs. A pinned file that changed is FAIL with
+  SOURCE_MISMATCH.
+- Every command runs inside one `_redact.redaction_scope()`, which reads the
+  secret-named environment variables once; `verify()` enters its own scope.
+
+### 17.4 Claims (section 7)
+
+- The registry is `{schema: "science-gate-claims/v1", claims: [...],
+  not_claims?}`. `not_claims` lists numbers a reviewer declared are not
+  claims, pinned to the manuscript's sha256; after any manuscript edit, none
+  of them apply.
+- A selector is an RFC 6901 JSON Pointer into a JSON stored output, or
+  `{row: {column: cell}, column}`, which selects exactly one CSV row. Stored
+  outputs are read with the role `claims.stored_output`.
+- Only the stored-output link is tested (DIGEST_MATCHES, DIGEST_MISMATCH,
+  UNAVAILABLE, or MISSING). The other links are checked for presence and
+  reported as DECLARED, never as confirmed.
+- Each claim gets one disposition, in this precedence:
+  STORED_OUTPUT_CHANGED and VALUE_DISAGREES (FAIL SOURCE_MISMATCH),
+  EPHEMERAL_CLAIM and INCOMPLETE_CHAIN (ABSTAIN UNVERIFIED),
+  STORED_OUTPUT_UNAVAILABLE and VALUE_NOT_LOCATED (ABSTAIN
+  INSUFFICIENT_EVIDENCE), REQUIRES_HUMAN_REVIEW, RESOLVED. FAIL needs a
+  contradicted recorded fact, never absent evidence.
+- The manuscript scan (`claims.SCAN_RULE`) skips identifiers and masks URLs
+  and DOIs. A token matches a claim only when its value and its printed
+  decimals are equal. With a registry but no manuscript, the check is
+  ABSTAIN with BLIND_SPOT. `rows_examined` counts claims plus manuscript
+  tokens.
+
+### 17.5 Dependencies (section 8)
+
+- Node paths are relative to the manifest directory. The graph's `schema`
+  key is optional (`science-gate-graph/v1` when present).
+- `graph-state.json` (`science-gate-graph-state/v1`) holds only transitions
+  this tool made; `graph.json` is never rewritten. A state file that exists
+  but cannot be used is never ignored.
+- History entries add `trigger`, `recorded_sha256_before`,
+  `recorded_sha256_after` and `observed_sha256` to `{at, from, to, reason}`.
+- `impact` also marks the origin itself. Each pending node keeps
+  `stale_because`; early cutoff removes one cause and restores a node only
+  when none remains, to the state recorded before it went stale.
+- `revalidate` has outcomes beyond the contract's two:
+  REFUSED_UPSTREAM_PENDING, NO_FILE_TO_HASH and FILE_UNAVAILABLE.
+- `publication_block.blocked` is true, false (only when the assessment is
+  PASS) or null (undetermined).
+- The commands print the headline, the two paths written
+  (`graph-state.json`, then `impact-report.json` or
+  `revalidation-report.json`, schema `science-gate-impact/v1`), a blank line
+  and the Markdown report.
+
+### 17.6 Citations (section 9)
+
+- Documents: `science-gate-citations/v1` (each citation with DOI, title,
+  `{family, given}` authors, year, journal, volume and issue),
+  `science-gate-citations-frozen/v1` (one record per DOI with outcome FOUND,
+  NOT_FOUND or ERROR, the HTTP status, the work and the six provenance
+  fields), and an optional `science-gate-verification-log/v1` tag on the
+  log.
+- The primary disposition is a MetadataState value or SOURCE_UNAVAILABLE.
+  RECORD_NOT_FOUND_UNDER_RECORDED_QUERIES is used only for a captured
+  NOT_FOUND answer. Defects: DOI_WORK_MISMATCH, TITLE_MISMATCH,
+  AUTHOR_MISMATCH, AUTHOR_ORDER_MISMATCH, YEAR_MISMATCH, JOURNAL_MISMATCH,
+  VOLUME_MISMATCH, ISSUE_MISMATCH, CONFLATED_ENTRY.
+- Live lookups only fill gaps: a usable frozen record always answers, and
+  each DOI is fetched live at most once per run. The three citation checks
+  take no inputs and no params.
+
+### 17.7 Mutation testing (section 10)
+
+- Detection is judged from the verifier's findings: the expected detector
+  must produce a finding with an allowed status and signal. A verifier crash
+  under a mutant is an escape. Records add `target`, and the result fields
+  of a mutation that did not execute are null.
+- The report schema is `science-gate-mutation-report/v1`. The count keys sit
+  at top level. Sensitivity is `{detected, executed, fraction, decimal}`,
+  rounded ROUND_HALF_EVEN to 4 places.
+- Operators that change an input's bytes re-declare its digest; M07 covers
+  the digest itself. M13 acts on the citation verification log. M16 and M17
+  replay the sealed baseline through `decide`. Every verify runs offline.
+- `mutate` writes `mutation-report.json`, `mutation-report.md` and
+  `mutation-report.html`. The page is the baseline run's page (built from an
+  unsigned receipt that is never written) with the detected-versus-blind-spot
+  constellation.
+
+### 17.8 Receipts (section 11)
+
+- Subject names are input ids. The predicate also carries every input's
+  state and digest, each check's `evidence_sha256` and the invariant
+  outcomes, so an evidence change beneath an unchanged PASS changes
+  `content_sha256`.
+- Signing uses the key file's exact bytes. An empty, oversized, missing or
+  unreadable key file gives UNSIGNED.
+
+### 17.9 Reports (section 12)
+
+- The HTML contract is `science_gate._html.render(run, mutation=None) ->
+  str`, where `run` is the `run.json` document. A re-rendered run carries
+  `reverification`, and a rejected one is passed as ERROR with
+  `recorded_status`. The renderer re-reads a mutation report rather than
+  trusting it, and draws a recorded PASS that the document's own figures
+  contradict as unsupported.
+- `report.md` adds FILES and, on re-render, RE-VERIFICATION after the nine
+  contract headings. A `graph-state.json` that does not exist yet is listed
+  as "no saved graph state ...: the graph's declared node states were used".
+- `report RUN_DIR` also checks `run.json` against the receipt predicate and
+  each check against its terminal ledger entry; any mismatch is ERROR.
+
+### 17.10 Packaging (section 13)
+
+- Layout: `package.json` (`science-gate-package/v1`, written last),
+  `schemas/`, `expected/receipt.json`, and `evaluation/` holding the
+  manifest-relative paths. The expected results are the reproducible
+  projection of the receipt predicate (`packaging.REPRODUCIBLE_FIELDS`).
+- "An input directory" is the manifest directory. "Default synthetic
+  permissions" means a SYNTHETIC corpus that declares no permission keys.
+  The manifest follows the data rule. Extra refusals: EVALUATION_NOT_ALLOWED
+  and UNSAFE_DECLARED_PATH. Exit 0 for a COMPLETE package, 2 for an
+  INCOMPLETE one, 3 for any refusal.
+- `source_licenses` and `approved_redactions` are recorded as DECLARED (as
+  the manifest states them) or NOT_DECLARED. The tool's own license
+  assertion is always NOASSERTION.
+
+### 17.11 Packaged data and the demo (section 14)
+
+- `fixtures/` and `schemas/` ship inside the wheel as the data-only
+  subpackages `science_gate._fixtures` and `science_gate._schemas`.
+  `science_gate._resources.bundled_dir()` finds them there or, in a source
+  checkout, at the repository root.
+- `demo` copies the fixtures it needs into `--output` (a new temporary
+  directory by default; an existing non-empty directory is refused with exit
+  3), runs `verify`, `report`, `mutate`, `impact`, `revalidate` and
+  `package` in process, and compares each outcome with an expectation
+  written in advance. It prints the headline, the paths written, a blank
+  line and the expected-versus-actual table, and writes `demo-summary.json`
+  (`science-gate-demo/v1`) and `demo-summary.md`. It exits 0 only when every
+  expectation holds, and 1 otherwise.
