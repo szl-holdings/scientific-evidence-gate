@@ -1,0 +1,42 @@
+[
+  {
+    "source": "CROSSREF_UPDATED_BY",
+    "snapshot_sha256": "3e50f31d7d2369aba89a2a7333ea230bcd3990ca734cc664872d4cbd2f0e1103",
+    "captured_at": "2026-03-01T08:00:00Z",
+    "consulted_dois": [
+      "10.5555/sgate.fx.0001",
+      "10.5555/sgate.fx.0002",
+      "10.5555/sgate.fx.0003"
+    ],
+    "notices": []
+  },
+  {
+    "source": "RETRACTION_WATCH_SNAPSHOT",
+    "snapshot_sha256": "67d54123c26a7bf61f5f5da23b86bcd86d8194ca2a1a57631081d9fa2ed72786",
+    "captured_at": "2026-03-02T08:00:00Z",
+    "consulted_dois": [
+      "10.5555/sgate.fx.0001",
+      "10.5555/sgate.fx.0002",
+      "10.5555/sgate.fx.0003"
+    ],
+    "notices": []
+  },
+  {
+    "source": "OPENALEX_IS_RETRACTED",
+    "snapshot_sha256": "c9e2011c602dfaa9ff013c02d68737fd23aeabf0b233f5e44fa0ebb59447002d",
+    "captured_at": "2024-01-15T08:00:00Z",
+    "consulted_dois": [
+      "10.5555/sgate.fx.0001",
+      "10.5555/sgate.fx.0002",
+      "10.5555/sgate.fx.0003"
+    ],
+    "notices": [
+      {
+        "doi": "10.5555/sgate.fx.0001",
+        "type": "RETRACTION",
+        "date": "2024-01-10",
+        "notice_id": "OA-FLAG-0001"
+      }
+    ]
+  }
+]

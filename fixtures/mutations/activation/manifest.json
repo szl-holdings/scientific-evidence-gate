@@ -1,0 +1,34 @@
+{
+  "checks": [
+    {
+      "id": "rows",
+      "inputs": [
+        "samples"
+      ],
+      "kind": "row_count",
+      "required": true,
+      "version": "1"
+    }
+  ],
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  },
+  "dependencies": "graph/graph.json",
+  "inputs": [
+    {
+      "denominator_source": "INDEPENDENT",
+      "expected_rows": 3,
+      "format": "csv",
+      "id": "samples",
+      "path": "data/samples.csv",
+      "required": true,
+      "row_key": [
+        "sample_id"
+      ],
+      "sha256": "d22650268c556ab195a2f842aafc40708abc62fb96d0802bb876096bf9d6f5f0"
+    }
+  ],
+  "run_label": "synthetic-mutation-activation",
+  "schema": "science-gate-manifest/v1"
+}

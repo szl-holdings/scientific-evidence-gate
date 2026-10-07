@@ -1,0 +1,61 @@
+{
+  "cases": [
+    {
+      "brief_case": 1,
+      "description": "The PASS result for check 'rows' keeps kind 'pass' but carries level 'error'.",
+      "export": "results.sarif",
+      "id": "sarif-level-error-on-pass",
+      "problem": "SARIF_LEVEL_WITHOUT_FAIL"
+    },
+    {
+      "brief_case": 2,
+      "description": "An ERROR run (check 'boom' errored) whose SARIF invocation still says executionSuccessful true; its error notification is kept, so only the tool-health flag is wrong.",
+      "export": "results.sarif",
+      "id": "sarif-error-run-execution-successful",
+      "problem": "SARIF_EXECUTION_SUCCESS_ON_ERROR"
+    },
+    {
+      "brief_case": 3,
+      "description": "The result for the declared, ABSTAINing check 'reviews' is missing from the SARIF log.",
+      "export": "results.sarif",
+      "id": "sarif-planned-check-dropped",
+      "problem": "SARIF_CHECK_MISSING"
+    },
+    {
+      "brief_case": 4,
+      "description": "Check 'duplicates' FAILed in run.json, but its SARIF result says kind 'pass' (with level 'none').",
+      "export": "results.sarif",
+      "id": "sarif-pass-kind-for-failed-check",
+      "problem": "SARIF_KIND_MISMATCH"
+    },
+    {
+      "brief_case": 5,
+      "description": "report.md without its WHAT THIS RESULT DOES NOT PROVE section.",
+      "export": "report.md",
+      "id": "report-missing-not-prove",
+      "problem": "REPORT_HEADING_MISSING"
+    },
+    {
+      "brief_case": 6,
+      "description": "report.md with WHAT ABSTAINED before WHAT FAILED; every heading is present.",
+      "export": "report.md",
+      "id": "report-headings-out-of-order",
+      "problem": "REPORT_HEADING_ORDER"
+    },
+    {
+      "brief_case": null,
+      "description": "run.json says checks_executed 3, but required check 'reviews' was SKIPPED: only 2 reached CHECKED.",
+      "export": "run.json",
+      "id": "run-checks-executed-overstated",
+      "problem": "RUN_CHECKS_EXECUTED_MISMATCH"
+    },
+    {
+      "brief_case": null,
+      "description": "report.md names the run's rows_examined 'Rows examined in scope', a second name for one quantity (G5).",
+      "export": "report.md",
+      "id": "report-rows-examined-renamed",
+      "problem": "REPORT_ROWS_EXAMINED_MISMATCH"
+    }
+  ],
+  "schema": "science-gate-exporter-fixtures/v1"
+}

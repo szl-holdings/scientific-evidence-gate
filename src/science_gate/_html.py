@@ -51,6 +51,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ._canonical import CanonicalizationError, sha256_canonical
 from ._redact import redact_text
+from ._validators import ROWS_EXAMINED_MEANING
 from .invariants import INVARIANT_NAMES
 from .ledger import invocation_id_for
 
@@ -125,21 +126,35 @@ _STATUS_STYLE = {
 }
 _UNKNOWN_STYLE = ("muted", "question")
 
-DETECTED, BLIND_SPOT, UNRESOLVED, SKIPPED, NOT_APPLICABLE_MUTATION = (
+DETECTED, BLIND_SPOT, UNRESOLVED, SKIPPED, NOT_APPLICABLE_MUTATION, NOT_EXECUTED_MUTATION = (
     "DETECTED",
     "BLIND_SPOT",
     "UNRESOLVED",
     "SKIPPED",
     "NOT_APPLICABLE",
+    "NOT_EXECUTED",
 )
-MUTATION_GROUPS = (DETECTED, BLIND_SPOT, UNRESOLVED, SKIPPED, NOT_APPLICABLE_MUTATION)
+MUTATION_GROUPS = (DETECTED, BLIND_SPOT, UNRESOLVED, SKIPPED, NOT_APPLICABLE_MUTATION, NOT_EXECUTED_MUTATION)
 _MUTATION_STYLE = {
     DETECTED: ("good", "check"),
     BLIND_SPOT: ("critical", "cross"),
     UNRESOLVED: ("warning", "question"),
     SKIPPED: ("muted", "dash"),
     NOT_APPLICABLE_MUTATION: ("muted", "dash"),
+    NOT_EXECUTED_MUTATION: ("muted", "dash"),
 }
+#: Report v2 statuses (ARCHITECTURE.md 17.12) of mutants that were built or
+#: considered but never executed. They are neither skipped operators nor
+#: inapplicable ones, so they get their own group and are never counted as
+#: either: a NOT_ACTIVATED mutant read nothing, a NOOP or equivalent mutant
+#: changed nothing, a duplicate repeats an earlier mutant.
+_UNEXECUTED_V2_STATUSES = frozenset(
+    {"NOT_ACTIVATED", "NOOP_MUTATION", "CANONICALLY_EQUIVALENT", "DUPLICATE_MUTANT", "SUPPRESSED"}
+)
+#: Report v2 statuses of executed mutants that no check detected for a reason
+#: other than a blind spot. They count as escaped (executed minus detected),
+#: and the page says why instead of calling them blind spots without comment.
+_ESCAPED_V2_STATUSES = frozenset({"VERIFIER_ERROR", "TIMED_OUT", "FLAKY"})
 #: The six section 10 counts, in the order the page shows them, with their labels.
 _MUTATION_COUNTS = (
     ("applicable_mutations", "Applicable"),
@@ -635,9 +650,10 @@ def _performance_facets(
     if rows is None:
         facets.append(_Facet("Rows examined", DARK, "rows_examined is not recorded"))
     elif rows < 1:
-        facets.append(_Facet("Rows examined", DARK, f"{rows} rows examined: a PASS is impossible"))
+        facets.append(_Facet("Rows examined", DARK, f"rows_examined {rows}: a PASS is impossible"))
     else:
-        facets.append(_Facet("Rows examined", LIT, f"{rows} row(s) examined in scope"))
+        # One name per quantity (G5): the run figure is always rows_examined, with its one meaning.
+        facets.append(_Facet("Rows examined", LIT, f"rows_examined {rows} ({ROWS_EXAMINED_MEANING})"))
 
     executed, expected_checks = _int(doc.get("checks_executed")), _int(doc.get("checks_expected"))
     ratio = f"{_count(executed)} of {_count(expected_checks)} required checks executed"
@@ -920,7 +936,10 @@ def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str
     a result. Every disagreement is reported as a note.
     """
     state, detected, blind = record.get("execution_state"), record.get("detected"), record.get("blind_spot")
+    status = record.get("status")
     claims = " but the record says detected=true; it is not counted as a detection" if detected is True else ""
+    if status in _UNEXECUTED_V2_STATUSES and not _is(state, "CHECKED"):
+        return NOT_EXECUTED_MUTATION, f"status {status}: never executed, so never counted" + claims
     if record.get("applicable") is False or _is(state, "NOT_APPLICABLE"):
         return NOT_APPLICABLE_MUTATION, ("not applicable" + claims) if claims else None
     if _is(state, "SKIPPED"):
@@ -937,6 +956,8 @@ def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str
             return UNRESOLVED, "no fired detector is recorded" + claims
         return DETECTED, "the record also says blind_spot=true" if blind is True else None
     if detected is False:
+        if status in _ESCAPED_V2_STATUSES:
+            return BLIND_SPOT, f"status {status}: executed and not detected, so it counts as escaped"
         notes = ["the record says blind_spot=false although nothing detected it"] if blind is False else []
         if firing == FIRED and actual is not None and actual != "PASS":
             notes.append(
@@ -1639,7 +1660,11 @@ def _constellation_svg(view: _MutationView) -> str:
     groups = [
         ("Detected", DETECTED, view.group(DETECTED)),
         ("Blind spots", BLIND_SPOT, view.group(BLIND_SPOT)),
-        ("Not executed", SKIPPED, view.group(SKIPPED) + view.group(NOT_APPLICABLE_MUTATION)),
+        (
+            "Not executed",
+            SKIPPED,
+            view.group(SKIPPED) + view.group(NOT_APPLICABLE_MUTATION) + view.group(NOT_EXECUTED_MUTATION),
+        ),
     ]
     if view.group(UNRESOLVED):
         groups.insert(2, ("Unresolved", UNRESOLVED, view.group(UNRESOLVED)))
@@ -1912,7 +1937,7 @@ def _masthead(
                 "reached CHECKED with a terminal invocation",
                 known=_int(executed) is not None and _int(expected) is not None,
             ),
-            _stat("Rows examined", _e(_count(rows)), "distinct rows in scope", known=_int(rows) is not None),
+            _stat("Rows examined", _e(_count(rows)), ROWS_EXAMINED_MEANING, known=_int(rows) is not None),
             _stat(
                 "Inputs opened",
                 _ratio(opened, expected_inputs),
@@ -2173,7 +2198,8 @@ def _lattice_section(doc: Mapping[str, Any], lattice: Sequence[_LatticeRow]) -> 
     )
     table = _table(
         "Checks: expected, executed, terminal",
-        ("Check and kind", "Expected", "Executed", "Terminal and reason", "Rows examined", "Invocation and evidence",
+        ("Check and kind", "Expected", "Executed", "Terminal and reason", "Subject records examined",
+         "Invocation and evidence",
          "Failure modes and diagnostics"),
         [_check_cells(row) for row in lattice],
         equivalent_of="lattice",

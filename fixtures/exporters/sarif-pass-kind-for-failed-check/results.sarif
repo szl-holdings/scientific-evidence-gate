@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "artifacts": [
+        {
+          "hashes": {
+            "sha-256": "869837d836c85516e870924b62b12403af3972e2a6bf529e888ab8fd4648b185"
+          },
+          "location": {
+            "uri": "data/measurements.csv",
+            "uriBaseId": "MANIFEST_DIR"
+          }
+        }
+      ],
+      "invocations": [
+        {
+          "endTimeUtc": "2026-01-02T03:04:05Z",
+          "executionSuccessful": true,
+          "exitCode": 1,
+          "startTimeUtc": "2026-01-02T03:04:05Z",
+          "toolExecutionNotifications": []
+        }
+      ],
+      "originalUriBaseIds": {
+        "MANIFEST_DIR": {
+          "description": {
+            "text": "The directory containing the manifest; URIs are relative to it."
+          }
+        }
+      },
+      "properties": {
+        "controls": {
+          "canary": {
+            "holds": true,
+            "must_fail": {
+              "invocation_id": "inv-a081c642d5cb",
+              "reason": "SOURCE_MISMATCH",
+              "verdict": "FAIL"
+            },
+            "must_pass": {
+              "invocation_id": "inv-2e2cd435607b",
+              "reason": "VERIFIED",
+              "verdict": "PASS"
+            }
+          },
+          "claim_join": null,
+          "comparator_self_test": {
+            "holds": true,
+            "invocation_id": "inv-a171155a9a3c",
+            "pairs": [
+              {
+                "actual": "DISAGREES",
+                "claim": "0.15",
+                "expected": "DISAGREES",
+                "stored": "0.14"
+              },
+              {
+                "actual": "EXACT",
+                "claim": "12.4",
+                "expected": "EXACT",
+                "stored": "12.40"
+              },
+              {
+                "actual": "AGREES_AT_STATED_PRECISION",
+                "claim": "0.1",
+                "expected": "AGREES_AT_STATED_PRECISION",
+                "stored": "0.14"
+              }
+            ]
+          },
+          "falsifiers": {
+            "NO_CASE": [],
+            "NO_GENERATOR": [],
+            "REFUTED": [],
+            "UNWITNESSED": [],
+            "WITNESSED": [
+              "rows"
+            ],
+            "invocations": 1
+          },
+          "min_discrimination": null,
+          "pins": {
+            "changed": [],
+            "holds": true,
+            "pinned": 4,
+            "writes": []
+          },
+          "plan": {
+            "checks_planned": 3,
+            "entry_sha256": "63049643cc3163544262a2aea9a05f5d23b0c1fdd5a8c34ce5d38f924e08c905",
+            "inputs_planned": 1,
+            "manifest_sha256": "9557dcef32f1c7a8bd3e824f92d1d69e67cbade32fdac4d7ffa94250eaac1d77",
+            "pins": 4
+          },
+          "verdict_transitions": [
+            {
+              "after": "PASS",
+              "before": "NONE",
+              "reason": "VERIFIED",
+              "source": "check:rows",
+              "step": 1
+            },
+            {
+              "after": "FAIL",
+              "before": "PASS",
+              "reason": "SOURCE_MISMATCH",
+              "source": "check:duplicates",
+              "step": 2
+            }
+          ]
+        },
+        "counters": {
+          "checks_abstained": 1,
+          "checks_declared": 3,
+          "checks_errored": 0,
+          "checks_executed": 3,
+          "checks_expected": 3,
+          "checks_failed": 1,
+          "checks_not_applicable": 0,
+          "checks_passed": 1,
+          "checks_skipped": 0,
+          "expected_inputs": 1,
+          "inputs_discovered": 1,
+          "inputs_examined": 1,
+          "inputs_opened": 1,
+          "inputs_parsed": 1,
+          "rows_examined": 6
+        },
+        "disclaimer": "Synthetic exporter fixture; it records no real run.",
+        "evidence_boundary": {
+          "integrity": "Synthetic fixture: no input was hashed for this document.",
+          "performance": "Synthetic fixture: no check ran for this document.",
+          "scientific_validity": "NOT ESTABLISHED"
+        },
+        "evidence_manifest_sha256": "89bd93aceb78a780b266e2a194fbd7b60c22ad8e6a56b33c4f20190bf4bdfc80",
+        "failure_modes": [
+          "PROTOCOL_DRIFT",
+          "SOURCE_MISMATCH"
+        ],
+        "reason": "SOURCE_MISMATCH",
+        "reasons": [
+          "SOURCE_MISMATCH",
+          "PROTOCOL_BROKEN"
+        ],
+        "run_id": "run-d36af7aab43267d5",
+        "status": "FAIL"
+      },
+      "results": [
+        {
+          "kind": "pass",
+          "level": "none",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "data/measurements.csv",
+                  "uriBaseId": "MANIFEST_DIR"
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "duplicates: FAIL (SOURCE_MISMATCH), CHECKED, subject records examined 6. row_key SYN-0003 appears twice"
+          },
+          "properties": {
+            "check_id": "duplicates",
+            "execution_state": "CHECKED",
+            "failure_modes": [
+              "SOURCE_MISMATCH"
+            ],
+            "falsification": null,
+            "invocation_id": "inv-4b956d10114c",
+            "reason": "SOURCE_MISMATCH",
+            "required": true,
+            "rows_examined": 6,
+            "verdict": "FAIL"
+          },
+          "ruleId": "duplicate_rows",
+          "ruleIndex": 0
+        },
+        {
+          "kind": "open",
+          "level": "none",
+          "locations": [],
+          "message": {
+            "text": "reviews: ABSTAIN (PROTOCOL_BROKEN), CHECKED, subject records examined 1. required reviewer reviewer-b gave no verdict"
+          },
+          "properties": {
+            "check_id": "reviews",
+            "execution_state": "CHECKED",
+            "failure_modes": [
+              "PROTOCOL_DRIFT"
+            ],
+            "falsification": null,
+            "invocation_id": "inv-10b4eea1e171",
+            "reason": "PROTOCOL_BROKEN",
+            "required": true,
+            "rows_examined": 1,
+            "verdict": "ABSTAIN"
+          },
+          "ruleId": "reviewer_protocol",
+          "ruleIndex": 1
+        },
+        {
+          "kind": "pass",
+          "level": "none",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "data/measurements.csv",
+                  "uriBaseId": "MANIFEST_DIR"
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "rows: PASS (VERIFIED), CHECKED, subject records examined 6"
+          },
+          "properties": {
+            "check_id": "rows",
+            "execution_state": "CHECKED",
+            "failure_modes": [],
+            "falsification": "WITNESSED",
+            "invocation_id": "inv-325393fa8605",
+            "reason": "VERIFIED",
+            "required": true,
+            "rows_examined": 6,
+            "verdict": "PASS"
+          },
+          "ruleId": "row_count",
+          "ruleIndex": 2
+        }
+      ],
+      "tool": {
+        "driver": {
+          "name": "scientific-evidence-gate",
+          "rules": [
+            {
+              "id": "duplicate_rows",
+              "shortDescription": {
+                "text": "No exact duplicates and no duplicate row_key."
+              }
+            },
+            {
+              "id": "reviewer_protocol",
+              "shortDescription": {
+                "text": "All required reviewers present, no duplicate verdicts."
+              }
+            },
+            {
+              "id": "row_count",
+              "shortDescription": {
+                "text": "Rows examined > 0, with closure against an INDEPENDENT expected_rows."
+              }
+            }
+          ],
+          "semanticVersion": "0.1.0",
+          "version": "0.1.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -1,17 +1,25 @@
-"""Named invariants (section 4) and the numeric rules (section 7)."""
+"""Named invariants (section 4, extended by section 17) and the numeric rules (section 7)."""
 
 from __future__ import annotations
 
 import dataclasses
 import unittest
 from decimal import Decimal
+from typing import Any
+from unittest import mock
 
 from _helpers import TempDirTestCase, build_scenario
+from _project import VALID_MANIFEST
 
+from science_gate import invariants
 from science_gate._canonical import canonical_dumps
 from science_gate.invariants import (
     AGREES_AT_STATED_PRECISION,
     AMBIGUOUS_SEPARATOR,
+    CANARY_MUST_FAIL,
+    CANARY_MUST_PASS,
+    COMPARATOR_CONTROL,
+    COMPARATOR_PAIRS,
     DISAGREES,
     EXACT,
     INVARIANT_NAMES,
@@ -23,21 +31,30 @@ from science_gate.invariants import (
     VIOLATION_OUTCOMES,
     ClaimTally,
     InvariantContext,
+    NumericComparison,
     compare_decimal,
+    comparison_discrimination,
     evaluate_invariants,
+    falsifier_check_id,
+    is_control,
     parse_decimal,
+    run_comparator_self_test,
 )
+from science_gate.ledger import Ledger
 from science_gate.models import (
     CheckResult,
     ExecutionState,
     FailureMode,
     InputState,
     InvariantResult,
+    RatioState,
     Reason,
     Status,
 )
+from science_gate.verifier import VerificationRun, verify
 
-CONTRACT_NAMES = (
+#: The ten invariants of section 4, which the hand-built scenario exercises.
+SECTION_4_NAMES = (
     "checked_claims_le_invocations",
     "every_verdict_has_invocation",
     "every_invocation_has_terminal_result",
@@ -50,6 +67,40 @@ CONTRACT_NAMES = (
     "ledger_chain_intact",
 )
 
+#: Section 17's six, appended in this order (17.4).
+SECTION_17_NAMES = (
+    "plan_closure",
+    "plan_matches_manifest",
+    "harness_pins_intact",
+    "comparator_self_test",
+    "canary_controls_hold",
+    "pass_requires_falsifier_witness",
+)
+CONTRACT_NAMES = SECTION_4_NAMES + SECTION_17_NAMES
+
+
+def run_context(run: VerificationRun, **overrides: Any) -> InvariantContext:
+    """The invariant context a real verify judged, rebuilt from the run (a replay)."""
+    seal = run.ledger.seal()
+    assert run.manifest is not None
+    values: dict[str, Any] = {
+        "entries": run.ledger.entries,
+        "checks": run.result.checks,
+        "accounting": run.result.accounting,
+        "declared_checks": {spec.check_id: spec.required for spec in run.manifest.checks},
+        "claimed_status": run.result.status,
+        "evidence_manifest": run.evidence_manifest["entries"],
+        "ledger_head_sha256": seal["ledger_head_sha256"],
+        "ledger_length": seal["ledger_length"],
+        "run_id": run.result.run_id,
+        "expected_plan": run.plan,
+        "pins": run.pins,
+        "controls": run.result.controls,
+        "rows_examined": run.result.counters["rows_examined"],
+    }
+    values.update(overrides)
+    return InvariantContext(**values)
+
 
 class InvariantTestCase(TempDirTestCase):
     def setUp(self) -> None:
@@ -58,7 +109,8 @@ class InvariantTestCase(TempDirTestCase):
         self.check = self.scenario.checks[0]
 
     def judge(self, name: str, **overrides: object) -> InvariantResult:
-        result = INVARIANTS[name](self.scenario.context(**overrides))
+        # The scenario examined 3 distinct rows of its one declared input.
+        result = INVARIANTS[name](self.scenario.context(**{"rows_examined": 3, **overrides}))
         self.assertEqual(result.name, name)
         return result
 
@@ -90,8 +142,15 @@ class RegistryTests(InvariantTestCase):
                 self.assertIn(outcome.status, (Status.FAIL, Status.ABSTAIN))
                 self.assertIsNot(outcome.reason, Reason.VERIFIED)
 
+    def test_the_hand_built_scenario_satisfies_the_section_4_invariants(self) -> None:
+        results = {result.name: result for result in evaluate_invariants(self.scenario.context(rows_examined=3))}
+        for name in SECTION_4_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual((results[name].applicable, results[name].holds), (True, True), results[name].detail)
+
     def test_a_coherent_passing_run_satisfies_every_invariant(self) -> None:
-        results = evaluate_invariants(self.scenario.context())
+        # A real verify is the only coherent source of a PLAN, falsifiers, controls and pins.
+        results = evaluate_invariants(run_context(verify(VALID_MANIFEST)))
         self.assertEqual(tuple(result.name for result in results), CONTRACT_NAMES)
         for result in results:
             with self.subTest(name=result.name):
@@ -188,18 +247,21 @@ class PassContractTests(InvariantTestCase):
         self.assertViolated("pass_requires_nonempty_evidence", "has no sha256", evidence_manifest=[{"path": "x"}])
 
     def test_pass_is_impossible_with_zero_examined_rows(self) -> None:
-        # Requirement 3.
+        # Requirement 3, with G1: the run is judged on its distinct data rows, never on a per-check sum.
         self.assertViolated("pass_requires_examined_rows", "examining 0 rows", checks=self.replaced_check(rows_examined=0))
         self.assertViolated(
             "pass_requires_examined_rows", "without reporting rows examined", checks=self.replaced_check(rows_examined=None)
         )
-        self.assertViolated("pass_requires_examined_rows", "examined no rows", checks=())
+        self.assertViolated("pass_requires_examined_rows", "examined no rows", checks=(), rows_examined=0)
+        # A passing check that counted its own comparisons cannot stand in for data rows.
+        self.assertViolated("pass_requires_examined_rows", "examined no rows", rows_examined=0)
+        self.assertViolated("pass_requires_examined_rows", "rows_examined is unknown", rows_examined=None)
 
-    def test_the_examined_rows_detail_says_it_is_a_per_check_total(self) -> None:
-        # run.json's rows_examined counts distinct rows; this sum counts a row once per check that read it.
+    def test_the_examined_rows_detail_names_the_distinct_row_figure(self) -> None:
+        # G5: one name per quantity. The detail names the run figure, never a per-check total.
         result = self.judge("pass_requires_examined_rows")
         self.assertIs(result.holds, True)
-        self.assertTrue(result.detail.startswith("per-check rows examined total="), result.detail)
+        self.assertEqual(result.detail, "rows_examined=3 (distinct data rows of declared inputs)")
 
     def test_pass_is_impossible_when_a_required_checker_did_not_run(self) -> None:
         # Requirement 4.
@@ -261,6 +323,203 @@ class PassContractTests(InvariantTestCase):
         self.assertNotApplicable("input_accounting_closure", accounting=None)
 
 
+def plan_body(*check_ids: str, controls: tuple[str, ...] = ()) -> dict[str, Any]:
+    """A minimal PLAN body naming ``check_ids`` and ``controls``."""
+    return {
+        "schema": "science-gate-plan/v1",
+        "inputs": [],
+        "checks": [{"check_id": check_id} for check_id in check_ids],
+        "pins": [],
+        "controls": list(controls),
+    }
+
+
+def closed(ledger: Ledger, check_id: str, verdict: Status, reason: Reason, evidence: dict[str, Any] | None = None) -> str:
+    """Record one complete invocation of ``check_id`` and return its id."""
+    invocation_id = ledger.start(check_id=check_id, check_kind="row_count", check_version="1")
+    ledger.finish(invocation_id, verdict=verdict, reason=reason, evidence=evidence or {})
+    return invocation_id
+
+
+def ledger_context(ledger: Ledger, **overrides: Any) -> InvariantContext:
+    seal = ledger.seal()
+    values: dict[str, Any] = {"entries": ledger.entries, "run_id": ledger.run_id, **seal}
+    values.update(overrides)
+    return InvariantContext(**values)
+
+
+class PlanClosureTests(TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixed_clock()
+
+    def test_not_applicable_without_a_ledger(self) -> None:
+        result = invariants.plan_closure(InvariantContext())
+        self.assertEqual((result.applicable, result.holds), (False, None))
+
+    def test_a_ledger_without_a_plan_breaks_closure(self) -> None:
+        ledger = Ledger("run-synthetic-plan")
+        closed(ledger, "rows", Status.PASS, Reason.VERIFIED)
+        result = invariants.plan_closure(ledger_context(ledger))
+        self.assertIs(result.holds, False)
+        self.assertIn("entry 1 is not a PLAN", result.detail)
+
+    def test_every_planned_item_must_run_exactly_once(self) -> None:
+        ledger = Ledger("run-synthetic-plan")
+        ledger.plan(plan_body("rows", "dups", controls=(COMPARATOR_CONTROL,)))
+        closed(ledger, "rows", Status.PASS, Reason.VERIFIED)
+        closed(ledger, "rows", Status.PASS, Reason.VERIFIED)
+        ledger.start(check_id=COMPARATOR_CONTROL, check_kind="comparator_self_test", check_version="1")
+        closed(ledger, "extra", Status.PASS, Reason.VERIFIED)
+        closed(ledger, falsifier_check_id("rows", "case"), Status.FAIL, Reason.SOURCE_MISMATCH)
+        result = invariants.plan_closure(ledger_context(ledger))
+        self.assertIs(result.holds, False)
+        self.assertIn("planned 'rows' has 2 invocation(s)", result.detail)
+        self.assertIn("planned 'dups' has 0 invocation(s)", result.detail)
+        self.assertIn(f"planned '{COMPARATOR_CONTROL}' has 1 invocation(s) and 0 terminal", result.detail)
+        # Unplanned work is listed, never judged; falsifiers are never "unplanned".
+        self.assertIn("unplanned invocation(s), listed not judged: ['extra']", result.detail)
+        self.assertNotIn("control:falsifier", result.detail)
+
+    def test_a_complete_plan_holds(self) -> None:
+        ledger = Ledger("run-synthetic-plan")
+        ledger.plan(plan_body("rows"))
+        closed(ledger, "rows", Status.FAIL, Reason.SOURCE_MISMATCH)
+        result = invariants.plan_closure(ledger_context(ledger))
+        self.assertEqual((result.applicable, result.holds), (True, True), result.detail)
+        self.assertEqual(VIOLATION_OUTCOMES["plan_closure"].status, Status.FAIL)
+        self.assertEqual(VIOLATION_OUTCOMES["plan_closure"].reason, Reason.PARTIAL_EXECUTION)
+
+
+class ControlInvariantTests(TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixed_clock()
+
+    def test_comparator_and_canary_are_judged_from_the_ledger(self) -> None:
+        self.assertFalse(invariants.comparator_self_test(InvariantContext()).applicable)
+        self.assertFalse(invariants.canary_controls_hold(InvariantContext()).applicable)
+        ledger = Ledger("run-synthetic-controls")
+        pairs = [{"claim": c, "stored": s, "expected": e, "actual": e} for c, s, e in COMPARATOR_PAIRS]
+        closed(ledger, COMPARATOR_CONTROL, Status.PASS, Reason.VERIFIED, {"pairs": pairs})
+        closed(ledger, CANARY_MUST_FAIL, Status.FAIL, Reason.SOURCE_MISMATCH)
+        closed(ledger, CANARY_MUST_PASS, Status.PASS, Reason.VERIFIED)
+        self.assertIs(invariants.comparator_self_test(ledger_context(ledger)).holds, True)
+        self.assertIs(invariants.canary_controls_hold(ledger_context(ledger)).holds, True)
+
+    def test_a_canary_that_passes_is_a_proven_miss(self) -> None:
+        ledger = Ledger("run-synthetic-controls")
+        closed(ledger, CANARY_MUST_FAIL, Status.PASS, Reason.VERIFIED)
+        closed(ledger, CANARY_MUST_PASS, Status.PASS, Reason.VERIFIED)
+        result = invariants.canary_controls_hold(ledger_context(ledger))
+        self.assertIs(result.holds, False)
+        self.assertIn(f"{CANARY_MUST_FAIL} ended PASS, not FAIL", result.detail)
+        outcome = VIOLATION_OUTCOMES["canary_controls_hold"]
+        self.assertEqual((outcome.status, outcome.reason), (Status.FAIL, Reason.BLIND_SPOT))
+        self.assertEqual(outcome.failure_mode, FailureMode.DEFECTIVE_VERIFICATION)
+
+    def test_a_control_narrated_in_controls_but_absent_from_the_ledger_does_not_count(self) -> None:
+        context = InvariantContext(controls={"canary": {"holds": True}, "comparator_self_test": {"holds": True}})
+        self.assertIs(invariants.canary_controls_hold(context).holds, False)
+        self.assertIs(invariants.comparator_self_test(context).holds, False)
+
+    def test_a_comparator_pair_with_the_wrong_outcome_breaks_the_self_test(self) -> None:
+        ledger = Ledger("run-synthetic-controls")
+        pairs = [{"claim": c, "stored": s, "expected": e, "actual": EXACT} for c, s, e in COMPARATOR_PAIRS]
+        closed(ledger, COMPARATOR_CONTROL, Status.PASS, Reason.VERIFIED, {"pairs": pairs})
+        result = invariants.comparator_self_test(ledger_context(ledger))
+        self.assertIs(result.holds, False)
+        self.assertIn("did not give its expected outcome", result.detail)
+
+    def test_pins_hold_only_when_unchanged_and_unwritten(self) -> None:
+        self.assertFalse(invariants.harness_pins_intact(InvariantContext()).applicable)
+        pinned = [{"role": "document", "path": "snapshots/accepted.json", "sha256": "a" * 64, "sha256_after": "a" * 64}]
+        intact = InvariantContext(pins={"pinned": pinned, "writes": [], "hook_errors": 0})
+        self.assertIs(invariants.harness_pins_intact(intact).holds, True)
+        changed = [{**pinned[0], "sha256_after": "b" * 64}]
+        result = invariants.harness_pins_intact(InvariantContext(pins={"pinned": changed, "writes": []}))
+        self.assertIs(result.holds, False)
+        self.assertIn("snapshots/accepted.json changed during the run", result.detail)
+        write = {"path": "snapshots/accepted.json", "action": "write", "event": "open"}
+        result = invariants.harness_pins_intact(InvariantContext(pins={"pinned": pinned, "writes": [write]}))
+        self.assertIs(result.holds, False, "a write that restored the bytes is still a write")
+        self.assertIn("snapshots/accepted.json was touched during the run (write via open)", result.detail)
+
+    def test_witness_is_required_only_of_pass_results(self) -> None:
+        self.assertFalse(invariants.pass_requires_falsifier_witness(InvariantContext()).applicable)
+        unwitnessed = CheckResult(
+            check_id="rows",
+            kind="row_count",
+            version="1",
+            required=True,
+            execution_state=ExecutionState.CHECKED,
+            verdict=Status.PASS,
+            reason=Reason.VERIFIED,
+            rows_examined=3,
+            evidence={"falsification": "WITNESSED", "falsifiers": [{"outcome": "REJECTED"}]},
+            invocation_id="inv-000000000001",
+        )
+        result = invariants.pass_requires_falsifier_witness(InvariantContext(checks=(unwitnessed,)))
+        self.assertIs(result.holds, False, "a witness that exists only in evidence is narrated")
+        self.assertIn("no REJECTED falsifier", result.detail)
+        outcome = VIOLATION_OUTCOMES["pass_requires_falsifier_witness"]
+        self.assertEqual((outcome.status, outcome.reason, outcome.failure_mode), (Status.ABSTAIN, Reason.BLIND_SPOT, FailureMode.VACUOUS_PASS))
+
+    def test_control_ids_are_recognizable(self) -> None:
+        self.assertEqual(falsifier_check_id("rows", "drop-last-row"), "control:falsifier:rows:drop-last-row")
+        self.assertTrue(is_control(CANARY_MUST_FAIL))
+        self.assertFalse(is_control("rows"))
+        self.assertFalse(is_control(None))
+
+
+class ComparatorControlTests(unittest.TestCase):
+    def test_the_live_comparator_passes_its_self_test(self) -> None:
+        pairs = run_comparator_self_test()
+        self.assertEqual([(pair["claim"], pair["stored"]) for pair in pairs], [("0.15", "0.14"), ("12.4", "12.40"), ("0.1", "0.14")])
+        self.assertTrue(all(pair["actual"] == pair["expected"] for pair in pairs))
+
+    def test_a_patched_comparator_is_the_one_tested(self) -> None:
+        def always_equal(claim: Any, stored: Any, **_: Any) -> NumericComparison:
+            return NumericComparison(EXACT, parse_decimal(claim), parse_decimal(stored))
+
+        with mock.patch.object(invariants, "compare_decimal", always_equal):
+            pairs = run_comparator_self_test()
+        self.assertEqual(pairs[0]["actual"], EXACT, "the patched comparator calls 0.15 and 0.14 equal")
+        self.assertNotEqual(pairs[0]["actual"], pairs[0]["expected"])
+
+    def test_a_raising_comparator_is_recorded_never_as_agreement(self) -> None:
+        def broken(*_: Any, **__: Any) -> NumericComparison:
+            raise RuntimeError("synthetic comparator crash")
+
+        with mock.patch.object(invariants, "compare_decimal", broken):
+            pairs = run_comparator_self_test()
+        self.assertEqual({pair["actual"] for pair in pairs}, {"RAISED: RuntimeError"})
+
+
+class DiscriminationTests(unittest.TestCase):
+    def test_twenty_of_the_twenty_one_nearest_claims_disagree(self) -> None:
+        for claim, stored, kwargs in (("12.4", "12.40", {}), ("0.1", "0.14", {}), ("10,500", "10,500", {"thousands": ","})):
+            with self.subTest(claim=claim):
+                ratio = comparison_discrimination(claim, stored, **kwargs)
+                self.assertEqual((ratio.fraction, ratio.decimal, ratio.state), ("20/21", "0.9524", RatioState.DEFINED))
+
+    def test_a_comparator_that_rejects_nothing_has_zero_discrimination(self) -> None:
+        def always_equal(claim: Any, stored: Any, **_: Any) -> NumericComparison:
+            return NumericComparison(EXACT, parse_decimal(claim), parse_decimal(stored))
+
+        with mock.patch.object(invariants, "compare_decimal", always_equal):
+            ratio = comparison_discrimination("12.4", "12.40")
+        self.assertEqual((ratio.numerator, ratio.denominator, ratio.decimal), (0, 21, "0"))
+
+    def test_an_unreadable_claim_has_no_discrimination_figure(self) -> None:
+        ratio = comparison_discrimination("1,234", "1234")
+        self.assertEqual((ratio.state, ratio.decimal, ratio.fraction), (RatioState.UNAVAILABLE, None, None))
+
+    def test_probes_use_the_declared_decimal_point(self) -> None:
+        ratio = comparison_discrimination("12,4", "12,40", decimal_point=",")
+        self.assertEqual(ratio.fraction, "20/21")
+
+
 class ViolationOutcomeTests(unittest.TestCase):
     def test_outcomes_match_section_6_precedence(self) -> None:
         self.assertEqual(VIOLATION_OUTCOMES["ledger_chain_intact"].status, Status.FAIL)
@@ -272,6 +531,20 @@ class ViolationOutcomeTests(unittest.TestCase):
         self.assertEqual(
             VIOLATION_OUTCOMES["every_invocation_has_terminal_result"].reason, Reason.PARTIAL_EXECUTION
         )
+
+    def test_section_17_outcomes_follow_d1_and_d2(self) -> None:
+        expected = {
+            "plan_closure": (Status.FAIL, Reason.PARTIAL_EXECUTION, FailureMode.PARTIAL_EXECUTION),
+            "plan_matches_manifest": (Status.FAIL, Reason.PROTOCOL_DRIFT, FailureMode.PROTOCOL_DRIFT),
+            "harness_pins_intact": (Status.FAIL, Reason.PROTOCOL_DRIFT, FailureMode.PROTOCOL_DRIFT),
+            "comparator_self_test": (Status.FAIL, Reason.BLIND_SPOT, FailureMode.DEFECTIVE_VERIFICATION),
+            "canary_controls_hold": (Status.FAIL, Reason.BLIND_SPOT, FailureMode.DEFECTIVE_VERIFICATION),
+            "pass_requires_falsifier_witness": (Status.ABSTAIN, Reason.BLIND_SPOT, FailureMode.VACUOUS_PASS),
+        }
+        for name, (status, reason, mode) in expected.items():
+            with self.subTest(name=name):
+                outcome = VIOLATION_OUTCOMES[name]
+                self.assertEqual((outcome.status, outcome.reason, outcome.failure_mode), (status, reason, mode))
 
 
 class ClaimTallyTests(unittest.TestCase):

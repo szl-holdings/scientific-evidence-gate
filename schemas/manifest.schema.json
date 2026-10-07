@@ -102,9 +102,12 @@
           "enum": [
             "citation_metadata",
             "citation_resolver",
+            "claim_join",
             "claim_registry",
             "dependency_currency",
             "duplicate_rows",
+            "editorial_status",
+            "mutation_accounting",
             "numeric_agreement",
             "required_columns",
             "reviewer_protocol",

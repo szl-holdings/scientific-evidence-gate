@@ -47,7 +47,28 @@
         "publication_location": {
           "description": "Recorded as DECLARED. The lines on which the manuscript prints the claim's value are reported beside it for reference and are not judged.",
           "$ref": "#/$defs/optional_text"
-        }
+        },
+        "rounding": {
+          "description": "Decision D5: HALF_EVEN (default) for the project's own outputs; EITHER_HALF for a third-party number, which agrees when half-even or half-up reproduces it. The convention set is recorded.",
+          "anyOf": [{"enum": ["HALF_EVEN", "EITHER_HALF"]}, {"type": "null"}]
+        },
+        "must_derive_from": {
+          "description": "With stored_output, a derived claim that reproduces only the printed (rounded) operands, not the stored full-precision ones, is FAIL with NARRATED_VERIFICATION instead of requiring human review.",
+          "anyOf": [{"const": "stored_output"}, {"type": "null"}]
+        },
+        "consistency": {"anyOf": [{"$ref": "#/$defs/consistency"}, {"type": "null"}]}
+      }
+    },
+    "consistency": {
+      "description": "A GRIM (mean), GRIMMER (mean and sample SD) or DEBIT (proportion and SD) test on the claim value, run under the claim's rounding. grim takes no sd, debit takes no items, and grimmer and debit need n >= 2. INCONSISTENT is FAIL with SOURCE_MISMATCH; a test that could not have failed (zero discrimination) abstains and never passes.",
+      "type": "object",
+      "required": ["test", "n"],
+      "additionalProperties": false,
+      "properties": {
+        "test": {"enum": ["grim", "grimmer", "debit"]},
+        "n": {"type": "integer", "minimum": 1},
+        "items": {"type": "integer", "minimum": 1},
+        "sd": {"type": "string", "minLength": 1}
       }
     },
     "derivation": {
@@ -58,7 +79,23 @@
         "analysis_recipe": {"$ref": "#/$defs/optional_text"},
         "code_version": {"$ref": "#/$defs/optional_text"},
         "environment": {"$ref": "#/$defs/optional_text"},
-        "input_manifest_sha256": {"$ref": "#/$defs/optional_sha256"}
+        "input_manifest_sha256": {"$ref": "#/$defs/optional_sha256"},
+        "formula": {
+          "description": "A derived claim (narrated-number check): the claim is recomputed from its two operands, once from their printed values and once from their stored full-precision values. Declared together with operands.",
+          "anyOf": [{"enum": ["difference", "ratio", "percent", "f1"]}, {"type": "null"}]
+        },
+        "operands": {
+          "description": "Two registered claim ids in order; formula and operands are declared together; a claim may not name itself.",
+          "anyOf": [
+            {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+            },
+            {"type": "null"}
+          ]
+        }
       }
     },
     "stored_output": {

@@ -158,7 +158,19 @@
         "response_sha256": {"$ref": "#/$defs/sha256"},
         "resolver_identity": {"$ref": "#/$defs/text"},
         "resolver_schema_version": {"$ref": "#/$defs/text"},
-        "live_refresh_performed": {"type": "boolean"}
+        "live_refresh_performed": {"type": "boolean"},
+        "canary": {
+          "type": "boolean",
+          "description": "true marks a negative control whose doi is <prefix>/science-gate-canary-<12 lowercase hex>; at most one per prefix; it holds only with outcome NOT_FOUND, no work and handle_response_code 100; it is never a reference work. Every prefix under which the frozen set answers a cited DOI needs one, or the resolver abstains with BLIND_SPOT; a canary that resolves is FAIL with BLIND_SPOT."
+        },
+        "handle_response_code": {
+          "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}],
+          "description": "Handle body responseCode; when present it alone decides: 1 resolved, 100 or 200 not resolved, anything else SOURCE_UNAVAILABLE; http_status never decides."
+        },
+        "registered_at": {
+          "anyOf": [{"$ref": "#/$defs/utc_timestamp"}, {"type": "null"}],
+          "description": "When the DOI was registered; a record retrieved before it is SOURCE_UNAVAILABLE (snapshot predates registration), and a log invocation retrieved before it backs nothing."
+        }
       }
     },
     "frozen_set": {

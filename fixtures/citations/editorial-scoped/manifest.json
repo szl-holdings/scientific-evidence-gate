@@ -1,0 +1,43 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "citations-editorial-scoped",
+  "inputs": [
+    {
+      "id": "editorial-snapshots",
+      "path": "editorial/snapshots.json",
+      "format": "json",
+      "required": true,
+      "expected_rows": 3,
+      "denominator_source": "INDEPENDENT",
+      "sha256": "8bbc70115c319e4f94f8d77ac401039604231c6d3a467229ed4ee0c1e8bc8be9"
+    }
+  ],
+  "checks": [
+    {
+      "id": "editorial",
+      "kind": "editorial_status",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "editorial-snapshots"
+      ],
+      "params": {
+        "defect_windows": [
+          {
+            "source": "OPENALEX_IS_RETRACTED",
+            "start": "2023-12-22",
+            "end": "2024-03-19"
+          }
+        ]
+      }
+    }
+  ],
+  "citations": {
+    "entries": "citations/entries.json",
+    "live": false
+  },
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}

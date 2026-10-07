@@ -6,13 +6,24 @@ by default), runs the real commands against the copies, in process, through
 :func:`science_gate.cli.main`, and compares each outcome with an expectation
 written down here in advance:
 
-* a valid project PASSes, and its run directory re-verifies;
+* a valid project PASSes, every PASS carries a falsifier witness (a known-bad
+  case its checker rejected), the must-fail canary fails and its must-pass
+  twin passes, the ledger opens with the run's PLAN, and the run directory
+  re-verifies;
 * an empty input ABSTAINs with exit 2;
 * a narrated citation log is UNVERIFIED;
-* mutation testing reports detections *and* blind spots, and never counts a
-  skipped or non-applicable mutation as a detection;
-* an upstream change marks descendants stale, and revalidation tells an
-  unchanged artifact from a changed one;
+* a mean that no integer total can produce fails the GRIM test, and a derived
+  number that reproduces only the printed operands is a narrated number;
+* a resolver whose canary (a DOI that cannot exist) resolves is a proven
+  blind spot;
+* agent assertions joined to a sealed ledger fall into BACKED, NARRATED,
+  CONTRADICTED and ORPHANED;
+* mutation testing reports detections *and* blind spots, detects its own
+  forced defect (M00) first, keeps its bookkeeping conserved, and never
+  counts a skipped or non-applicable mutation as a detection;
+* an upstream change marks descendants stale, revalidation tells an
+  unchanged artifact from a changed one, and a derived artifact is cleared
+  only by a recompute witness, never by re-hashing its untouched file;
 * packaging a CONTROLLED_LOCAL corpus withholds every data file.
 
 The demo checks itself: it exits 0 only if every expectation holds and 1 if
@@ -32,11 +43,13 @@ import io
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, TextIO
 
 from . import TOOL_NAME, __version__, cli
-from ._canonical import StrictJSONError, pretty_json_bytes, strict_loads
+from ._canonical import StrictJSONError, pretty_json_bytes, sha256_bytes, strict_loads
+from ._clock import format_utc, parse_utc
 from ._resources import bundled_dir
 from ._safeio import SafeIOError, safe_read, safe_write
 from .models import EXIT_CODE, Status
@@ -64,8 +77,13 @@ DEMO_FIXTURES: tuple[str, ...] = (
     "core/valid",
     "core/empty",
     "citations/narrated-log",
+    "numeric/grim-inconsistent",
+    "numeric/narrated",
+    "citations/canary-resolved",
+    "assertions/five-cases",
     "mutations/rich",
     "dependencies/current",
+    "dependencies/witnessed",
     "packaging/controlled-local",
 )
 
@@ -86,14 +104,32 @@ _DESIGN_FILE = f"{_DEPENDENCIES}/design/protocol.md"
 _PUBLICATION_NODE = "conclusion-1"
 _DESIGN_AMENDMENT = b"\nSynthetic amendment made by science-gate demo: the invented design changed upstream.\n"
 
+#: The witnessed-revalidation project: analysis-run is derived from two root
+#: nodes, and site-summary, figure-1 and conclusion-1 descend from it.
+_WITNESSED = "fixtures/dependencies/witnessed"
+_DERIVED_NODE = "analysis-run"
+_BELOW_DERIVED = ("site-summary", "figure-1", "conclusion-1")
+#: The committed witness whose parent and output digests bind the fixture; the
+#: demo re-times copies of it around the change it records (see
+#: :func:`_write_witness`).
+_WITNESS_TEMPLATE = f"{_WITNESSED}/witnesses/analysis-run-recomputed.json"
+_PREDATING_WITNESS = f"{_WITNESSED}/witnesses/demo-recompute-before-change.json"
+_FRESH_WITNESS = f"{_WITNESSED}/witnesses/demo-recompute-after-change.json"
+
 _CONTROLLED = "fixtures/packaging/controlled-local"
 
+#: What the claim-join fixture is built to produce (fixtures/assertions/five-cases/expected.json).
+_EXPECTED_CLAIM_JOIN = {"BACKED": 1, "NARRATED": 2, "CONTRADICTED": 1, "ORPHANED": 1}
+
+_STALE = "STALE_PENDING_REVALIDATION"
 _ERROR = EXIT_CODE[Status.ERROR]
 
 _NOT_PROVEN = (
-    "Every fixture is synthetic: invented samples, sites, reviewers, citations and values. A demo that holds "
-    "shows how the tool reacts to known defects on these fixtures. It establishes nothing about any real "
-    "dataset, and nothing about scientific truth, accuracy, safety, or fitness for use."
+    "Every fixture is synthetic: invented samples, sites, reviewers, citations, assertions and values, and the "
+    "demo writes its own synthetic recompute witnesses. A demo that holds shows how the tool reacts to known "
+    "defects on these fixtures. A falsifier witness shows that a check rejected one known-bad case, not that it "
+    "catches every defect. It establishes nothing about any real dataset, and nothing about scientific truth, "
+    "accuracy, safety, or fitness for use."
 )
 
 
@@ -237,6 +273,13 @@ class _Workspace:
         except (OSError, SafeIOError, StrictJSONError):
             return None
 
+    def json_lines(self, relpath: str) -> list[Any]:
+        """The records of a JSON Lines file, or an empty list when it is missing or unreadable."""
+        try:
+            return [strict_loads(line) for line in safe_read(self.root, relpath).splitlines() if line.strip()]
+        except (OSError, SafeIOError, StrictJSONError):
+            return []
+
     def read(self, relpath: str) -> bytes:
         return safe_read(self.root, relpath)
 
@@ -273,7 +316,7 @@ def _copy_fixtures(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Steps
+# Reading what the commands wrote
 # ---------------------------------------------------------------------------
 
 #: What a step returns: the commands it ran and the expectations it judged.
@@ -293,9 +336,38 @@ def _status(document: Any, code: int) -> str:
     return f"{_field(document, 'status')} ({_field(document, 'reason')}), exit {code}"
 
 
+def _is_status(document: Any, code: int, status: str, reason: str) -> bool:
+    """True when a written document records ``status (reason)`` and the command exited with status's code."""
+    return (
+        _field(document, "status") == status
+        and _field(document, "reason") == reason
+        and code == EXIT_CODE[Status(status)]
+    )
+
+
+def _mappings(value: Any) -> list[Mapping[str, Any]]:
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _check_of(run: Any, kind: str) -> Any:
+    """The run's one result of ``kind``, or None when there is not exactly one."""
+    found = [item for item in _mappings(_field(run, "checks")) if item.get("kind") == kind]
+    return found[0] if len(found) == 1 else None
+
+
+def _invariants(run: Any) -> dict[Any, Any]:
+    """``{name: holds}`` for every invariant the run recorded."""
+    return {item.get("name"): item.get("holds") for item in _mappings(_field(run, "invariants"))}
+
+
 def _verify(ws: _Workspace, fixture: str, run_dir: str) -> tuple[CommandOutcome, Any]:
     outcome = ws.run("verify", PurePosixPath(f"fixtures/{fixture}/manifest.json"), "--output", PurePosixPath(run_dir))
     return outcome, ws.json(f"{run_dir}/run.json")
+
+
+# ---------------------------------------------------------------------------
+# Steps: the valid project and what its PASS carries
+# ---------------------------------------------------------------------------
 
 
 def _step_valid(ws: _Workspace) -> _Outcome:
@@ -308,12 +380,86 @@ def _step_valid(ws: _Workspace) -> _Outcome:
         Expectation(
             "PASS (VERIFIED), exit 0",
             _status(run, command.exit_code),
-            _field(run, "status") == "PASS" and _field(run, "reason") == "VERIFIED" and command.exit_code == 0,
+            _is_status(run, command.exit_code, "PASS", "VERIFIED"),
         ),
         Expectation(
             "at least one row examined; every required check executed and passed",
             f"{rows} row(s) examined; {executed}/{expected} required checks executed, {passed} passed",
             isinstance(rows, int) and rows >= 1 and complete,
+        ),
+    )
+
+
+def _rejected_cases(check: Mapping[str, Any]) -> list[Any]:
+    """The falsifier cases the check rejected, as its own evidence records them."""
+    return [
+        item.get("case_id")
+        for item in _mappings(_field(check, "evidence", "falsifiers"))
+        if item.get("outcome") == "REJECTED"
+    ]
+
+
+def _step_witnesses(ws: _Workspace) -> _Outcome:
+    """Every PASS of the valid run carries a witness that it could have failed, and the canary pair held."""
+    run = ws.json("runs/valid/run.json")
+    passed = [item for item in _mappings(_field(run, "checks")) if item.get("verdict") == "PASS"]
+    witnessed = [
+        item.get("check_id")
+        for item in passed
+        if _field(item, "evidence", "falsification") == "WITNESSED" and _rejected_cases(item)
+    ]
+    held = _invariants(run)
+    canary = _field(run, "controls", "canary")
+    must_fail, must_pass = _field(canary, "must_fail", "verdict"), _field(canary, "must_pass", "verdict")
+    return (), (
+        Expectation(
+            "every PASS check is WITNESSED: its checker rejected a known-bad case of its own input "
+            "(pass_requires_falsifier_witness holds)",
+            f"{len(witnessed)} of {len(passed)} PASS check(s) WITNESSED; pass_requires_falsifier_witness "
+            f"holds={held.get('pass_requires_falsifier_witness')}",
+            bool(passed) and len(witnessed) == len(passed) and held.get("pass_requires_falsifier_witness") is True,
+        ),
+        Expectation(
+            "the must-fail canary (a planted duplicate row) FAILs and its must-pass twin PASSes "
+            "(canary_controls_hold holds)",
+            f"must_fail {must_fail}, must_pass {must_pass}; "
+            f"canary_controls_hold holds={held.get('canary_controls_hold')}",
+            must_fail == "FAIL"
+            and must_pass == "PASS"
+            and _field(canary, "holds") is True
+            and held.get("canary_controls_hold") is True,
+        ),
+    )
+
+
+def _step_plan(ws: _Workspace) -> _Outcome:
+    """The ledger opens with the run's PLAN, committed before any check started, and the plan closed."""
+    run = ws.json("runs/valid/run.json")
+    entries = [entry for entry in ws.json_lines("runs/valid/ledger.jsonl") if isinstance(entry, Mapping)]
+    first = entries[0] if entries else {}
+    second = entries[1] if len(entries) > 1 else {}
+    chained = (
+        bool(first)
+        and second.get("result") == "STARTED"
+        and second.get("prev_entry_sha256") == first.get("entry_sha256")
+        and _field(run, "controls", "plan", "entry_sha256") == first.get("entry_sha256")
+    )
+    held = _invariants(run)
+    closure, matches = held.get("plan_closure"), held.get("plan_matches_manifest")
+    return (), (
+        Expectation(
+            "the ledger's first entry (seq 1, the brief's entry 0) is the PLAN, hash-chained before the first "
+            "check started; plan_closure and plan_matches_manifest hold",
+            f"first entry seq {first.get('seq')}, result {first.get('result')}, "
+            f"invocation {first.get('invocation_id')}; "
+            f"next entry {second.get('result')} chained to it: {chained}; plan_closure holds={closure}, "
+            f"plan_matches_manifest holds={matches}",
+            first.get("seq") == 1
+            and first.get("result") == "PLAN"
+            and first.get("invocation_id") is None
+            and chained
+            and closure is True
+            and matches is True,
         ),
     )
 
@@ -329,9 +475,14 @@ def _step_report(ws: _Workspace) -> _Outcome:
     )
 
 
+# ---------------------------------------------------------------------------
+# Steps: missing, narrated and contradicted evidence
+# ---------------------------------------------------------------------------
+
+
 def _step_empty(ws: _Workspace) -> _Outcome:
     command, run = _verify(ws, "core/empty", "runs/empty")
-    states = {item.get("id"): item.get("state") for item in _field(run, "accounting", "inputs") or ()}
+    states = {item.get("id"): item.get("state") for item in _mappings(_field(run, "accounting", "inputs"))}
     rows = _field(run, "rows_examined")
     return (command,), (
         Expectation(
@@ -349,13 +500,12 @@ def _step_empty(ws: _Workspace) -> _Outcome:
 def _step_narrated(ws: _Workspace) -> _Outcome:
     command, run = _verify(ws, "citations/narrated-log", "runs/narrated")
     modes = _field(run, "failure_modes") or []
-    held = {item.get("name"): item.get("holds") for item in _field(run, "invariants") or ()}
-    tally = held.get("checked_claims_le_invocations")
+    tally = _invariants(run).get("checked_claims_le_invocations")
     return (command,), (
         Expectation(
             "ABSTAIN (UNVERIFIED), exit 2",
             _status(run, command.exit_code),
-            _field(run, "status") == "ABSTAIN" and _field(run, "reason") == "UNVERIFIED" and command.exit_code == 2,
+            _is_status(run, command.exit_code, "ABSTAIN", "UNVERIFIED"),
         ),
         Expectation(
             "NARRATED_VERIFICATION; claimed verifications exceed invocation records; no live lookup",
@@ -366,10 +516,113 @@ def _step_narrated(ws: _Workspace) -> _Outcome:
     )
 
 
+def _step_grim(ws: _Workspace) -> _Outcome:
+    command, run = _verify(ws, "numeric/grim-inconsistent", "runs/grim")
+    tests = _mappings(_field(_check_of(run, "claim_registry"), "evidence", "consistency", "tests"))
+    grim = next((item for item in tests if item.get("test") == "grim"), {})
+    nearest = _field(grim, "evidence", "nearest_consistent") or {}
+    ratio = _field(grim, "discrimination_ratio") or {}
+    return (command,), (
+        Expectation(
+            "FAIL (SOURCE_MISMATCH), exit 1",
+            _status(run, command.exit_code),
+            _is_status(run, command.exit_code, "FAIL", "SOURCE_MISMATCH"),
+        ),
+        Expectation(
+            "GRIM: no integer total of 28 ratings has mean 5.19 (INCONSISTENT; nearest consistent 5.18 and 5.21), "
+            "and the test could have failed (discrimination above 0)",
+            f"mean {_field(grim, 'evidence', 'mean')} of n={_field(grim, 'evidence', 'n')}: {grim.get('outcome')}; "
+            f"nearest {nearest.get('below')} and {nearest.get('above')}; discrimination {ratio.get('fraction')}",
+            grim.get("outcome") == "INCONSISTENT"
+            and (nearest.get("below"), nearest.get("above")) == ("5.18", "5.21")
+            and ratio.get("state") == "DEFINED"
+            and isinstance(ratio.get("numerator"), int)
+            and ratio["numerator"] > 0,
+        ),
+    )
+
+
+def _step_narrated_number(ws: _Workspace) -> _Outcome:
+    command, run = _verify(ws, "numeric/narrated", "runs/narrated-number")
+    claims = _check_of(run, "claim_registry")
+    modes = _field(claims, "failure_modes") or []
+    derived = _mappings(_field(claims, "evidence", "narration", "claims"))
+    claim = derived[0] if len(derived) == 1 else {}
+    return (command,), (
+        Expectation(
+            "FAIL (SOURCE_MISMATCH), exit 1, with NARRATED_VERIFICATION",
+            f"{_status(run, command.exit_code)}; failure modes {', '.join(modes) or 'none'}",
+            _is_status(run, command.exit_code, "FAIL", "SOURCE_MISMATCH") and "NARRATED_VERIFICATION" in modes,
+        ),
+        Expectation(
+            "the printed 2.10 reproduces the printed operands (12.35 - 10.25), not the stored ones "
+            "(12.346 - 10.254 gives 2.09): NARRATED",
+            f"{claim.get('claim_id')} {claim.get('value')}: {claim.get('outcome')}; from printed operands "
+            f"{claim.get('from_printed')}, from stored operands {claim.get('from_stored')}",
+            claim.get("outcome") == "NARRATED"
+            and claim.get("from_printed") == ["2.10"]
+            and claim.get("from_stored") == ["2.09"],
+        ),
+    )
+
+
+def _step_canary(ws: _Workspace) -> _Outcome:
+    command, run = _verify(ws, "citations/canary-resolved", "runs/canary")
+    resolver = _check_of(run, "citation_resolver")
+    canary = _field(resolver, "evidence", "canaries", "10.5555") or {}
+    totals = _field(resolver, "evidence", "state_totals") or {}
+    return (command,), (
+        Expectation(
+            "FAIL (BLIND_SPOT), exit 1: the captured resolver vouches for a DOI that cannot exist",
+            _status(run, command.exit_code),
+            _is_status(run, command.exit_code, "FAIL", "BLIND_SPOT"),
+        ),
+        Expectation(
+            "the 10.5555 canary resolved (holds=false), so no DOI under that prefix is reported DOI_RESOLVED",
+            f"canary {canary.get('doi')} {canary.get('state')}, holds={canary.get('holds')}; "
+            f"DOI_RESOLVED {totals.get('DOI_RESOLVED')}, SOURCE_UNAVAILABLE {totals.get('SOURCE_UNAVAILABLE')}",
+            canary.get("holds") is False
+            and canary.get("state") == "DOI_RESOLVED"
+            and totals.get("DOI_RESOLVED") == 0
+            and isinstance(totals.get("SOURCE_UNAVAILABLE"), int)
+            and totals["SOURCE_UNAVAILABLE"] >= 1,
+        ),
+    )
+
+
+def _step_claim_join(ws: _Workspace) -> _Outcome:
+    command, run = _verify(ws, "assertions/five-cases", "runs/claim-join")
+    counts = _field(_check_of(run, "claim_join"), "evidence", "counts")
+    mirrored = _field(run, "controls", "claim_join")
+    shown = ", ".join(f"{name} {_field(counts, name)}" for name in _EXPECTED_CLAIM_JOIN)
+    return (command,), (
+        Expectation(
+            "FAIL (SOURCE_MISMATCH), exit 1: an assertion contradicts the sealed ledger",
+            _status(run, command.exit_code),
+            _is_status(run, command.exit_code, "FAIL", "SOURCE_MISMATCH"),
+        ),
+        Expectation(
+            "assertions joined to the ledger: BACKED 1, NARRATED 2, CONTRADICTED 1, ORPHANED 1 "
+            "(mirrored in run.json controls.claim_join)",
+            f"{shown}; controls.claim_join {'matches' if mirrored == counts else 'differs'}",
+            counts == _EXPECTED_CLAIM_JOIN and mirrored == _EXPECTED_CLAIM_JOIN,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step: mutation testing
+# ---------------------------------------------------------------------------
+
+
+def _fired(record: Mapping[str, Any]) -> list[Any]:
+    return [item.get("detector") for item in _mappings(record.get("detecting_invariants_fired"))]
+
+
 def _step_mutation(ws: _Workspace) -> _Outcome:
     command = ws.run("mutate", PurePosixPath(BLIND_SPOT_MANIFEST), "--output", PurePosixPath("mutation"))
     report = ws.json("mutation/mutation-report.json")
-    records = [item for item in _field(report, "mutations") or () if isinstance(item, Mapping)]
+    records = _mappings(_field(report, "mutations"))
     blind = tuple(item.get("mutation_id") for item in records if item.get("blind_spot") is True)
     executed = [item for item in records if item.get("execution_state") == "CHECKED"]
     others = [item for item in records if item.get("execution_state") != "CHECKED"]
@@ -379,12 +632,21 @@ def _step_mutation(ws: _Workspace) -> _Outcome:
         and all(item.get("detected") is None and item.get("blind_spot") is None for item in others)
         and detected == sum(item.get("detected") is True for item in executed)
     )
+    forced = _field(report, "forced_detection") or {}
+    conservation = _field(report, "conservation") or {}
+    generated = conservation.get("generated")
+    conserved = (
+        all(conservation.get(key) is True for key in ("holds", "generated_holds", "executed_holds", "disjoint"))
+        and isinstance(generated, list)
+        and sorted(generated) == sorted(item.get("mutation_id") for item in records)
+        and len(generated) == _field(report, "generated_mutations")
+    )
+    plan = next((item for item in records if item.get("mutation_id") == "M21_removed_plan"), {})
     return (command,), (
         Expectation(
             "FAIL (BLIND_SPOT), exit 1",
             _status(report, command.exit_code),
-            _field(report, "status") == "FAIL" and _field(report, "reason") == "BLIND_SPOT"
-            and command.exit_code == 1,
+            _is_status(report, command.exit_code, "FAIL", "BLIND_SPOT"),
         ),
         Expectation(
             f"detections reported; blind spots exactly {', '.join(EXPECTED_BLIND_SPOTS)}",
@@ -399,15 +661,33 @@ def _step_mutation(ws: _Workspace) -> _Outcome:
             "or escaped",
             counted_apart,
         ),
+        Expectation(
+            "the harness detects its own forced defect M00 (invariant:ledger_chain_intact) before counting; "
+            "every generated mutant lands in exactly one bucket and the conservation identities hold",
+            f"M00 detected={forced.get('detected')} by {forced.get('detector')}; {len(generated or [])} generated "
+            f"(generated_mutations {_field(report, 'generated_mutations')}); conservation holds="
+            f"{conservation.get('holds')}, disjoint={conservation.get('disjoint')}",
+            forced.get("detected") is True and forced.get("detector") == "invariant:ledger_chain_intact" and conserved,
+        ),
+        Expectation(
+            "M21_removed_plan (PLAN entry removed, ledger resealed) is DETECTED by invariant:plan_closure",
+            f"M21_removed_plan {plan.get('status')}; fired {', '.join(str(item) for item in _fired(plan)) or 'none'}",
+            plan.get("status") == "DETECTED" and "invariant:plan_closure" in _fired(plan),
+        ),
     )
 
 
-def _graph_report(ws: _Workspace, name: str) -> Any:
-    return ws.json(f"{_DEPENDENCIES}/graph/{name}")
+# ---------------------------------------------------------------------------
+# Steps: dependency currency
+# ---------------------------------------------------------------------------
+
+
+def _graph_report(ws: _Workspace, graph_dir: str, name: str) -> Any:
+    return ws.json(f"{graph_dir}/graph/{name}")
 
 
 def _node(report: Any, node_id: str) -> Any:
-    found = [item for item in _field(report, "nodes") or () if isinstance(item, Mapping) and item.get("id") == node_id]
+    found = [item for item in _mappings(_field(report, "nodes")) if item.get("id") == node_id]
     return found[0] if found else None
 
 
@@ -417,9 +697,9 @@ def _graph_command(ws: _Workspace, command: str) -> CommandOutcome:
 
 def _step_impact(ws: _Workspace) -> _Outcome:
     command = _graph_command(ws, "impact")
-    report = _graph_report(ws, "impact-report.json")
+    report = _graph_report(ws, _DEPENDENCIES, "impact-report.json")
     blocked = _field(report, "publication_block", "blocked")
-    reached = [item.get("id") for item in _field(report, "impact", "descendants") or () if isinstance(item, Mapping)]
+    reached = [item.get("id") for item in _mappings(_field(report, "impact", "descendants"))]
     publication = _field(_node(report, _PUBLICATION_NODE), "validity")
     return (command,), (
         Expectation(
@@ -428,23 +708,25 @@ def _step_impact(ws: _Workspace) -> _Outcome:
             _field(report, "status") == "FAIL" and command.exit_code == 1 and blocked is True,
         ),
         Expectation(
-            f"descendants marked STALE_PENDING_REVALIDATION, {_PUBLICATION_NODE} among them",
+            f"descendants marked {_STALE}, {_PUBLICATION_NODE} among them",
             f"{len(reached)} descendant(s) reached; {_PUBLICATION_NODE} is {publication}",
-            _PUBLICATION_NODE in reached and publication == "STALE_PENDING_REVALIDATION",
+            _PUBLICATION_NODE in reached and publication == _STALE,
         ),
     )
 
 
-def _revalidation(ws: _Workspace) -> tuple[Any, Any, list[Any], Any]:
-    report = _graph_report(ws, "revalidation-report.json")
+def _revalidation(ws: _Workspace, graph_dir: str) -> tuple[Any, Any, list[Any]]:
+    """The last revalidation report written under ``graph_dir``: the report, its outcome and what it cleared."""
+    report = _graph_report(ws, graph_dir, "revalidation-report.json")
     action = _field(report, "revalidate")
-    cleared = [item.get("id") for item in _field(action, "cleared") or () if isinstance(item, Mapping)]
-    return report, _field(action, "outcome"), cleared, _field(_node(report, _PUBLICATION_NODE), "validity")
+    cleared = [item.get("id") for item in _mappings(_field(action, "cleared"))]
+    return report, _field(action, "outcome"), cleared
 
 
 def _step_revalidate_unchanged(ws: _Workspace) -> _Outcome:
     command = _graph_command(ws, "revalidate")
-    report, outcome, cleared, publication = _revalidation(ws)
+    report, outcome, cleared = _revalidation(ws, _DEPENDENCIES)
+    publication = _field(_node(report, _PUBLICATION_NODE), "validity")
     return (command,), (
         Expectation(
             f"REVALIDATED_UNCHANGED; early cutoff clears {_PUBLICATION_NODE}; PASS, exit 0",
@@ -461,18 +743,101 @@ def _step_revalidate_unchanged(ws: _Workspace) -> _Outcome:
 def _step_revalidate_changed(ws: _Workspace) -> _Outcome:
     ws.write(_DESIGN_FILE, ws.read(_DESIGN_FILE) + _DESIGN_AMENDMENT)
     command = _graph_command(ws, "revalidate")
-    report, outcome, cleared, publication = _revalidation(ws)
+    report, outcome, cleared = _revalidation(ws, _DEPENDENCIES)
+    publication = _field(_node(report, _PUBLICATION_NODE), "validity")
     return (command,), (
         Expectation(
-            f"REVALIDATED_CHANGED; {_PUBLICATION_NODE} stays STALE_PENDING_REVALIDATION; FAIL, exit 1",
+            f"REVALIDATED_CHANGED; {_PUBLICATION_NODE} stays {_STALE}; FAIL, exit 1",
             f"{outcome}; cleared {', '.join(cleared) or 'nothing'}; {_PUBLICATION_NODE} is {publication}; "
             f"{_status(report, command.exit_code)}",
-            outcome == "REVALIDATED_CHANGED"
-            and not cleared
-            and publication == "STALE_PENDING_REVALIDATION"
-            and command.exit_code == 1,
+            outcome == "REVALIDATED_CHANGED" and not cleared and publication == _STALE and command.exit_code == 1,
         ),
     )
+
+
+def _write_witness(ws: _Workspace, relpath: str, offset: timedelta) -> None:
+    """Write a synthetic recompute witness for analysis-run, timed ``offset`` from its recorded change.
+
+    The change is the last transition that made the node pending, as the
+    ``impact`` command recorded it in graph-state.json; refused cutoffs are
+    not changes. The parent and output digests come from the committed
+    witness, which binds the fixture as recorded, so the only thing that
+    differs between an accepted and a refused witness is whether the
+    recompute started after the change. The invocation id is a content hash
+    (D11). Raises ValueError when no change is recorded, which fails the step.
+    """
+    history = _mappings(_field(ws.json(f"{_WITNESSED}/graph/graph-state.json"), "nodes", _DERIVED_NODE, "history"))
+    changes = [item for item in history if item.get("to") == _STALE and item.get("from") != item.get("to")]
+    template = ws.json(_WITNESS_TEMPLATE)
+    if not changes or not isinstance(template, Mapping):
+        raise ValueError(f"no recorded change of {_DERIVED_NODE} or no witness template to time a recompute against")
+    moment = format_utc(parse_utc(changes[-1]["at"]) + offset)
+    label = f"synthetic recompute of {_DERIVED_NODE} by science-gate demo at {moment}"
+    document = dict(
+        template,
+        invocation_id="inv-" + sha256_bytes(label.encode("utf-8"))[:12],
+        started_at=moment,
+        completed_at=moment,
+    )
+    ws.write(relpath, pretty_json_bytes(document))
+
+
+def _step_witnessed(ws: _Workspace) -> _Outcome:
+    """A derived artifact is cleared only by a recompute that followed its change (decision D6)."""
+    manifest = PurePosixPath(f"{_WITNESSED}/manifest.json")
+    impact = ws.run("impact", _DERIVED_NODE, "--manifest", manifest)
+    bare = ws.run("revalidate", _DERIVED_NODE, "--manifest", manifest)
+    report, outcome, _ = _revalidation(ws, _WITNESSED)
+    modes = {mode for item in _mappings(_field(report, "findings")) for mode in item.get("failure_modes") or ()}
+    pending = {node: _field(_node(report, node), "validity") for node in (_DERIVED_NODE, _PUBLICATION_NODE)}
+
+    _write_witness(ws, _PREDATING_WITNESS, -timedelta(seconds=1))
+    stale = ws.run("revalidate", _DERIVED_NODE, "--manifest", manifest, "--witness", PurePosixPath(_PREDATING_WITNESS))
+    stale_report, stale_outcome, _ = _revalidation(ws, _WITNESSED)
+    problems = _field(stale_report, "revalidate", "witness", "problems") or []
+
+    _write_witness(ws, _FRESH_WITNESS, timedelta(seconds=1))
+    fresh = ws.run("revalidate", _DERIVED_NODE, "--manifest", manifest, "--witness", PurePosixPath(_FRESH_WITNESS))
+    fresh_report, fresh_outcome, cleared = _revalidation(ws, _WITNESSED)
+    publication = _field(_node(fresh_report, _PUBLICATION_NODE), "validity")
+    return (impact, bare, stale, fresh), (
+        Expectation(
+            f"after an upstream change, re-hashing the untouched derived node {_DERIVED_NODE} is refused: "
+            f"REFUSED_VACUOUS_CUTOFF (VACUOUS_CUTOFF); it and {_PUBLICATION_NODE} stay {_STALE}; FAIL, exit 1",
+            f"impact exit {impact.exit_code}; {outcome}; {_DERIVED_NODE} is {pending[_DERIVED_NODE]}, "
+            f"{_PUBLICATION_NODE} is {pending[_PUBLICATION_NODE]}; {_status(report, bare.exit_code)}",
+            impact.exit_code == 1
+            and outcome == "REFUSED_VACUOUS_CUTOFF"
+            and "VACUOUS_CUTOFF" in modes
+            and pending == {_DERIVED_NODE: _STALE, _PUBLICATION_NODE: _STALE}
+            and bare.exit_code == 1,
+        ),
+        Expectation(
+            "a recompute witness that started before the change is refused: REFUSED_INVALID_WITNESS "
+            "(WITNESS_PREDATES_CHANGE); FAIL, exit 1",
+            f"{stale_outcome}; problems: {'; '.join(str(item).split(':', 1)[0] for item in problems) or 'none'}; "
+            f"exit {stale.exit_code}",
+            stale_outcome == "REFUSED_INVALID_WITNESS"
+            and len(problems) == 1
+            and str(problems[0]).startswith("WITNESS_PREDATES_CHANGE")
+            and stale.exit_code == 1,
+        ),
+        Expectation(
+            "a recompute witness that started after the change and binds both parents and the output: "
+            f"REVALIDATED_UNCHANGED; early cutoff clears {', '.join(_BELOW_DERIVED)}; PASS, exit 0",
+            f"{fresh_outcome}; cleared {', '.join(str(item) for item in cleared) or 'nothing'}; "
+            f"{_PUBLICATION_NODE} is {publication}; {_status(fresh_report, fresh.exit_code)}",
+            fresh_outcome == "REVALIDATED_UNCHANGED"
+            and sorted(cleared) == sorted(_BELOW_DERIVED)
+            and publication == "CURRENT"
+            and fresh.exit_code == 0,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step: packaging
+# ---------------------------------------------------------------------------
 
 
 def _leaked_rows(ws: _Workspace, entries: Iterable[Mapping[str, Any]]) -> int:
@@ -492,7 +857,7 @@ def _step_package(ws: _Workspace) -> _Outcome:
         "package", PurePosixPath(f"{_CONTROLLED}/manifest.json"), "--output", PurePosixPath("package")
     )
     index = ws.json("package/package.json")
-    files = [item for item in _field(index, "files") or () if isinstance(item, Mapping)]
+    files = _mappings(_field(index, "files"))
     withheld = [
         item
         for item in files
@@ -515,13 +880,20 @@ def _step_package(ws: _Workspace) -> _Outcome:
 
 _STEPS: tuple[tuple[str, Callable[[_Workspace], _Outcome]], ...] = (
     ("valid project", _step_valid),
+    ("falsifier witnesses and canary", _step_witnesses),
+    ("execution plan", _step_plan),
     ("re-verify the run directory", _step_report),
     ("empty input", _step_empty),
     ("narrated verification", _step_narrated),
+    ("GRIM inconsistency", _step_grim),
+    ("narrated number", _step_narrated_number),
+    ("resolver canary", _step_canary),
+    ("claim join", _step_claim_join),
     ("mutation testing", _step_mutation),
     ("upstream change", _step_impact),
     ("revalidate, file unchanged", _step_revalidate_unchanged),
     ("revalidate, file changed", _step_revalidate_changed),
+    ("witnessed revalidation", _step_witnessed),
     ("controlled-local packaging", _step_package),
 )
 
@@ -592,8 +964,13 @@ def _written_paths(root: Path) -> list[Path]:
         "runs/valid",
         "runs/empty",
         "runs/narrated",
+        "runs/grim",
+        "runs/narrated-number",
+        "runs/canary",
+        "runs/claim-join",
         "mutation",
         f"{_DEPENDENCIES}/graph",
+        f"{_WITNESSED}/graph",
         "package",
     ]
     return [root / place for place in places if (root / place).exists()]

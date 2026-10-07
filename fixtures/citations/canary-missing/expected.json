@@ -1,0 +1,23 @@
+{
+  "description": "The same three citations as all-good, but the frozen capture holds no canary record for the 10.5555 prefix: the positive answers have no negative control, so resolution cannot PASS (ABSTAIN / BLIND_SPOT).",
+  "status": "ABSTAIN",
+  "reason": "BLIND_SPOT",
+  "exit_code": 2,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "ABSTAIN",
+    "citation-metadata": "PASS"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.0001": "DOI_RESOLVED",
+    "10.5555/sgate.fx.0002": "DOI_RESOLVED",
+    "10.5555/sgate.fx.0003": "DOI_RESOLVED"
+  },
+  "canaries": {
+    "10.5555": {
+      "holds": false,
+      "source": "none"
+    }
+  }
+}

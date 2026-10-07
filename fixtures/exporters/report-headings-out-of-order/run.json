@@ -1,0 +1,383 @@
+{
+  "accounting": {
+    "closure": {
+      "accounted": 1,
+      "expected": 1,
+      "holds": true,
+      "source": "INDEPENDENT"
+    },
+    "counters": {
+      "admitted": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "deferred": {
+        "denominator_source": "OBSERVED",
+        "value": 0
+      },
+      "discovered": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "examined": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "excluded": {
+        "denominator_source": "OBSERVED",
+        "value": 0
+      },
+      "expected": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "failed": {
+        "denominator_source": "OBSERVED",
+        "value": 0
+      },
+      "opened": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "parsed": {
+        "denominator_source": "OBSERVED",
+        "value": 1
+      },
+      "unresolved": {
+        "denominator_source": "OBSERVED",
+        "value": 0
+      }
+    },
+    "inputs": [
+      {
+        "bytes": 212,
+        "closure": {
+          "accounted": 6,
+          "expected": 6,
+          "holds": true,
+          "source": "INDEPENDENT"
+        },
+        "diagnostics": [],
+        "id": "measurements",
+        "path": "data/measurements.csv",
+        "required": true,
+        "row_counts": {
+          "admitted": 6,
+          "deferred": 0,
+          "excluded": 0,
+          "failed": 0,
+          "unresolved": 0
+        },
+        "rows": 6,
+        "sha256": "869837d836c85516e870924b62b12403af3972e2a6bf529e888ab8fd4648b185",
+        "state": "PARSED"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "check_id": "duplicates",
+      "diagnostics": [
+        "row_key SYN-0003 appears twice"
+      ],
+      "evidence": {
+        "duplicate_keys": [
+          "SYN-0003"
+        ]
+      },
+      "execution_state": "CHECKED",
+      "failure_modes": [
+        "SOURCE_MISMATCH"
+      ],
+      "inputs": [
+        "measurements"
+      ],
+      "invocation_id": "inv-4b956d10114c",
+      "kind": "duplicate_rows",
+      "reason": "SOURCE_MISMATCH",
+      "required": true,
+      "rows_examined": 6,
+      "verdict": "FAIL",
+      "version": "1"
+    },
+    {
+      "check_id": "reviews",
+      "diagnostics": [
+        "required reviewer reviewer-b gave no verdict"
+      ],
+      "evidence": {
+        "missing_reviewers": [
+          "reviewer-b"
+        ]
+      },
+      "execution_state": "CHECKED",
+      "failure_modes": [
+        "PROTOCOL_DRIFT"
+      ],
+      "inputs": [],
+      "invocation_id": "inv-10b4eea1e171",
+      "kind": "reviewer_protocol",
+      "reason": "PROTOCOL_BROKEN",
+      "required": true,
+      "rows_examined": 1,
+      "verdict": "ABSTAIN",
+      "version": "1"
+    },
+    {
+      "check_id": "rows",
+      "diagnostics": [],
+      "evidence": {
+        "falsification": "WITNESSED",
+        "falsifiers": [
+          {
+            "actual": {
+              "execution_state": "CHECKED",
+              "reason": "SOURCE_MISMATCH",
+              "verdict": "FAIL"
+            },
+            "case_id": "drop-last-row",
+            "checker_sha256": "ffb1a34cb7fd804722913d7fed76c73a410de13ee2aeb28494e57d534c1596a2",
+            "description": "last admitted row of measurements removed",
+            "expected": {
+              "reason": "SOURCE_MISMATCH",
+              "verdict": "FAIL"
+            },
+            "invocation_id": "inv-924a72d9ea79",
+            "outcome": "REJECTED",
+            "params_sha256": "830b6549c6daba8be4a5d6e44f40cca32b1035f45e639da176d2ce5bd3f025fc"
+          }
+        ],
+        "rows_counted": 6
+      },
+      "execution_state": "CHECKED",
+      "failure_modes": [],
+      "inputs": [
+        "measurements"
+      ],
+      "invocation_id": "inv-325393fa8605",
+      "kind": "row_count",
+      "reason": "VERIFIED",
+      "required": true,
+      "rows_examined": 6,
+      "verdict": "PASS",
+      "version": "1"
+    }
+  ],
+  "checks_abstained": 1,
+  "checks_executed": 3,
+  "checks_expected": 3,
+  "checks_failed": 1,
+  "checks_passed": 1,
+  "claim_tallies": [],
+  "completed_at": "2026-01-02T03:04:05Z",
+  "controls": {
+    "canary": {
+      "holds": true,
+      "must_fail": {
+        "invocation_id": "inv-a081c642d5cb",
+        "reason": "SOURCE_MISMATCH",
+        "verdict": "FAIL"
+      },
+      "must_pass": {
+        "invocation_id": "inv-2e2cd435607b",
+        "reason": "VERIFIED",
+        "verdict": "PASS"
+      }
+    },
+    "claim_join": null,
+    "comparator_self_test": {
+      "holds": true,
+      "invocation_id": "inv-a171155a9a3c",
+      "pairs": [
+        {
+          "actual": "DISAGREES",
+          "claim": "0.15",
+          "expected": "DISAGREES",
+          "stored": "0.14"
+        },
+        {
+          "actual": "EXACT",
+          "claim": "12.4",
+          "expected": "EXACT",
+          "stored": "12.40"
+        },
+        {
+          "actual": "AGREES_AT_STATED_PRECISION",
+          "claim": "0.1",
+          "expected": "AGREES_AT_STATED_PRECISION",
+          "stored": "0.14"
+        }
+      ]
+    },
+    "falsifiers": {
+      "NO_CASE": [],
+      "NO_GENERATOR": [],
+      "REFUTED": [],
+      "UNWITNESSED": [],
+      "WITNESSED": [
+        "rows"
+      ],
+      "invocations": 1
+    },
+    "min_discrimination": null,
+    "pins": {
+      "changed": [],
+      "holds": true,
+      "pinned": 4,
+      "writes": []
+    },
+    "plan": {
+      "checks_planned": 3,
+      "entry_sha256": "63049643cc3163544262a2aea9a05f5d23b0c1fdd5a8c34ce5d38f924e08c905",
+      "inputs_planned": 1,
+      "manifest_sha256": "9557dcef32f1c7a8bd3e824f92d1d69e67cbade32fdac4d7ffa94250eaac1d77",
+      "pins": 4
+    },
+    "verdict_transitions": [
+      {
+        "after": "PASS",
+        "before": "NONE",
+        "reason": "VERIFIED",
+        "source": "check:rows",
+        "step": 1
+      },
+      {
+        "after": "FAIL",
+        "before": "PASS",
+        "reason": "SOURCE_MISMATCH",
+        "source": "check:duplicates",
+        "step": 2
+      }
+    ]
+  },
+  "counters": {
+    "checks_abstained": 1,
+    "checks_declared": 3,
+    "checks_errored": 0,
+    "checks_executed": 3,
+    "checks_expected": 3,
+    "checks_failed": 1,
+    "checks_not_applicable": 0,
+    "checks_passed": 1,
+    "checks_skipped": 0,
+    "expected_inputs": 1,
+    "inputs_discovered": 1,
+    "inputs_examined": 1,
+    "inputs_opened": 1,
+    "inputs_parsed": 1,
+    "rows_examined": 6
+  },
+  "declared": {
+    "checks": [
+      {
+        "id": "duplicates",
+        "inputs": [
+          "measurements"
+        ],
+        "kind": "duplicate_rows",
+        "params": {},
+        "required": true,
+        "version": "1"
+      },
+      {
+        "id": "reviews",
+        "inputs": [],
+        "kind": "reviewer_protocol",
+        "params": {},
+        "required": true,
+        "version": "1"
+      },
+      {
+        "id": "rows",
+        "inputs": [
+          "measurements"
+        ],
+        "kind": "row_count",
+        "params": {},
+        "required": true,
+        "version": "1"
+      }
+    ],
+    "inputs": [
+      {
+        "denominator_source": "INDEPENDENT",
+        "expected_rows": 6,
+        "format": "csv",
+        "id": "measurements",
+        "path": "data/measurements.csv",
+        "required": true,
+        "row_key": [
+          "sample_id"
+        ],
+        "sha256": "869837d836c85516e870924b62b12403af3972e2a6bf529e888ab8fd4648b185"
+      }
+    ]
+  },
+  "disclaimer": "Synthetic exporter fixture; it records no real run.",
+  "documents": [],
+  "evidence_boundary": {
+    "integrity": "Synthetic fixture: no input was hashed for this document.",
+    "performance": "Synthetic fixture: no check ran for this document.",
+    "scientific_validity": "NOT ESTABLISHED"
+  },
+  "evidence_manifest_sha256": "89bd93aceb78a780b266e2a194fbd7b60c22ad8e6a56b33c4f20190bf4bdfc80",
+  "exit_code": 1,
+  "expected_inputs": 1,
+  "failure_modes": [
+    "PROTOCOL_DRIFT",
+    "SOURCE_MISMATCH"
+  ],
+  "findings": [
+    {
+      "detail": "row_key SYN-0003 appears twice",
+      "failure_modes": [
+        "SOURCE_MISMATCH"
+      ],
+      "reason": "SOURCE_MISMATCH",
+      "source": "check:duplicates",
+      "status": "FAIL"
+    },
+    {
+      "detail": "required reviewer reviewer-b gave no verdict",
+      "failure_modes": [
+        "PROTOCOL_DRIFT"
+      ],
+      "reason": "PROTOCOL_BROKEN",
+      "source": "check:reviews",
+      "status": "ABSTAIN"
+    }
+  ],
+  "inputs_discovered": 1,
+  "inputs_opened": 1,
+  "invariants": [],
+  "ledger_head_sha256": "00ef384093b54cba15925493f7a0dbd992967e29022bdb56e6a737be5520e4c0",
+  "ledger_length": 15,
+  "manifest": {
+    "file": "manifest.json",
+    "issues": [],
+    "run_label": "synthetic-exporter",
+    "sha256": "9557dcef32f1c7a8bd3e824f92d1d69e67cbade32fdac4d7ffa94250eaac1d77"
+  },
+  "network": {
+    "live": false
+  },
+  "reason": "SOURCE_MISMATCH",
+  "reasons": [
+    "SOURCE_MISMATCH",
+    "PROTOCOL_BROKEN"
+  ],
+  "receipt": {
+    "content_sha256": "c36b901c28c7fe33ab9344abd33d41d4d78d1f592787520ba22cbae89a1e0dc1",
+    "key_id": null,
+    "signature_state": "UNSIGNED"
+  },
+  "rows_examined": 6,
+  "run_id": "run-d36af7aab43267d5",
+  "schema": "science-gate-run/v1",
+  "started_at": "2026-01-02T03:04:05Z",
+  "status": "FAIL",
+  "tool": {
+    "name": "scientific-evidence-gate",
+    "version": "fixture"
+  }
+}

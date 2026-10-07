@@ -51,6 +51,19 @@ section 15) and, where noted, elsewhere.
   outside its root. `package` refuses an output inside the evaluated
   project, and `--force` replaces only a previous package whose every file it
   listed itself.
+- **Half-written run directories.** `verify` writes into a staging sibling
+  `.<name>.incomplete` and renames it into place only after every file is
+  written and every export has passed its validator, so an interrupted run
+  (a full disk, for example) never leaves a `report.md` without its
+  `run.json`. An existing non-empty `--output` is refused (`OUTPUT_EXISTS`),
+  and `report` refuses a directory without `run.json` as `RUN_INCOMPLETE`.
+- **Writes to evidence during a run.** The files a run depends on (manifest,
+  inputs, role documents, check modules) are pinned before the run's PLAN and
+  re-hashed after the last check. One process-wide audit hook, active only
+  while a run records, also reports any write, rename or delete of a pinned
+  path, so a write that restores the original bytes is still caught
+  (`harness_pins_intact`). The hook cannot see I/O done by subprocesses or C
+  extensions.
 - **Network.** Live citation lookups run only with `--live` or
   `citations.live: true`, through `urllib` with a 10-second timeout. Any
   network error or non-2xx response becomes `SOURCE_UNAVAILABLE`. Tests
@@ -63,8 +76,12 @@ section 15) and, where noted, elsewhere.
   form is not recognized and could appear in evidence or reports.
 - **Rewritten run directories.** An UNSIGNED receipt's content hash detects
   accidental change, but anyone who can edit the run directory can rewrite
-  and rehash it. Set `SCIENCE_GATE_HMAC_KEY_FILE` to a key file to sign
-  receipts with HMAC-SHA256; the key itself is never written.
+  and rehash it. Set `SCIENCE_GATE_HMAC_KEY_FILE` to a key file to
+  authenticate receipts with an HMAC-SHA256 shared-key authenticator, written
+  to `receipt.auth.json` beside the statement; the key itself is never
+  written. Anyone holding the key can produce the authenticator, so it is not
+  a public signature. Pass `--require-signature` to make anything short of a
+  verified authenticator exit 3.
 - **Forged but consistent inputs.** The tool checks that evidence is
   internally consistent and matches declared digests. It cannot tell whether
   the declared digests, snapshots or expectations were honest.

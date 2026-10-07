@@ -10,6 +10,12 @@ The graph in that project:
     admitted-evidence -> analysis-run -> site-means -> figure-1, conclusion-1
     figure-1 -> conclusion-1
     table-2 -> conclusion-2
+
+Section 17 additions tested here: the closed skip justifications of the
+check's unexamined outcomes (#24), the dependency_currency falsifier (17.5)
+and the schema keys of 17.13. Witnessed revalidation and verifier drift
+have their own module (test_witnessed_revalidation.py), as does the
+what-if (test_staleness_whatif.py).
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +39,8 @@ from _helpers import FIXED_TIME, REPO_ROOT, SRC_DIR, TempDirTestCase
 from science_gate import cli
 from science_gate._canonical import sha256_bytes, strict_loads
 from science_gate.dependencies import (
+    BACKING_KEYS,
+    FALSIFIER_MARK,
     GRAPH_CYCLE,
     GRAPH_SCHEMA,
     GRAPH_STATE_FILE,
@@ -45,6 +54,7 @@ from science_gate.dependencies import (
     NODE_ROLE,
     REQUIRED_GRAPH_KEYS,
     REQUIRED_NODE_KEYS,
+    REQUIRED_STATE_TRANSITION_KEYS,
     REQUIRED_TRANSITION_KEYS,
     REVALIDATION_REPORT_FILE,
     STATE_KEYS,
@@ -53,19 +63,41 @@ from science_gate.dependencies import (
     TRANSITION_KEYS,
     UNKNOWN_ARTIFACT,
     UNSAFE_PATH,
+    WHAT_IF_SCHEMA,
+    WITNESS_KEYS,
+    WITNESS_SCHEMA,
+    Assessment,
     DependencyGraph,
     DigestComparison,
     GraphCycleError,
     GraphError,
     NodeKind,
+    RecomputeWitness,
     RevalidationOutcome,
     assess,
+    check_dependency_currency,
+    falsify_dependency_currency,
     load_graph,
     parse_graph,
 )
-from science_gate.models import ExecutionState, FailureMode, Reason, Status, Validity
+from science_gate.discovery import discover
+from science_gate.manifests import CheckSpec, load_manifest
+from science_gate.models import (
+    SKIP_JUSTIFICATION_KEY,
+    SKIP_JUSTIFICATION_OUTCOMES,
+    CheckResult,
+    ExecutionState,
+    FailureMode,
+    FalsifierCase,
+    FalsifierOutcome,
+    Reason,
+    SkipJustification,
+    StaleCause,
+    Status,
+    Validity,
+)
 from science_gate.receipts import HMAC_KEY_FILE_ENV
-from science_gate.verifier import VerificationRun, verify
+from science_gate.verifier import CheckContext, CheckOutcome, VerificationRun, verify
 
 FIXTURES = REPO_ROOT / "fixtures" / "dependencies"
 CURRENT = FIXTURES / "current"
@@ -102,6 +134,38 @@ def bare_node(node_id: str, kind: str = "ANALYSIS_RUN", validity: str = "CURRENT
 
 def parse(document: dict[str, Any]) -> DependencyGraph:
     return parse_graph(document, graph_path=GRAPH, graph_sha256=_ANY_DIGEST)
+
+
+def recompute_witness(graph: DependencyGraph, node_id: str) -> RecomputeWitness:
+    """A witness that binds: started after the fixed clock, every parent at its current digest."""
+    inputs = {parent: graph.recorded_sha256(parent) for parent in graph.parents(node_id)}
+    return RecomputeWitness(
+        node_id=node_id,
+        invocation_id="inv-" + sha256_bytes(f"synthetic recompute of {node_id}".encode("utf-8"))[:12],
+        started_at="2026-01-02T04:00:00Z",
+        completed_at="2026-01-02T04:05:00Z",
+        inputs={parent: digest for parent, digest in inputs.items() if digest is not None},
+        output_sha256=graph.recorded_sha256(node_id),
+    )
+
+
+def currency_context(manifest_path: Path) -> tuple[CheckContext, CheckSpec]:
+    """A check context as the engine builds one (inputs discovered, files preloaded), and the currency spec.
+
+    Calling the check directly keeps these tests about the check itself, not
+    about how the engine later folds its result into a run.
+    """
+    manifest = load_manifest(manifest_path)
+    _, opened = discover(manifest)
+    ctx = CheckContext(manifest, opened)
+    ctx.preload(spec.kind for spec in manifest.checks)
+    (spec,) = [spec for spec in manifest.checks if spec.kind == "dependency_currency"]
+    return ctx, spec
+
+
+def run_currency(manifest_path: Path) -> CheckOutcome:
+    ctx, spec = currency_context(manifest_path)
+    return check_dependency_currency(ctx, spec)
 
 
 class GraphProject(TempDirTestCase):
@@ -532,15 +596,21 @@ class RevalidateTests(GraphProject):
         self.assertEqual(assess(graph, graph.detect_changes()).status, Status.FAIL)
 
     def test_after_a_real_change_early_cutoff_clears_only_what_no_longer_depends_on_it(self) -> None:
+        # Section 17.13 (D6) changed this test: the two derived nodes now
+        # settle only with recompute witnesses, and each direct child of the
+        # changed design is pending on its own account as well.
         graph = self.load()
         graph.impact("study-design")
         self.append("design/protocol.md")
         graph.revalidate("study-design")
-        admitted = graph.revalidate("admitted-evidence")
+        self.assertEqual(graph.stale_because("admitted-evidence"), ("admitted-evidence", "study-design"))
+        rehashed = graph.revalidate("admitted-evidence")
+        self.assertEqual(rehashed.outcome, RevalidationOutcome.REFUSED_VACUOUS_CUTOFF)
+        admitted = graph.revalidate("admitted-evidence", witness=recompute_witness(graph, "admitted-evidence"))
         self.assertEqual(admitted.outcome, RevalidationOutcome.REVALIDATED_UNCHANGED)
         self.assertEqual(admitted.cleared, ())
-        self.assertEqual(graph.stale_because("analysis-run"), ("study-design",))
-        analysis = graph.revalidate("analysis-run")
+        self.assertEqual(graph.stale_because("analysis-run"), ("analysis-run", "study-design"))
+        analysis = graph.revalidate("analysis-run", witness=recompute_witness(graph, "analysis-run"))
         self.assertEqual([item.node_id for item in analysis.cleared], ["site-means", "figure-1", "conclusion-1"])
         assessment = assess(graph, graph.detect_changes())
         self.assertEqual(assessment.status, Status.PASS)
@@ -922,6 +992,172 @@ class CurrencyCheckTests(GraphProject):
 
 
 # ---------------------------------------------------------------------------
+# Closed skip justifications (extension #24, section 17.7)
+# ---------------------------------------------------------------------------
+
+
+class SkipJustificationTests(GraphProject):
+    """Every outcome that examined nothing names why, from the closed vocabulary."""
+
+    def assert_labelled(self, justification: SkipJustification, state: ExecutionState) -> CheckOutcome:
+        outcome = run_currency(self.manifest_path)
+        self.assertEqual(outcome.execution_state, state)
+        self.assertEqual(outcome.rows_examined, 0)
+        self.assertEqual(SkipJustification(outcome.evidence[SKIP_JUSTIFICATION_KEY]), justification)
+        # The run-level row for the label agrees with the check's own verdict and reason.
+        verdict, reason, _ = SKIP_JUSTIFICATION_OUTCOMES[justification]
+        self.assertEqual((outcome.verdict, outcome.reason), (verdict, reason))
+        return outcome
+
+    def test_no_declared_graph_is_not_declared(self) -> None:
+        document = self.read_json("manifest.json")
+        document.pop("dependencies")
+        self.write_json("manifest.json", document)
+        self.assert_labelled(SkipJustification.NOT_DECLARED, ExecutionState.NOT_APPLICABLE)
+
+    def test_a_missing_graph_is_input_unavailable(self) -> None:
+        self.remove(GRAPH)
+        self.assert_labelled(SkipJustification.INPUT_UNAVAILABLE, ExecutionState.SKIPPED)
+
+    def test_unparseable_or_malformed_evidence_is_evidence_malformed(self) -> None:
+        (self.project / GRAPH).write_bytes(b"{not json")
+        self.assert_labelled(SkipJustification.EVIDENCE_MALFORMED, ExecutionState.SKIPPED)
+        self.write_graph([bare_node("a"), bare_node("b")], [["a", "ghost"]])
+        self.assert_labelled(SkipJustification.EVIDENCE_MALFORMED, ExecutionState.SKIPPED)
+        shutil.copy(CURRENT / GRAPH, self.project / GRAPH)
+        (self.project / "graph" / GRAPH_STATE_FILE).write_bytes(b"{not json")
+        self.assert_labelled(SkipJustification.EVIDENCE_MALFORMED, ExecutionState.SKIPPED)
+        (self.project / "graph" / GRAPH_STATE_FILE).write_text('{"schema": "x"}', encoding="utf-8")
+        self.assert_labelled(SkipJustification.EVIDENCE_MALFORMED, ExecutionState.SKIPPED)
+
+    def test_a_graph_without_nodes_is_an_empty_population(self) -> None:
+        self.write_graph([], [])
+        outcome = self.assert_labelled(SkipJustification.EMPTY_POPULATION, ExecutionState.NOT_APPLICABLE)
+        self.assertEqual(outcome.reason, Reason.INSUFFICIENT_EVIDENCE)
+
+    def test_an_error_carries_no_label_and_a_judged_graph_needs_none(self) -> None:
+        outcome = run_currency(CYCLE / "manifest.json")
+        self.assertEqual(outcome.verdict, Status.ERROR)
+        self.assertNotIn(SKIP_JUSTIFICATION_KEY, outcome.evidence)
+        judged = run_currency(self.manifest_path)
+        self.assertEqual((judged.execution_state, judged.verdict), (ExecutionState.CHECKED, Status.PASS))
+        self.assertNotIn(SKIP_JUSTIFICATION_KEY, judged.evidence)
+
+
+# ---------------------------------------------------------------------------
+# The dependency_currency falsifier (section 17.5)
+# ---------------------------------------------------------------------------
+
+
+def blind_assess(graph: DependencyGraph, detection: Any) -> Assessment:
+    """A deliberately blind assessment: whatever the graph says, PASS."""
+    real = assess(graph, detection)
+    return Assessment(Status.PASS, Reason.VERIFIED, (), (), real.publication_block, real.counts)
+
+
+def falsifier_outcome(case: FalsifierCase, outcome: CheckOutcome) -> FalsifierOutcome:
+    """Section 17.5, step 3: REJECTED on the expected rejection, ACCEPTED on PASS, else INCONCLUSIVE."""
+    if (outcome.verdict, outcome.reason) == (case.expected_verdict, case.expected_reason):
+        return FalsifierOutcome.REJECTED
+    return FalsifierOutcome.ACCEPTED if outcome.verdict is Status.PASS else FalsifierOutcome.INCONCLUSIVE
+
+
+class FalsifierTests(GraphProject):
+    """``falsify_dependency_currency`` builds known-bad evidence the check must reject."""
+
+    def passing(self) -> tuple[CheckContext, CheckSpec, CheckResult]:
+        """A context in which the currency check passes, with that check's result."""
+        ctx, spec = currency_context(self.manifest_path)
+        outcome = check_dependency_currency(ctx, spec)
+        self.assertEqual(outcome.verdict, Status.PASS, outcome.diagnostics)
+        result = CheckResult(
+            check_id=spec.check_id,
+            kind=spec.kind,
+            version=spec.version,
+            required=spec.required,
+            execution_state=outcome.execution_state,
+            verdict=outcome.verdict,
+            reason=outcome.reason,
+            rows_examined=outcome.rows_examined,
+            evidence=outcome.evidence,
+        )
+        return ctx, spec, result
+
+    def replay(self, case: FalsifierCase) -> CheckOutcome:
+        """Serve the case's replacement bytes and run the same check (the engine does this in memory)."""
+        for relpath, data in case.documents.items():
+            (self.project / relpath).write_bytes(data)
+        return run_currency(self.manifest_path)
+
+    def test_a_pass_yields_a_publication_file_case_that_the_check_rejects(self) -> None:
+        ctx, spec, result = self.passing()
+        reads, files = ctx.read_log(), self.snapshot()
+        (case,) = falsify_dependency_currency(ctx, spec, result)
+        self.assertEqual(ctx.read_log(), reads, "the generator reads only what the context already served")
+        self.assertEqual(self.snapshot(), files, "the generator writes nothing")
+        self.assertEqual(falsify_dependency_currency(*self.passing()), (case,), "the generator is deterministic")
+        self.assertEqual(case.case_id, "change-publication-file")
+        self.assertEqual((case.expected_verdict, case.expected_reason), (Status.FAIL, Reason.SOURCE_MISMATCH))
+        original = (self.project / "conclusions/conclusion-1.md").read_bytes()
+        self.assertEqual(dict(case.documents), {"conclusions/conclusion-1.md": original + FALSIFIER_MARK})
+        self.assertEqual(dict(case.inputs), {})
+        self.assertIn("'conclusion-1'", case.description)
+        replayed = self.replay(case)
+        self.assertEqual(falsifier_outcome(case, replayed), FalsifierOutcome.REJECTED)
+        self.assertIn(FailureMode.STALE_DEPENDENCY, replayed.failure_modes)
+        self.assertEqual(replayed.evidence["publication_block"]["stale_publication_nodes"], ["conclusion-1"])
+
+    def test_the_engine_witnesses_a_currency_pass_with_this_case(self) -> None:
+        check = self.currency(self.run_verify())
+        self.assertEqual(check.verdict, Status.PASS)
+        self.assertEqual(check.evidence["falsification"], "WITNESSED")
+        (falsifier,) = check.evidence["falsifiers"]
+        self.assertEqual((falsifier["case_id"], falsifier["outcome"]), ("change-publication-file", "REJECTED"))
+        self.assertEqual(falsifier["actual"]["verdict"], "FAIL")
+
+    def test_the_case_tells_a_working_check_from_a_blind_one(self) -> None:
+        (case,) = falsify_dependency_currency(*self.passing())
+        working = self.replay(case)
+        with mock.patch("science_gate.dependencies.assess", blind_assess):
+            blind = run_currency(self.manifest_path)
+        self.assertEqual(falsifier_outcome(case, working), FalsifierOutcome.REJECTED)
+        self.assertEqual(falsifier_outcome(case, blind), FalsifierOutcome.ACCEPTED)
+
+    def test_publication_nodes_without_files_fall_back_to_an_upstream_file(self) -> None:
+        design = self.file_node("design", "DESIGN", "files/design.txt")
+        self.write_graph([design, bare_node("claim", "CONCLUSION")], [["design", "claim"]])
+        (case,) = falsify_dependency_currency(*self.passing())
+        self.assertEqual(case.case_id, "change-upstream-file")
+        self.assertEqual(list(case.documents), ["files/design.txt"])
+        self.assertEqual(falsifier_outcome(case, self.replay(case)), FalsifierOutcome.REJECTED)
+
+    def test_no_case_when_no_file_backed_node_reaches_a_publication_node(self) -> None:
+        design = self.file_node("design", "DESIGN", "files/design.txt")
+        self.write_graph([design, bare_node("claim", "CONCLUSION")], [])
+        ctx, spec = currency_context(self.manifest_path)
+        self.assertEqual(falsify_dependency_currency(ctx, spec, None), ())  # type: ignore[arg-type]
+        document = self.read_json("manifest.json")
+        document.pop("dependencies")
+        self.write_json("manifest.json", document)
+        ctx, spec = currency_context(self.manifest_path)
+        self.assertEqual(falsify_dependency_currency(ctx, spec, None), ())  # type: ignore[arg-type]
+
+    def test_the_saved_state_decides_which_digests_are_current(self) -> None:
+        document = self.read_json(GRAPH)
+        for node in document["nodes"]:
+            if node["id"] == "conclusion-1":
+                node["recorded_sha256"] = None
+        self.write_json(GRAPH, document)
+        graph = self.load()
+        graph.revalidate("conclusion-1")  # records the first digest, in graph-state.json only
+        graph.save_state()
+        (case,) = falsify_dependency_currency(*self.passing())
+        # Without the saved state conclusion-1 would have no digest to change, and conclusion-2 would be chosen.
+        self.assertEqual(list(case.documents), ["conclusions/conclusion-1.md"])
+        self.assertEqual(falsifier_outcome(case, self.replay(case)), FalsifierOutcome.REJECTED)
+
+
+# ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
@@ -1108,15 +1344,35 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(self.schema["properties"]["schema"]["const"], GRAPH_SCHEMA)
         self.assertEqual(set(self.schema["required"]), REQUIRED_GRAPH_KEYS)
 
-    def test_nodes_and_transitions_match_the_parser(self) -> None:
-        node = self.defs["node"]
-        self.assertEqual(set(node["properties"]), NODE_KEYS)
-        self.assertEqual(set(node["required"]), REQUIRED_NODE_KEYS)
+    def test_enumerations_and_required_keys_match_the_parser(self) -> None:
+        self.assertEqual(set(self.defs["node"]["required"]), REQUIRED_NODE_KEYS)
         self.assertEqual(self.defs["node_kind"]["enum"], [kind.value for kind in NodeKind])
         self.assertEqual(self.defs["validity"]["enum"], [validity.value for validity in Validity])
-        self.assertEqual(set(self.defs["transition"]["properties"]), TRANSITION_KEYS)
         self.assertEqual(set(self.defs["transition"]["required"]), REQUIRED_TRANSITION_KEYS)
-        self.assertEqual(set(self.defs["state_transition"]["required"]), TRANSITION_KEYS)
+        # A state saved before section 17 lacks witness_id and cause_category and must stay readable.
+        self.assertEqual(set(self.defs["state_transition"]["required"]), REQUIRED_STATE_TRANSITION_KEYS)
+
+    def test_nodes_and_transitions_match_the_parser(self) -> None:
+        # Red until integration applies this builder's schemas/graph.schema.json request (section 17.18).
+        self.assertEqual(set(self.defs["node"]["properties"]), NODE_KEYS)
+        self.assertEqual(set(self.defs["transition"]["properties"]), TRANSITION_KEYS)
+        backed = self.defs["node"]["properties"]["backed_by_checks"]
+        self.assertEqual(backed["items"], {"$ref": "#/$defs/backing_check"})
+        backing = self.defs["backing_check"]
+        self.assertEqual((set(backing["properties"]), set(backing["required"])), (BACKING_KEYS, BACKING_KEYS))
+        self.assertEqual(self.defs["stale_cause"]["enum"], [cause.value for cause in StaleCause])
+        cause = self.defs["graph_state"]["properties"]["nodes"]["additionalProperties"]["properties"]["stale_because"]
+        patterns = [item["pattern"] for item in cause["items"]["anyOf"] if "pattern" in item]
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(re.search(patterns[0], "verifier:numeric"))
+        self.assertFalse(re.search(patterns[0], "verifier:"))
+
+    def test_witness_and_what_if_documents_are_described(self) -> None:
+        # Red until integration applies this builder's schemas/graph.schema.json request (section 17.18).
+        witness = self.defs["recompute_witness"]
+        self.assertEqual(witness["$id"], WITNESS_SCHEMA)
+        self.assertEqual((set(witness["properties"]), set(witness["required"])), (WITNESS_KEYS, WITNESS_KEYS))
+        self.assertEqual(self.defs["what_if_report"]["$id"], WHAT_IF_SCHEMA)
 
     def test_graph_state_matches_what_is_written(self) -> None:
         state = self.defs["graph_state"]

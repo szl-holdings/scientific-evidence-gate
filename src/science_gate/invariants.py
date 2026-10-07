@@ -17,6 +17,20 @@ if any applicable invariant is violated.
 
 Numbers are compared only through :func:`parse_decimal` and
 :func:`compare_decimal`, which use ``decimal.Decimal`` and never floats.
+
+Section 17 adds six invariants that judge the checker rather than the data:
+the run's pre-committed PLAN was executed in full and matches what the
+manifest declares (``plan_closure``, ``plan_matches_manifest``), no pinned
+file was written during the run (``harness_pins_intact``), the comparator and
+the must-fail canary still reject what they must (``comparator_self_test``,
+``canary_controls_hold``), and every PASS carries a recorded negative control
+that its checker rejected (``pass_requires_falsifier_witness``). Every
+control is judged from the sealed ledger, so a control narrated in a summary
+but absent from the chain does not count.
+
+Callers of the comparator look it up as the module attribute
+``invariants.compare_decimal`` at call time, never through a bound import,
+so a patched comparator is the one every caller and the self-test exercise.
 """
 
 from __future__ import annotations
@@ -28,16 +42,20 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
-from .ledger import InvocationTrace, index_invocations, verify_chain
+from ._canonical import CanonicalizationError, sha256_canonical
+from .ledger import InvocationTrace, index_invocations, is_plan_entry, plan_of, verify_chain
 from .models import (
     CheckResult,
     DenominatorSource,
     ExecutionState,
     FailureMode,
+    FalsifierOutcome,
     InputAccounting,
     InvariantResult,
+    Ratio,
     Reason,
     Status,
+    WitnessState,
 )
 
 __all__ = [
@@ -56,8 +74,26 @@ __all__ = [
     "pass_requires_examined_rows",
     "input_accounting_closure",
     "ledger_chain_intact",
+    "plan_closure",
+    "plan_matches_manifest",
+    "harness_pins_intact",
+    "comparator_self_test",
+    "canary_controls_hold",
+    "pass_requires_falsifier_witness",
     "INVARIANTS",
     "evaluate_invariants",
+    "CONTROL_PREFIX",
+    "FALSIFIER_PREFIX",
+    "COMPARATOR_CONTROL",
+    "CANARY_MUST_FAIL",
+    "CANARY_MUST_PASS",
+    "PLANNED_CONTROLS",
+    "COMPARATOR_PAIRS",
+    "DISCRIMINATION_STEPS",
+    "falsifier_check_id",
+    "is_control",
+    "run_comparator_self_test",
+    "comparison_discrimination",
     "NUMBER_PARSED",
     "AMBIGUOUS_SEPARATOR",
     "NOT_A_NUMBER",
@@ -83,7 +119,34 @@ INVARIANT_NAMES = (
     "pass_requires_examined_rows",
     "input_accounting_closure",
     "ledger_chain_intact",
+    "plan_closure",
+    "plan_matches_manifest",
+    "harness_pins_intact",
+    "comparator_self_test",
+    "canary_controls_hold",
+    "pass_requires_falsifier_witness",
 )
+
+#: Every control invocation's ``check_id`` starts with this, so no declared
+#: check can be mistaken for a control (manifest ids never contain ``:``).
+CONTROL_PREFIX = "control:"
+FALSIFIER_PREFIX = "control:falsifier:"
+COMPARATOR_CONTROL = "control:comparator"
+CANARY_MUST_FAIL = "control:canary:must_fail"
+CANARY_MUST_PASS = "control:canary:must_pass"
+#: The controls every PLAN commits to, sorted. Falsifiers are not planned:
+#: which cases exist depends on what each check examined.
+PLANNED_CONTROLS = (CANARY_MUST_FAIL, CANARY_MUST_PASS, COMPARATOR_CONTROL)
+
+
+def falsifier_check_id(check_id: str, case_id: str) -> str:
+    """The ledger ``check_id`` of one falsifier run: ``control:falsifier:<check_id>:<case_id>``."""
+    return f"{FALSIFIER_PREFIX}{check_id}:{case_id}"
+
+
+def is_control(check_id: object) -> bool:
+    """True for a control invocation's check id (falsifier, canary or comparator)."""
+    return isinstance(check_id, str) and check_id.startswith(CONTROL_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -130,6 +193,21 @@ VIOLATION_OUTCOMES: Mapping[str, ViolationOutcome] = MappingProxyType(
         ),
         "ledger_chain_intact": ViolationOutcome(
             Status.FAIL, Reason.PROTOCOL_BROKEN, FailureMode.DEFECTIVE_VERIFICATION
+        ),
+        # An unexecuted planned item is a failure (D1), as a missing test is in TAP.
+        "plan_closure": ViolationOutcome(Status.FAIL, Reason.PARTIAL_EXECUTION, FailureMode.PARTIAL_EXECUTION),
+        "plan_matches_manifest": ViolationOutcome(Status.FAIL, Reason.PROTOCOL_DRIFT, FailureMode.PROTOCOL_DRIFT),
+        "harness_pins_intact": ViolationOutcome(Status.FAIL, Reason.PROTOCOL_DRIFT, FailureMode.PROTOCOL_DRIFT),
+        # A control that accepted what it must reject is a proven miss (D2).
+        "comparator_self_test": ViolationOutcome(
+            Status.FAIL, Reason.BLIND_SPOT, FailureMode.DEFECTIVE_VERIFICATION
+        ),
+        "canary_controls_hold": ViolationOutcome(
+            Status.FAIL, Reason.BLIND_SPOT, FailureMode.DEFECTIVE_VERIFICATION
+        ),
+        # A PASS without a ledger-backed witness has unknown coverage, not a proven miss (D2).
+        "pass_requires_falsifier_witness": ViolationOutcome(
+            Status.ABSTAIN, Reason.BLIND_SPOT, FailureMode.VACUOUS_PASS
         ),
     }
 )
@@ -181,6 +259,15 @@ class InvariantContext:
     * ``run_id``: when given, invocation ids must derive from it.
     * ``claim_tallies``: further claimed-versus-invoked counts, for example a
       citation log's ``claimed_verified`` against its invocation records.
+    * ``expected_plan``: the PLAN body the manifest implies; when set, the
+      recorded PLAN must equal it.
+    * ``pins``: ``{"pinned": [{role, path, sha256, sha256_after}], "writes":
+      [{path, action, event}], "hook_errors": n}``; None when no pin was
+      re-hashed after the checks.
+    * ``controls``: the run's recorded controls summary
+      (``RunResult.controls``). A control it names must also be in the ledger.
+    * ``rows_examined``: the run's distinct admitted data rows of declared
+      inputs that an executed check consumed (G1).
     """
 
     entries: tuple[Mapping[str, Any], ...] = ()
@@ -193,9 +280,14 @@ class InvariantContext:
     ledger_length: int | None = None
     run_id: str | None = None
     claim_tallies: tuple[ClaimTally, ...] = ()
+    expected_plan: Mapping[str, Any] | None = None
+    pins: Mapping[str, Any] | None = None
+    controls: Mapping[str, Any] | None = None
+    rows_examined: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "entries", tuple(self.entries))
+        object.__setattr__(self, "rows_examined", _optional_count(self.rows_examined, "rows_examined"))
         object.__setattr__(self, "checks", tuple(sorted(self.checks, key=lambda check: check.check_id)))
         object.__setattr__(self, "declared_checks", MappingProxyType(dict(self.declared_checks)))
         object.__setattr__(self, "claim_tallies", tuple(self.claim_tallies))
@@ -432,7 +524,14 @@ def pass_requires_complete_required_checks(ctx: InvariantContext) -> InvariantRe
 
 
 def pass_requires_examined_rows(ctx: InvariantContext) -> InvariantResult:
-    """A PASS needs examined rows: never None, never zero."""
+    """A PASS needs examined rows: never None, never zero.
+
+    Each passing check must report a positive count of its own subject
+    records. The run is judged against ``ctx.rows_examined``: the distinct
+    admitted data rows of declared inputs that an executed check consumed
+    (G1). Comparisons, pins, verdicts and events are never rows, so a
+    header-only input cannot be rescued by a check that compared a digest.
+    """
     name = "pass_requires_examined_rows"
     passing = ctx.passing_checks
     if not passing and not ctx.run_claims_pass:
@@ -443,16 +542,13 @@ def pass_requires_examined_rows(ctx: InvariantContext) -> InvariantResult:
             problems.append(f"check {check.check_id!r} passed without reporting rows examined")
         elif check.rows_examined == 0:
             problems.append(f"check {check.check_id!r} passed after examining 0 rows")
-    total = sum(
-        check.rows_examined
-        for check in ctx.checks
-        if check.execution_state is ExecutionState.CHECKED and check.rows_examined is not None
-    )
-    if ctx.run_claims_pass and total < 1:
-        problems.append("the run claims PASS but examined no rows")
-    # A sum over checks counts a row once per check that read it, so it is
-    # labelled as such: run.json's rows_examined counts distinct rows.
-    return _judged(name, problems, f"per-check rows examined total={total}")
+    if ctx.run_claims_pass:
+        if ctx.rows_examined is None:
+            problems.append("the run claims PASS but its rows_examined is unknown")
+        elif ctx.rows_examined < 1:
+            problems.append("the run claims PASS but examined no rows")
+    detail = f"rows_examined={ctx.rows_examined} (distinct data rows of declared inputs)"
+    return _judged(name, [*problems, detail] if problems else [], detail)
 
 
 def input_accounting_closure(ctx: InvariantContext) -> InvariantResult:
@@ -501,6 +597,285 @@ def ledger_chain_intact(ctx: InvariantContext) -> InvariantResult:
     )
 
 
+def _traces_by_check(ctx: InvariantContext) -> dict[str, list[InvocationTrace]]:
+    """Ledger invocations grouped by ``check_id``, in invocation-id order."""
+    grouped: dict[str, list[InvocationTrace]] = {}
+    for trace in ctx.traces().values():
+        if trace.check_id is not None:
+            grouped.setdefault(trace.check_id, []).append(trace)
+    return grouped
+
+
+def _terminal_evidence(ctx: InvariantContext) -> dict[str, Mapping[str, Any]]:
+    """The evidence of each invocation's terminal ledger entry, keyed by invocation id."""
+    found: dict[str, Mapping[str, Any]] = {}
+    for entry in ctx.entries:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("invocation_id"), str):
+            continue
+        if entry.get("completed_at") is not None and isinstance(entry.get("evidence"), Mapping):
+            found[entry["invocation_id"]] = entry["evidence"]
+    return found
+
+
+def _single_terminal(ctx: InvariantContext, check_id: str) -> InvocationTrace | None:
+    """The invocation of ``check_id`` when there is exactly one and it is terminal, else None."""
+    traces = _traces_by_check(ctx).get(check_id, [])
+    return traces[0] if len(traces) == 1 and traces[0].terminal else None
+
+
+def _planned_ids(body: Mapping[str, Any], problems: list[str]) -> list[str]:
+    """Every check id and control id a PLAN body commits to."""
+    checks, controls = body.get("checks"), body.get("controls")
+    if not isinstance(checks, list) or not isinstance(controls, list):
+        problems.append("the PLAN body has no list of checks and controls")
+        return []
+    planned = [item.get("check_id") if isinstance(item, Mapping) else None for item in checks] + list(controls)
+    usable = [item for item in planned if isinstance(item, str) and item]
+    if len(usable) != len(planned) or len(set(usable)) != len(usable):
+        problems.append("the PLAN names a check or control that is not a unique non-empty id")
+    return sorted(set(usable))
+
+
+def plan_closure(ctx: InvariantContext) -> InvariantResult:
+    """The ledger opens with the run's PLAN, and everything planned ran exactly once.
+
+    Entry 1 must be the only PLAN entry. Every planned check and planned
+    control must have exactly one invocation, and it must be terminal.
+    Invocations nobody planned (other than falsifier controls, which no plan
+    can list in advance) are listed in the detail, not judged: the plan binds
+    what must run, and extra work cannot make up for a shortfall.
+    """
+    name = "plan_closure"
+    if not ctx.entries:
+        return _not_applicable(name, "the ledger has no entries")
+    problems: list[str] = []
+    if not is_plan_entry(ctx.entries[0]):
+        problems.append("entry 1 is not a PLAN: the run committed to no plan before executing")
+    later = [position for position, entry in enumerate(ctx.entries[1:], start=2) if is_plan_entry(entry)]
+    if later:
+        problems.append(f"PLAN entries also at position(s) {later}: exactly one PLAN may open the ledger")
+    body = plan_of(ctx.entries)
+    planned = _planned_ids(body, problems) if body is not None else []
+    grouped = _traces_by_check(ctx)
+    for check_id in planned:
+        traces = grouped.get(check_id, [])
+        terminal = sum(1 for trace in traces if trace.terminal)
+        if len(traces) != 1 or terminal != 1:
+            problems.append(
+                f"planned {check_id!r} has {len(traces)} invocation(s) and {terminal} terminal result(s); "
+                "exactly one of each is required"
+            )
+    unplanned = sorted(
+        check_id for check_id in grouped if check_id not in planned and not check_id.startswith(FALSIFIER_PREFIX)
+    )
+    note = f"; unplanned invocation(s), listed not judged: {unplanned}" if unplanned else ""
+    if problems:
+        return InvariantResult(name, True, False, "; ".join(problems) + note)
+    return InvariantResult(name, True, True, f"{len(planned)} planned item(s) each ran exactly once{note}")
+
+
+def _plan_differences(recorded: Any, expected: Any, where: str = "plan") -> list[str]:
+    """Where two plan bodies differ, named down to the first differing field."""
+    if isinstance(recorded, Mapping) and isinstance(expected, Mapping):
+        found: list[str] = []
+        for key in sorted(set(recorded) | set(expected)):
+            if key not in recorded or key not in expected:
+                found.append(f"{where}.{key} is {'missing' if key not in recorded else 'not in the expected plan'}")
+            else:
+                found.extend(_plan_differences(recorded[key], expected[key], f"{where}.{key}"))
+        return found
+    if isinstance(recorded, list) and isinstance(expected, list) and len(recorded) == len(expected):
+        found = []
+        for index, (left, right) in enumerate(zip(recorded, expected)):
+            label = (left.get("check_id") or left.get("input_id") or left.get("path")) if isinstance(left, Mapping) else None
+            found.extend(_plan_differences(left, right, f"{where}[{label or index}]"))
+        return found
+    try:
+        same = sha256_canonical(recorded) == sha256_canonical(expected)
+    except CanonicalizationError:
+        same = False
+    return [] if same else [f"{where} differs"]
+
+
+def plan_matches_manifest(ctx: InvariantContext) -> InvariantResult:
+    """The recorded PLAN equals the plan the manifest implies, field for field.
+
+    A re-sealed ledger whose PLAN was edited (a lowered ``expected_rows``,
+    say) verifies as a chain. Only comparison with a plan rebuilt from the
+    manifest exposes the edit, and that is a change of protocol after the
+    fact: PROTOCOL_DRIFT.
+    """
+    name = "plan_matches_manifest"
+    body = plan_of(ctx.entries)
+    if body is None or ctx.expected_plan is None:
+        return _not_applicable(name, "there is no recorded PLAN or no expected plan to compare it with")
+    problems = _plan_differences(body, ctx.expected_plan)
+    if not problems:
+        return InvariantResult(name, True, True, "the recorded PLAN equals the plan the manifest implies")
+    shown = problems[:MAX_LISTED_DIFFERENCES]
+    more = f"; and {len(problems) - len(shown)} more" if len(problems) > len(shown) else ""
+    return InvariantResult(name, True, False, "the recorded PLAN differs from the manifest: " + "; ".join(shown) + more)
+
+
+#: How many PLAN differences a detail names before summarizing the rest.
+MAX_LISTED_DIFFERENCES = 20
+
+
+def harness_pins_intact(ctx: InvariantContext) -> InvariantResult:
+    """No pinned file changed during the run, and nothing even wrote to one.
+
+    A write that restored identical bytes leaves every digest equal, so the
+    audited write itself is the violation. The re-hashed pins must also be
+    the pins the PLAN committed to. Each offending path is named.
+    """
+    name = "harness_pins_intact"
+    pins = ctx.pins
+    if not isinstance(pins, Mapping) or not isinstance(pins.get("pinned"), list):
+        return _not_applicable(name, "no pinned file was re-hashed after the checks")
+    pinned = [item for item in pins["pinned"] if isinstance(item, Mapping)]
+    problems: list[str] = []
+    for item in pinned:
+        if item.get("sha256") != item.get("sha256_after"):
+            problems.append(f"{item.get('role')} {item.get('path')} changed during the run")
+    for write in pins.get("writes") or ():
+        if isinstance(write, Mapping):
+            problems.append(
+                f"{write.get('path')} was touched during the run ({write.get('action')} via {write.get('event')})"
+            )
+    errors = pins.get("hook_errors") or 0
+    if errors:
+        problems.append(f"the write-detection hook could not interpret {errors} event(s)")
+    body = plan_of(ctx.entries)
+    if body is not None:
+
+        def triple(item: Mapping[str, Any]) -> tuple[str, str, str]:
+            return (str(item.get("role")), str(item.get("path")), str(item.get("sha256")))
+
+        committed = sorted(triple(item) for item in body.get("pins") or () if isinstance(item, Mapping))
+        if committed != sorted(triple(item) for item in pinned):
+            problems.append("the re-hashed pins are not the pins the PLAN committed to")
+    return _judged(name, problems, f"{len(pinned)} pinned file(s) unchanged and never written during the run")
+
+
+def comparator_self_test(ctx: InvariantContext) -> InvariantResult:
+    """The comparator told the known pairs apart when this run used it.
+
+    Judged from the sealed ledger: the control's single terminal invocation
+    must be PASS, and every recorded pair must show its expected outcome.
+    """
+    name = "comparator_self_test"
+    recorded = isinstance(ctx.controls, Mapping) and ctx.controls.get("comparator_self_test") is not None
+    if COMPARATOR_CONTROL not in _traces_by_check(ctx) and not recorded:
+        return _not_applicable(name, "the ledger records no comparator self-test")
+    trace = _single_terminal(ctx, COMPARATOR_CONTROL)
+    if trace is None:
+        return _judged(name, [f"{COMPARATOR_CONTROL} has no single terminal invocation in the ledger"], "")
+    problems: list[str] = []
+    if trace.verdict is not Status.PASS:
+        problems.append(f"{COMPARATOR_CONTROL} ended {trace.verdict.value if trace.verdict else None}")
+    pairs = _terminal_evidence(ctx).get(trace.invocation_id, {}).get("pairs")
+    if not isinstance(pairs, list) or len(pairs) != len(COMPARATOR_PAIRS):
+        problems.append("the comparator self-test did not record its pairs")
+    else:
+        for pair in pairs:
+            if not isinstance(pair, Mapping) or pair.get("actual") != pair.get("expected"):
+                shown = dict(pair) if isinstance(pair, Mapping) else pair
+                problems.append(f"comparator pair {shown} did not give its expected outcome")
+    return _judged(name, problems, f"{len(COMPARATOR_PAIRS)} known pairs compared as expected")
+
+
+def canary_controls_hold(ctx: InvariantContext) -> InvariantResult:
+    """The must-fail canary FAILed and its known-good twin PASSed, through the same path as every check."""
+    name = "canary_controls_hold"
+    grouped = _traces_by_check(ctx)
+    recorded = isinstance(ctx.controls, Mapping) and ctx.controls.get("canary") is not None
+    if CANARY_MUST_FAIL not in grouped and CANARY_MUST_PASS not in grouped and not recorded:
+        return _not_applicable(name, "the ledger records no canary controls")
+    problems: list[str] = []
+    for check_id, expected in ((CANARY_MUST_FAIL, Status.FAIL), (CANARY_MUST_PASS, Status.PASS)):
+        trace = _single_terminal(ctx, check_id)
+        if trace is None:
+            problems.append(f"{check_id} has no single terminal invocation in the ledger")
+        elif trace.verdict is not expected:
+            actual = trace.verdict.value if trace.verdict else None
+            problems.append(f"{check_id} ended {actual}, not {expected.value}")
+    return _judged(name, problems, "the must-fail canary failed and its known-good twin passed")
+
+
+def _stands(
+    record: Any,
+    check: CheckResult,
+    grouped: Mapping[str, Sequence[InvocationTrace]],
+    terminals: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """True when one recorded falsifier is a ledger-backed rejection by the same checker and params.
+
+    The record names its control by ledger check id; the ledger binds that
+    control to this subject, because the falsifier's terminal entry names
+    the subject's own invocation. Exactly one such invocation must exist.
+    """
+    if not isinstance(record, Mapping) or record.get("outcome") != FalsifierOutcome.REJECTED.value:
+        return False
+    control_id = falsifier_check_id(check.check_id, str(record.get("case_id")))
+    if record.get("control_id") != control_id or check.invocation_id is None:
+        return False
+    bound = [
+        trace
+        for trace in grouped.get(control_id, ())
+        if terminals.get(trace.invocation_id, {}).get("subject_invocation_id") == check.invocation_id
+    ]
+    if len(bound) != 1:
+        return False
+    trace = bound[0]
+    if not trace.terminal or trace.verdict is None or trace.reason is None:
+        return False
+    invocation_id = trace.invocation_id
+    recorded = (trace.verdict.value, trace.reason.value)
+    expected, actual = record.get("expected"), record.get("actual")
+    if not isinstance(expected, Mapping) or not isinstance(actual, Mapping):
+        return False
+    if recorded != (expected.get("verdict"), expected.get("reason")) or recorded != (
+        actual.get("verdict"),
+        actual.get("reason"),
+    ):
+        return False
+    digests = (check.evidence.get("checker_sha256"), check.evidence.get("params_sha256"))
+    terminal = terminals.get(invocation_id, {})
+    return (
+        None not in digests
+        and digests == (record.get("checker_sha256"), record.get("params_sha256"))
+        and digests == (terminal.get("checker_sha256"), terminal.get("params_sha256"))
+        and terminal.get("subject_check_id") == check.check_id
+        and terminal.get("outcome") == FalsifierOutcome.REJECTED.value
+    )
+
+
+def pass_requires_falsifier_witness(ctx: InvariantContext) -> InvariantResult:
+    """Every PASS carries proof, in the sealed ledger, that its checker rejected a known-bad case.
+
+    The witness must be a falsifier invocation named for this check and
+    case, terminal, with the expected rejection recorded, and run with the
+    same checker and params digests as the PASS. A witness that exists only
+    in a result's evidence is narrated, so the PASS has unknown coverage.
+    """
+    name = "pass_requires_falsifier_witness"
+    passing = ctx.passing_checks
+    if not passing:
+        return _not_applicable(name, "no check result is PASS")
+    grouped, terminals = _traces_by_check(ctx), _terminal_evidence(ctx)
+    problems: list[str] = []
+    for check in passing:
+        state = check.evidence.get("falsification")
+        if state != WitnessState.WITNESSED.value:
+            problems.append(f"check {check.check_id!r} passed with falsification {state!r}, not WITNESSED")
+        elif not any(_stands(record, check, grouped, terminals) for record in check.evidence.get("falsifiers") or ()):
+            problems.append(
+                f"check {check.check_id!r} passed but no REJECTED falsifier with its checker and params digests "
+                "is terminal in the ledger"
+            )
+    return _judged(name, problems, f"{len(passing)} PASS result(s) each carry a ledger-backed falsifier witness")
+
+
 #: The invariants in contract order.
 INVARIANTS: Mapping[str, Callable[[InvariantContext], InvariantResult]] = MappingProxyType(
     {
@@ -514,6 +889,12 @@ INVARIANTS: Mapping[str, Callable[[InvariantContext], InvariantResult]] = Mappin
         "pass_requires_examined_rows": pass_requires_examined_rows,
         "input_accounting_closure": input_accounting_closure,
         "ledger_chain_intact": ledger_chain_intact,
+        "plan_closure": plan_closure,
+        "plan_matches_manifest": plan_matches_manifest,
+        "harness_pins_intact": harness_pins_intact,
+        "comparator_self_test": comparator_self_test,
+        "canary_controls_hold": canary_controls_hold,
+        "pass_requires_falsifier_witness": pass_requires_falsifier_witness,
     }
 )
 
@@ -772,3 +1153,70 @@ def compare_decimal(
         return NumericComparison(AGREES_AT_STATED_PRECISION, claim_parsed, stored_parsed, printed, shown, detail)
     detail = f"stored value rounds half-even to {shown} at {printed} decimal(s), not {claim_parsed.text.strip()}"
     return NumericComparison(DISAGREES, claim_parsed, stored_parsed, printed, shown, detail)
+
+
+#: The comparator self-test (17.6) as ``(claim, stored, expected outcome)``:
+#: two values that differ but round alike, an exact match despite a trailing
+#: zero, and a legitimate agreement at stated precision.
+COMPARATOR_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("0.15", "0.14", DISAGREES),
+    ("12.4", "12.40", EXACT),
+    ("0.1", "0.14", AGREES_AT_STATED_PRECISION),
+)
+
+
+def run_comparator_self_test() -> tuple[dict[str, str], ...]:
+    """Compare :data:`COMPARATOR_PAIRS` through the live comparator and record what it said.
+
+    ``compare_decimal`` is looked up in this module's namespace at call time,
+    so a patched comparator is the one tested. A comparator that raises is
+    recorded as having raised, never as agreeing.
+    """
+    pairs = []
+    for claim, stored, expected in COMPARATOR_PAIRS:
+        try:
+            actual = str(compare_decimal(claim, stored).outcome)
+        except Exception as exc:  # a broken comparator is a finding, not a crash
+            actual = f"RAISED: {type(exc).__name__}"
+        pairs.append({"claim": claim, "stored": stored, "expected": expected, "actual": actual})
+    return tuple(pairs)
+
+
+#: Discrimination probes ``claim + k * 10**-d`` for ``k`` in ``-STEPS..STEPS``: 21 probes.
+DISCRIMINATION_STEPS = 10
+
+
+def comparison_discrimination(
+    claim: str | int | Decimal,
+    stored: str | int | Decimal,
+    *,
+    thousands: str | None = None,
+    decimal_point: str = ".",
+    precision_decimals: int | None = None,
+) -> Ratio:
+    """How many of the 21 nearest printable claims the live comparator would reject (17.8).
+
+    The probes are ``c + k * 10**-d`` for ``k`` from -10 to 10, where ``c``
+    is the claim and ``d`` its printed decimals, each printed with ``d``
+    decimals and no grouping. A comparator that rejects none of them could
+    not have failed this comparison, so its agreement proves nothing.
+    Returns an UNAVAILABLE ratio when the claim cannot be read.
+    """
+    parsed = parse_decimal(claim, thousands=thousands, decimal_point=decimal_point)
+    if not parsed.ok or parsed.value is None or parsed.decimals is None:
+        return Ratio(None, None)
+    step = Decimal((0, (1,), -parsed.decimals))
+    rejected = 0
+    for k in range(-DISCRIMINATION_STEPS, DISCRIMINATION_STEPS + 1):
+        probe = format(_round_half_even(parsed.value + k * step, parsed.decimals), "f")
+        if decimal_point != ".":
+            probe = probe.replace(".", decimal_point)
+        try:
+            outcome = compare_decimal(
+                probe, stored, thousands=thousands, decimal_point=decimal_point, precision_decimals=precision_decimals
+            ).outcome
+        except Exception:  # a comparator that cannot answer rejects nothing
+            continue
+        if outcome == DISAGREES:
+            rejected += 1
+    return Ratio(rejected, 2 * DISCRIMINATION_STEPS + 1)

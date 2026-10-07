@@ -50,7 +50,7 @@ from science_gate.models import (
     Status,
     Validity,
 )
-from science_gate.mutations import COUNT_KEYS, INVALID_BASELINE_MESSAGE, mutate, render_markdown
+from science_gate.mutations import COUNT_KEYS, INVALID_BASELINE_MESSAGE, OPERATOR_IDS, mutate, render_markdown
 from science_gate.packaging import Basis, Disposition, build_package
 from science_gate.receipts import DISCLAIMER, HMAC_KEY_FILE_ENV, build_run_receipt, verify_receipt
 from science_gate.reports import write_run
@@ -505,8 +505,15 @@ class RequiredBehaviourTests(RequirementTestCase):
     def test_r22_every_invocation_has_a_terminal_result(self) -> None:
         run = self.run_verify()
         traces = index_invocations(run.ledger.entries)
-        self.assertEqual(len(traces), len(run.result.checks))
-        self.assertEqual(len(run.ledger.entries), 2 * len(traces), "one STARTED and one terminal entry each")
+        # Controls (falsifier witnesses, the canary pair, the comparator self-test) are invocations too
+        # (ARCHITECTURE.md 17.5, 17.6); every declared check still has exactly one.
+        subjects = [trace for trace in traces.values() if not (trace.check_id or "").startswith("control:")]
+        self.assertEqual(len(subjects), len(run.result.checks))
+        self.assertEqual(
+            len(run.ledger.entries),
+            1 + 2 * len(traces),
+            "one PLAN entry, then one STARTED and one terminal entry per invocation",
+        )
         for invocation_id, trace in traces.items():
             with self.subTest(invocation=invocation_id):
                 self.assertIn(trace.result, TERMINAL_INVOCATION_RESULTS)
@@ -617,7 +624,7 @@ class RequiredBehaviourTests(RequirementTestCase):
             (counts["executed_mutations"], counts["detected_mutations"], counts["escaped_mutations"]), (1, 1, 0)
         )
         self.assertEqual(counts["not_applicable_mutations"], len(CORE_NOT_APPLICABLE))
-        self.assertEqual(counts["skipped_mutations"], 20 - 1 - len(CORE_NOT_APPLICABLE))
+        self.assertEqual(counts["skipped_mutations"], len(OPERATOR_IDS) - 1 - len(CORE_NOT_APPLICABLE))
         for record in report.mutations:
             if record.execution_state is ExecutionState.CHECKED:
                 continue

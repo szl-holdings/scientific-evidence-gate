@@ -1,0 +1,49 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "N-COUNT",
+      "statement": "Number of invented respondents",
+      "value": "28",
+      "unit": "synthetic units",
+      "precision_decimals": 0,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/ratings.json",
+        "sha256": "d34012fcfd13d792c894a4363cd0888a852a24f0084f87e99caa1f2911e9850a",
+        "selector": "/respondents"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    },
+    {
+      "claim_id": "N-MEAN",
+      "statement": "Mean synthetic rating (no integer total of 28 ratings gives 5.19)",
+      "value": "5.19",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "consistency": {
+        "test": "grim",
+        "n": 28
+      },
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/ratings.json",
+        "sha256": "d34012fcfd13d792c894a4363cd0888a852a24f0084f87e99caa1f2911e9850a",
+        "selector": "/mean_rating"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    }
+  ]
+}

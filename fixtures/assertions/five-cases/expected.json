@@ -1,0 +1,24 @@
+{
+  "description": "Four synthetic assertions about a synthetic sealed run, plus one FAIL invocation that no assertion cites: one backed, one citing an invocation the run does not contain, one claiming PASS for a FAIL invocation, and one made before its invocation completed.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "agent-claims": "FAIL"
+  },
+  "counts": {
+    "BACKED": 1,
+    "NARRATED": 2,
+    "CONTRADICTED": 1,
+    "ORPHANED": 1
+  },
+  "outcomes": {
+    "agent-claim-01": "BACKED",
+    "agent-claim-02": "NARRATED",
+    "agent-claim-03": "CONTRADICTED",
+    "agent-claim-04": "NARRATED"
+  },
+  "orphaned": [
+    "inv-fa76646e68fa"
+  ]
+}

@@ -51,7 +51,9 @@ class FieldSurveyExampleTests(TempDirTestCase):
     def test_the_example_verifies_as_pass(self) -> None:
         run = verify(EXAMPLE / "manifest.json")
         self.assertEqual((run.status, run.result.reason, run.exit_code), (Status.PASS, Reason.VERIFIED, 0))
-        self.assertEqual((run.result.counters["checks_executed"], run.result.counters["rows_examined"]), (8, 10))
+        # rows_examined counts distinct data rows of declared inputs only (G1, ARCHITECTURE.md 17.7): the six
+        # plot rows. Reviewer verdicts and time events are never rows.
+        self.assertEqual((run.result.counters["checks_executed"], run.result.counters["rows_examined"]), (8, 6))
         canopy = self.check(run, "canopy").evidence
         self.assertIn("AGREES_AT_STATED_PRECISION", json.dumps(canopy), "41.2 against a stored 41.25")
 
@@ -98,7 +100,11 @@ class FieldSurveyExampleTests(TempDirTestCase):
                 self.assertEqual((check.rows_examined, check.verdict), (0, Status.ABSTAIN))
         self.assertIs(record.closure.holds, False, "6 rows were declared, 0 were found")
         self.assertEqual((run.status, run.exit_code), (Status.FAIL, 1))
-        self.assertIn(Reason.PARTIAL_EXECUTION, run.result.reasons)
+        # The six readers are NOT_APPLICABLE labelled EMPTY_POPULATION: a justified shortfall, which is never
+        # PARTIAL_EXECUTION (G2, ARCHITECTURE.md 17.7). The FAIL comes from the broken declared closure.
+        self.assertNotIn(Reason.PARTIAL_EXECUTION, run.result.reasons)
+        self.assertIn(Reason.INSUFFICIENT_EVIDENCE, run.result.reasons)
+        self.assertEqual(run.result.counters["checks_justified"], 6)
 
     def test_an_emptied_input_without_a_declared_count_abstains(self) -> None:
         manifest = json.loads((self.project / "manifest.json").read_text(encoding="utf-8"))

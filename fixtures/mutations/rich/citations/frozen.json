@@ -53,6 +53,20 @@
         "volume": "4",
         "year": 2023
       }
+    },
+    {
+      "canary": true,
+      "doi": "10.5555/science-gate-canary-0abe942fa8c3",
+      "handle_response_code": 100,
+      "http_status": 404,
+      "live_refresh_performed": false,
+      "outcome": "NOT_FOUND",
+      "request_url_or_query": "handle:10.5555/science-gate-canary-0abe942fa8c3",
+      "resolver_identity": "synthetic-frozen-resolver",
+      "resolver_schema_version": "1",
+      "response_sha256": "fc5a9773296d4b13c07ffc2ea1e0677a22aa7649313dbd65049ee9b923df3ede",
+      "retrieved_at": "2026-03-14T12:00:00Z",
+      "work": null
     }
   ],
   "schema": "science-gate-citations-frozen/v1"

@@ -1,0 +1,22 @@
+{
+  "description": "The record for C2's DOI says FOUND behind HTTP 200, but its Handle body responseCode is 200 (values not found). The body code decides alone, so the DOI is DOI_NOT_RESOLVED_AT_CAPTURE, never DOI_RESOLVED, and its metadata is not compared.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "FAIL",
+    "citation-metadata": "ABSTAIN"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.0001": "DOI_RESOLVED",
+    "10.5555/sgate.fx.0002": "DOI_NOT_RESOLVED_AT_CAPTURE",
+    "10.5555/sgate.fx.0003": "DOI_RESOLVED"
+  },
+  "dispositions": {
+    "C1": "VERIFIED_WITHIN_DECLARED_SCOPE",
+    "C2": "RECORD_NOT_FOUND_UNDER_RECORDED_QUERIES",
+    "C3": "VERIFIED_WITHIN_DECLARED_SCOPE"
+  }
+}

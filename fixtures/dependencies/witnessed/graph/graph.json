@@ -1,0 +1,97 @@
+{
+  "schema": "science-gate-graph/v1",
+  "nodes": [
+    {
+      "id": "source-snapshot",
+      "kind": "SOURCE_SNAPSHOT",
+      "path": "data/measurements.csv",
+      "recorded_sha256": "2167a40ff7ec8bc812934a9df03e03732467dacb2865c37f90e2a73c3784f37f",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "study-design",
+      "kind": "DESIGN",
+      "path": "design/protocol.md",
+      "recorded_sha256": "c69beb68b42ed077181fa034065d7ce930e0b1b3840137260081caec5b3b0cfe",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "analysis-run",
+      "kind": "ANALYSIS_RUN",
+      "path": "analysis/run-output.json",
+      "recorded_sha256": "302a170db37f5977e1a40163fcd1576da0bcc6b83fc2b12d216d52d176aca56a",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "site-summary",
+      "kind": "RANKING_OR_MEASUREMENT",
+      "path": "analysis/site-summary.csv",
+      "recorded_sha256": "f9cac39891eebb4ccb004c849929f07b112fbe14a721451787377e7f42bbd250",
+      "validity": "CURRENT",
+      "history": [],
+      "backed_by_checks": [
+        {
+          "check_id": "numeric",
+          "kind": "numeric_agreement",
+          "version": "1",
+          "params_sha256": "b3048e1b1f48cf6803643b08f00cdead215a226fadbd319c35632eb50a60222b",
+          "tool_version": "0.1.0"
+        }
+      ]
+    },
+    {
+      "id": "figure-1",
+      "kind": "FIGURE_OR_TABLE",
+      "path": "figures/figure-1.csv",
+      "recorded_sha256": "f9793a0a5e73373de9dd44090ab90944fad9c6c1acf9fbe80565972b2589a4a2",
+      "validity": "CURRENT",
+      "history": []
+    },
+    {
+      "id": "conclusion-1",
+      "kind": "CONCLUSION",
+      "path": "conclusions/conclusion-1.md",
+      "recorded_sha256": "6ca202efd15dd5554402862ce325c7f27a299c92b5a98c39841b513630861651",
+      "validity": "CURRENT",
+      "history": [],
+      "backed_by_checks": [
+        {
+          "check_id": "numeric",
+          "kind": "numeric_agreement",
+          "version": "1",
+          "params_sha256": "b3048e1b1f48cf6803643b08f00cdead215a226fadbd319c35632eb50a60222b",
+          "tool_version": "0.1.0"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    [
+      "source-snapshot",
+      "analysis-run"
+    ],
+    [
+      "study-design",
+      "analysis-run"
+    ],
+    [
+      "analysis-run",
+      "site-summary"
+    ],
+    [
+      "site-summary",
+      "figure-1"
+    ],
+    [
+      "site-summary",
+      "conclusion-1"
+    ],
+    [
+      "figure-1",
+      "conclusion-1"
+    ]
+  ]
+}

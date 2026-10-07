@@ -1,7 +1,8 @@
-"""The command line: exit codes, headlines, subcommands and determinism (section 14).
+"""The command line: exit codes, headlines, subcommands, flags and determinism (sections 14 and 17.9).
 
-The CLI runs as a subprocess with a list of arguments, never through a shell,
-exactly as a user or CI job would run it.
+Most tests run the CLI as a subprocess with a list of arguments, never through
+a shell, exactly as a user or CI job would run it. Tests that need a stand-in
+(an owning module, an exporter failure) call ``cli.main`` in process.
 """
 
 from __future__ import annotations
@@ -22,8 +23,10 @@ from _helpers import FIXED_TIME, SRC_DIR, TempDirTestCase
 from _project import EMPTY_MANIFEST, REVIEWERS, TIME_EVENT, VALID_MANIFEST, check, reviews_document, time_document
 
 from science_gate import cli
-from science_gate.cli import LAZY_COMMANDS, scaffold_project
-from science_gate.receipts import HMAC_KEY_FILE_ENV
+from science_gate._validators import ExportValidationError
+from science_gate.cli import LAZY_COMMANDS, require_signature_headline, scaffold_project
+from science_gate.models import AuthStatus
+from science_gate.receipts import HMAC_KEY_FILE_ENV, ReceiptVerification
 from science_gate.reports import LEDGER_JSONL, RUN_FILES, RUN_JSON
 from science_gate.verifier import resolve_check
 
@@ -115,8 +118,18 @@ class VerifyCommandTests(CliTestCase):
         blocker = self.write("occupied", "a file where the run directory should go")
         completed = self.run_cli("verify", str(VALID_MANIFEST), "--output", str(blocker))
         self.assertEqual(completed.returncode, 3)
-        self.assertTrue(completed.stdout.startswith("ERROR verify: the PASS result could not be written"))
+        self.assertRegex(completed.stdout, r"^ERROR verify: the [A-Z]+ result could not be written")
         self.assertNotIn("Traceback", completed.stderr)
+
+    def test_a_non_empty_output_directory_is_refused_as_output_exists(self) -> None:
+        # G4 and 17.9: one run never overwrites part of another.
+        existing = self.write("run/notes.txt", "keep me")
+        completed = self.run_cli("verify", str(VALID_MANIFEST), "--output", str(self.tmp / "run"))
+        self.assertEqual(completed.returncode, 3)
+        self.assertTrue(completed.stdout.startswith("ERROR verify: "), completed.stdout)
+        self.assertIn("OUTPUT_EXISTS", completed.stdout)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "keep me")
+        self.assertEqual([path.name for path in (self.tmp / "run").iterdir()], ["notes.txt"])
 
 
 class UsageTests(CliTestCase):
@@ -127,6 +140,8 @@ class UsageTests(CliTestCase):
             ("verify",),
             ("verify", "manifest.json", "--bogus"),
             ("impact", "artifact-1"),
+            ("what-if", "artifact-1"),
+            ("revalidate", "artifact-1", "--manifest", "manifest.json", "--witness"),
             ("package", "manifest.json"),
             ("report",),
         )
@@ -240,7 +255,8 @@ class LazyCommandTests(unittest.TestCase):
         return code, stdout.getvalue()
 
     def test_every_lazy_command_resolves_to_a_function(self) -> None:
-        self.assertEqual(set(LAZY_COMMANDS), {"mutate", "impact", "revalidate", "package", "demo"})
+        self.assertEqual(set(LAZY_COMMANDS), {"mutate", "impact", "revalidate", "what-if", "package", "demo"})
+        self.assertEqual(LAZY_COMMANDS["what-if"], "science_gate.dependencies:cli_what_if")
         for command, target in LAZY_COMMANDS.items():
             with self.subTest(command=command):
                 self.assertTrue(callable(resolve_check(target)))
@@ -252,6 +268,23 @@ class LazyCommandTests(unittest.TestCase):
         self.assertEqual((code, output), (2, "ABSTAIN stand-in: synthetic\n"))
         (args,) = RECEIVED
         self.assertEqual((args.manifest, args.output, args.force), ("m.json", "out", True))
+
+    def test_new_flags_reach_the_owning_module(self) -> None:
+        RECEIVED.clear()
+        stand_in = f"{__name__}:returns_abstain"
+        cases = (
+            ("mutate", ("mutate", "m.json", "--harness")),
+            ("revalidate", ("revalidate", "node-1", "--manifest", "m.json", "--witness", "w.json")),
+            ("what-if", ("what-if", "node-1", "--manifest", "m.json")),
+        )
+        for command, argv in cases:
+            with self.subTest(command=command):
+                self.assertEqual(self.invoke({command: stand_in}, *argv)[0], 2)
+        harness, revalidate, what_if = RECEIVED
+        self.assertEqual((harness.command, harness.manifest, harness.harness), ("mutate", "m.json", True))
+        self.assertEqual((revalidate.artifact_id, revalidate.manifest), ("node-1", "m.json"))
+        self.assertEqual(revalidate.witness, "w.json")
+        self.assertEqual((what_if.command, what_if.artifact_id, what_if.manifest), ("what-if", "node-1", "m.json"))
 
     def test_unavailable_or_misbehaving_commands_exit_3(self) -> None:
         cases = {
@@ -275,6 +308,103 @@ class LazyCommandTests(unittest.TestCase):
                 code = cli.main(["verify", str(VALID_MANIFEST)])
         self.assertEqual(code, 3)
         self.assertEqual(stdout.getvalue(), "ERROR verify: internal error (RuntimeError: synthetic engine defect)\n")
+
+    def test_an_export_validation_failure_exits_3_naming_the_first_problem(self) -> None:
+        problems = ["SARIF_KIND_MISMATCH: synthetic first", "REPORT_HEADING_ORDER: synthetic second"]
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "write_run", side_effect=ExportValidationError(problems)):
+            with contextlib.redirect_stdout(stdout):
+                code = cli.main(["verify", str(VALID_MANIFEST), "--output", "never-written"])
+        self.assertEqual(code, 3)
+        expected = "ERROR verify: export validation failed: SARIF_KIND_MISMATCH: synthetic first\n"
+        self.assertEqual(stdout.getvalue(), expected)
+
+
+class ParserTests(unittest.TestCase):
+    """The flags section 17.9 adds, each accepted only where it belongs."""
+
+    def parse(self, *argv: str) -> argparse.Namespace:
+        return cli.build_parser().parse_args(list(argv))
+
+    def test_new_flags_and_commands_parse(self) -> None:
+        self.assertTrue(self.parse("verify", "m.json", "--require-signature").require_signature)
+        self.assertFalse(self.parse("verify", "m.json").require_signature)
+        self.assertTrue(self.parse("report", "run", "--require-signature").require_signature)
+        self.assertFalse(self.parse("report", "run").require_signature)
+        self.assertTrue(self.parse("mutate", "m.json", "--harness").harness)
+        self.assertFalse(self.parse("mutate", "m.json").harness)
+        witnessed = self.parse("revalidate", "node-1", "--manifest", "m.json", "--witness", "w.json")
+        self.assertEqual(witnessed.witness, "w.json")
+        self.assertIsNone(self.parse("revalidate", "node-1", "--manifest", "m.json").witness)
+        what_if = self.parse("what-if", "node-1", "--manifest", "m.json")
+        self.assertEqual((what_if.command, what_if.artifact_id, what_if.manifest), ("what-if", "node-1", "m.json"))
+
+    def test_flags_are_refused_where_they_do_not_belong(self) -> None:
+        cases = (
+            ("impact", "node-1", "--manifest", "m.json", "--witness", "w.json"),
+            ("what-if", "node-1", "--manifest", "m.json", "--witness", "w.json"),
+            ("mutate", "m.json", "--require-signature"),
+            ("package", "m.json", "--output", "out", "--harness"),
+            ("what-if", "node-1"),
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), self.assertRaises(cli.UsageError):
+                self.parse(*argv)
+
+    def test_help_documents_the_distinct_outcome(self) -> None:
+        text = " ".join(cli.build_parser().format_help().split())
+        self.assertIn("3 ERROR (also usage errors and an unmet --require-signature)", text)
+
+
+def verification(
+    status: AuthStatus | None,
+    *,
+    detail: str = "synthetic detail",
+    problems: tuple[str, ...] = (),
+    run_id: str | None = "run-0123456789abcdef",
+) -> ReceiptVerification:
+    """A verification outcome built directly, so each auth status can be shown to the headline."""
+    return ReceiptVerification(
+        content_intact=True,
+        recomputed_sha256=None,
+        signature_state=None,
+        auth_status=status,
+        problems=problems,
+        detail=detail,
+        run_id=run_id,
+    )
+
+
+class RequireSignatureHeadlineTests(unittest.TestCase):
+    RECORDED = "the run's own status PASS is recorded in run.json"
+
+    def headline(self, item: ReceiptVerification) -> str | None:
+        return require_signature_headline(item, run_id=item.run_id, recorded=self.RECORDED)
+
+    def test_only_signed_verified_passes(self) -> None:
+        self.assertIsNone(self.headline(verification(AuthStatus.SIGNED_VERIFIED)))
+        for status in (AuthStatus.UNSIGNED, AuthStatus.SIGNED_FAILED, AuthStatus.SIGNED_UNCHECKED):
+            with self.subTest(status=status.value):
+                self.assertEqual(
+                    self.headline(verification(status)),
+                    f"ERROR (PROTOCOL_BROKEN) run-0123456789abcdef: --require-signature: the receipt is {status.value} "
+                    f"(synthetic detail); {self.RECORDED}",
+                )
+
+    def test_unknown_authentication_quotes_its_cause_instead_of_inventing_a_status(self) -> None:
+        problems = ("AUTH_SIDECAR_MISSING: synthetic", "SIGNATURE_REQUIRED: synthetic")
+        line = self.headline(verification(None, detail="", problems=problems, run_id=None))
+        self.assertEqual(
+            line,
+            "ERROR (PROTOCOL_BROKEN) unknown: --require-signature: the receipt's authentication could not be "
+            f"determined (AUTH_SIDECAR_MISSING: synthetic); {self.RECORDED}",
+        )
+
+    def test_the_headline_is_always_one_line(self) -> None:
+        line = self.headline(verification(AuthStatus.UNSIGNED, detail="first\n## STATUS\nsecond"))
+        self.assertIsNotNone(line)
+        self.assertNotIn("\n", line or "")
+        self.assertIn("(first ## STATUS second)", line or "")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 {
-  "note": "Expected outcomes of verifying each synthetic fixture's manifest.json. Every name, value and file here is invented. The claim_registry check has id 'claims' in every fixture.",
+  "note": "Expected outcomes of verifying each synthetic fixture's manifest.json. Every name, value and file here is invented. The claim_registry check has id 'claims' in every fixture. Since section 17.11, failure_modes also carry the numeric-coverage floor (OMITTED_POPULATION) and tie-rule drift (PROTOCOL_DRIFT); status, reason and exit code are unchanged from 0.1.0.",
   "fixtures": {
     "valid": {
       "status": "PASS",
@@ -20,7 +20,8 @@
         "verdict": "ABSTAIN",
         "reason": "UNVERIFIED",
         "failure_modes": [
-          "EPHEMERAL_CLAIM"
+          "EPHEMERAL_CLAIM",
+          "OMITTED_POPULATION"
         ]
       },
       "demonstrates": "manuscript number 42.5 on line 7 matches no registered claim"
@@ -33,7 +34,8 @@
         "verdict": "ABSTAIN",
         "reason": "UNVERIFIED",
         "failure_modes": [
-          "EPHEMERAL_CLAIM"
+          "EPHEMERAL_CLAIM",
+          "OMITTED_POPULATION"
         ]
       },
       "demonstrates": "claim C-004 has no derivation and no stored output: UNVERIFIED, never false"
@@ -59,10 +61,11 @@
         "verdict": "FAIL",
         "reason": "SOURCE_MISMATCH",
         "failure_modes": [
+          "PROTOCOL_DRIFT",
           "SOURCE_MISMATCH"
         ]
       },
-      "demonstrates": "claim 6.2 against stored 6.27 disagrees: 6.27 rounds half-even to 6.3 at the claim's 1 decimal, although both would round to 6"
+      "demonstrates": "claim 6.2 against stored 6.27 disagrees: 6.27 rounds half-even to 6.3 at the claim's 1 decimal, although both would round to 6; truncation or flooring reproduces 6.2, so the tie-rule fingerprint also records PROTOCOL_DRIFT (section 17.11)"
     },
     "separators": {
       "status": "ABSTAIN",
@@ -71,7 +74,9 @@
       "claims_check": {
         "verdict": "ABSTAIN",
         "reason": "REQUIRES_HUMAN_REVIEW",
-        "failure_modes": []
+        "failure_modes": [
+          "OMITTED_POPULATION"
+        ]
       },
       "demonstrates": "manuscript 10,801 is ambiguous without a declared thousands separator"
     }

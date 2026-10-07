@@ -1,0 +1,17 @@
+{
+  "description": "Two named channels consulted all three cited DOIs and recorded no notice, so each is NOT_RETRACTED_WITHIN_SCOPE. An aggregator's retraction flag (captured inside its declared defect window) is never a channel and is ignored.",
+  "status": "PASS",
+  "reason": "VERIFIED",
+  "exit_code": 0,
+  "checks": {
+    "editorial": "PASS"
+  },
+  "editorial_statuses": {
+    "10.5555/sgate.fx.0001": "NOT_RETRACTED_WITHIN_SCOPE",
+    "10.5555/sgate.fx.0002": "NOT_RETRACTED_WITHIN_SCOPE",
+    "10.5555/sgate.fx.0003": "NOT_RETRACTED_WITHIN_SCOPE"
+  },
+  "ignored_sources": [
+    "OPENALEX_IS_RETRACTED"
+  ]
+}

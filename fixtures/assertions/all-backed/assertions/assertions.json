@@ -1,0 +1,26 @@
+[
+  {
+    "claim_id": "agent-claim-01",
+    "kind": "DATASET_VALIDATED",
+    "cites": "inv-e6390737b000",
+    "claimed_at": "2026-01-15T10:05:00Z",
+    "artifact_sha256": "3b52dec376e867b60f3adde43db835f7ac774b16fd198c83fdfe5dcdb106ca62",
+    "claimed_result": "PASS"
+  },
+  {
+    "claim_id": "agent-claim-02",
+    "kind": "TESTS_RUN",
+    "cites": "inv-059358221281",
+    "claimed_at": "2026-01-15T10:05:00Z",
+    "artifact_sha256": "3b52dec376e867b60f3adde43db835f7ac774b16fd198c83fdfe5dcdb106ca62",
+    "claimed_result": "FAIL"
+  },
+  {
+    "claim_id": "agent-claim-03",
+    "kind": "FILE_CHECKED",
+    "cites": "inv-fa76646e68fa",
+    "claimed_at": "2026-01-15T10:05:00Z",
+    "artifact_sha256": "3b52dec376e867b60f3adde43db835f7ac774b16fd198c83fdfe5dcdb106ca62",
+    "claimed_result": "FAIL"
+  }
+]

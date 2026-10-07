@@ -29,6 +29,20 @@
       "resolver_identity": "synthetic-fixture-resolver",
       "resolver_schema_version": "fixture-1",
       "live_refresh_performed": false
+    },
+    {
+      "doi": "10.5555/science-gate-canary-b8e69f3aec9e",
+      "canary": true,
+      "outcome": "NOT_FOUND",
+      "http_status": 404,
+      "handle_response_code": 100,
+      "work": null,
+      "retrieved_at": "2026-02-14T09:00:00Z",
+      "request_url_or_query": "https://resolver.invalid/api/handles/10.5555/science-gate-canary-b8e69f3aec9e",
+      "response_sha256": "fbe788a819e3c7385bfa723033d74c0fc54078158c4bae81b0ec58956f271f5e",
+      "resolver_identity": "synthetic-fixture-resolver",
+      "resolver_schema_version": "fixture-1",
+      "live_refresh_performed": false
     }
   ]
 }

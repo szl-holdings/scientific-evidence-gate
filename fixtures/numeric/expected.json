@@ -1,0 +1,94 @@
+{
+  "note": "Expected outcomes of verifying each synthetic numeric-forensics fixture's manifest.json (ARCHITECTURE.md section 17.11). Every name, value and file here is invented. The claim_registry check has id 'claims' in every fixture.",
+  "fixtures": {
+    "narrated": {
+      "status": "FAIL",
+      "reason": "SOURCE_MISMATCH",
+      "exit_code": 1,
+      "claims_check": {
+        "verdict": "FAIL",
+        "reason": "SOURCE_MISMATCH",
+        "failure_modes": [
+          "NARRATED_VERIFICATION"
+        ]
+      },
+      "demonstrates": "difference 2.10 equals 12.35 - 10.25 as printed, but the stored 12.346 - 10.254 rounds to 2.09, and the claim must derive from stored outputs (extension #7, case a)"
+    },
+    "tie-rule": {
+      "status": "FAIL",
+      "reason": "SOURCE_MISMATCH",
+      "exit_code": 1,
+      "claims_check": {
+        "verdict": "FAIL",
+        "reason": "SOURCE_MISMATCH",
+        "failure_modes": [
+          "PROTOCOL_DRIFT",
+          "SOURCE_MISMATCH"
+        ]
+      },
+      "demonstrates": "stored 0.125 printed as 0.13 under a declared HALF_EVEN toolchain: only HALF_UP and CEILING produce it (extension #7, case c)"
+    },
+    "third-party": {
+      "status": "PASS",
+      "reason": "VERIFIED",
+      "exit_code": 0,
+      "claims_check": {
+        "verdict": "PASS",
+        "reason": "VERIFIED",
+        "failure_modes": []
+      },
+      "demonstrates": "the same 0.13 from stored 0.125, marked EITHER_HALF as a third-party number, agrees by half-up and records the convention (decision D5)"
+    },
+    "grim-inconsistent": {
+      "status": "FAIL",
+      "reason": "SOURCE_MISMATCH",
+      "exit_code": 1,
+      "claims_check": {
+        "verdict": "FAIL",
+        "reason": "SOURCE_MISMATCH",
+        "failure_modes": [
+          "SOURCE_MISMATCH"
+        ]
+      },
+      "demonstrates": "no integer total of 28 ratings has mean 5.19; the nearest consistent means are 5.18 and 5.21 (extension #3, case a)"
+    },
+    "grim-consistent": {
+      "status": "PASS",
+      "reason": "VERIFIED",
+      "exit_code": 0,
+      "claims_check": {
+        "verdict": "PASS",
+        "reason": "VERIFIED",
+        "failure_modes": []
+      },
+      "demonstrates": "mean 5.18 of 28 ratings is GRIM-consistent and the test rejects 72 of the 100 two-decimal means in [5, 6): discrimination 0.72 (extension #3, case b)"
+    },
+    "grim-untestable": {
+      "status": "ABSTAIN",
+      "reason": "INSUFFICIENT_EVIDENCE",
+      "exit_code": 2,
+      "claims_check": {
+        "verdict": "ABSTAIN",
+        "reason": "INSUFFICIENT_EVIDENCE",
+        "failure_modes": [
+          "VACUOUS_PASS"
+        ]
+      },
+      "demonstrates": "with 150 ratings every two-decimal mean is reachable, so GRIM has discrimination 0 and is NOT_TESTABLE, never PASS (extension #3, case c)"
+    },
+    "coverage": {
+      "status": "ABSTAIN",
+      "reason": "UNVERIFIED",
+      "exit_code": 2,
+      "claims_check": {
+        "verdict": "ABSTAIN",
+        "reason": "UNVERIFIED",
+        "failure_modes": [
+          "EPHEMERAL_CLAIM",
+          "OMITTED_POPULATION"
+        ]
+      },
+      "demonstrates": "a decimal comma (0,42), a corrected p-value (0.012) and a garbled comparison sign before 0.05 land in named buckets; 1 of 4 numbers checked is below the floor (extension #17)"
+    }
+  }
+}

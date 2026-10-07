@@ -1,16 +1,27 @@
-"""The ``science-gate`` command line (ARCHITECTURE.md section 14).
+"""The ``science-gate`` command line (ARCHITECTURE.md sections 14 and 17.9).
 
 Exit codes follow :data:`~science_gate.models.EXIT_CODE`: 0 PASS, 1 FAIL,
 2 ABSTAIN, 3 ERROR. Argument errors exit 3, not argparse's usual 2, so that 2
-always means ABSTAIN and a script can never mistake a typo for a verdict.
-Every command prints a one-line status headline first and then the paths it
-wrote, one per line.
+always means ABSTAIN and a script can never mistake a typo for a verdict
+(decision D3 keeps this scheme). Every command prints a one-line status
+headline first and then the paths it wrote, one per line.
+
+``--require-signature`` (on ``verify`` and ``report``) asks for more than a
+verdict: the receipt's HMAC-SHA256 shared-key authenticator must verify with
+the configured key. The run directory is still written or re-rendered as
+usual, so nothing is lost, but unless re-checking the files on disk gives
+``SIGNED_VERIFIED`` the headline is ``ERROR (PROTOCOL_BROKEN) <run_id>:
+--require-signature: ...`` and the exit code is 3. That outcome stays inside
+the 0-3 scheme and never borrows another status's code, while its headline
+names the receipt's authentication status and the run's own status, so the
+two are never confused.
 
 ``verify``, ``report`` and ``init`` are implemented here. ``mutate``,
-``impact``, ``revalidate``, ``package`` and ``demo`` belong to their own
-modules. They are imported only when invoked, and each is called as
-``function(args) -> int``. If a module is missing, the command says so and
-exits 3.
+``impact``, ``revalidate``, ``what-if``, ``package`` and ``demo`` belong to
+their own modules. They are imported only when invoked, and each is called as
+``function(args) -> int``; flags such as ``mutate --harness`` and
+``revalidate --witness`` are parsed here and read by those functions. If a
+module is missing, the command says so and exits 3.
 """
 
 from __future__ import annotations
@@ -26,9 +37,11 @@ from . import __version__
 from ._canonical import pretty_json_bytes, sha256_bytes
 from ._redact import redaction_scope
 from ._safeio import SafeIOError, safe_write
+from ._validators import ExportValidationError
 from .discovery import discover
 from .manifests import MANIFEST_SCHEMA, load_manifest
-from .models import EXIT_CODE, Status
+from .models import EXIT_CODE, AuthStatus, Reason, Status
+from .receipts import STATEMENT_FILE, ReceiptVerification, verify_receipt
 from .reports import report_run_dir, write_run
 from .verifier import build_snapshot, verify
 
@@ -39,6 +52,7 @@ __all__ = [
     "TEMPLATE_CSV",
     "UsageError",
     "build_parser",
+    "require_signature_headline",
     "template_manifest",
     "scaffold_project",
     "main",
@@ -55,6 +69,7 @@ LAZY_COMMANDS: Mapping[str, str] = MappingProxyType(
         "mutate": "science_gate.mutations:cli_mutate",
         "impact": "science_gate.dependencies:cli_impact",
         "revalidate": "science_gate.dependencies:cli_revalidate",
+        "what-if": "science_gate.dependencies:cli_what_if",
         "package": "science_gate.packaging:cli_package",
         "demo": "science_gate.demo:cli_demo",
     }
@@ -87,13 +102,21 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(f"{self.prog}: {message}")
 
 
+_REQUIRE_SIGNATURE_HELP = (
+    "exit 3 with an ERROR (PROTOCOL_BROKEN) headline unless the receipt's HMAC-SHA256 shared-key authenticator "
+    f"verifies with the key named by the environment (auth status {AuthStatus.SIGNED_VERIFIED.value}); "
+    "the run's own status stays recorded"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """The argument parser for all eight subcommands."""
+    """The argument parser for all nine subcommands."""
     parser = _Parser(
         prog=PROG,
         description=(
             "Local evidence gate: a passing check must emit enough evidence to prove it had the opportunity "
-            "to fail. Exit codes: 0 PASS, 1 FAIL, 2 ABSTAIN, 3 ERROR."
+            "to fail. Exit codes: 0 PASS, 1 FAIL, 2 ABSTAIN, 3 ERROR (also usage errors and an unmet "
+            "--require-signature)."
         ),
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
@@ -106,19 +129,32 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("manifest", metavar="MANIFEST")
     run.add_argument("--output", metavar="DIR", help=f"run directory (default ./{DEFAULT_RUNS_DIR}/<run_id>/)")
     run.add_argument("--live", action="store_true", help="allow live network lookups (off by default)")
+    run.add_argument("--require-signature", action="store_true", help=_REQUIRE_SIGNATURE_HELP)
 
     report = commands.add_parser("report", help="re-verify a run directory and re-render its reports")
     report.add_argument("run_dir", metavar="RUN_DIR")
+    report.add_argument("--require-signature", action="store_true", help=_REQUIRE_SIGNATURE_HELP)
 
     mutate = commands.add_parser("mutate", help="mutation-test the verifier against a manifest")
     mutate.add_argument("manifest", metavar="MANIFEST")
     mutate.add_argument("--output", metavar="DIR")
+    mutate.add_argument(
+        "--harness", action="store_true", help="also mutate the mutation harness itself and report its sensitivity"
+    )
 
-    graph_commands = (("impact", "mark the descendants of an artifact stale"), ("revalidate", "revalidate an artifact"))
-    for name, text in graph_commands:
-        command = commands.add_parser(name, help=text)
+    graph_commands = {
+        "impact": "mark the descendants of an artifact stale",
+        "revalidate": "revalidate an artifact",
+        "what-if": "inject a synthetic change into an artifact and check that staleness detection reacts",
+    }
+    graph_parsers: dict[str, argparse.ArgumentParser] = {}
+    for name, text in graph_commands.items():
+        command = graph_parsers[name] = commands.add_parser(name, help=text)
         command.add_argument("artifact_id", metavar="ARTIFACT_ID")
         command.add_argument("--manifest", metavar="MANIFEST", required=True)
+    graph_parsers["revalidate"].add_argument(
+        "--witness", metavar="PATH", help="recompute witness that a derived artifact was re-executed, not re-hashed"
+    )
 
     package = commands.add_parser("package", help="package an evaluation for local execution")
     package.add_argument("manifest", metavar="MANIFEST")
@@ -138,6 +174,13 @@ def _emit(stream: TextIO, text: str) -> None:
     """
     encoding = getattr(stream, "encoding", None) or "utf-8"
     stream.write(text.encode(encoding, "backslashreplace").decode(encoding) + "\n")
+
+
+def _emit_written(out: TextIO, headline: str, paths: Sequence[Path]) -> None:
+    """The output every command shares: its headline, then each path it wrote."""
+    _emit(out, headline)
+    for path in paths:
+        _emit(out, str(path))
 
 
 def template_manifest(csv_sha256: str) -> dict[str, Any]:
@@ -235,10 +278,32 @@ def _cmd_init(args: argparse.Namespace, out: TextIO) -> int:
         return _ERROR
     paths = scaffold_project(target)
     manifest = target / "manifest.json"
-    _emit(out, f"OK init: wrote a synthetic starter project; next: {PROG} verify {manifest}")
-    for path in paths:
-        _emit(out, str(path))
+    _emit_written(out, f"OK init: wrote a synthetic starter project; next: {PROG} verify {manifest}", paths)
     return 0
+
+
+def require_signature_headline(verification: ReceiptVerification, *, run_id: str | None, recorded: str) -> str | None:
+    """The headline for an unmet ``--require-signature``, or None when the receipt is SIGNED_VERIFIED.
+
+    ``recorded`` finishes the line by saying where the command's own status
+    is kept (for ``verify``, the run's status in run.json), so the reader
+    sees that the run itself was not rewritten as ERROR. A missing or
+    malformed sidecar has no auth status at all; the line then quotes the
+    problem instead of inventing one. The result is always one line.
+    """
+    status = verification.auth_status
+    if status is AuthStatus.SIGNED_VERIFIED:
+        return None
+    if status is None:
+        cause = next(
+            (problem for problem in verification.problems if not problem.startswith("SIGNATURE_REQUIRED")),
+            "no usable authentication sidecar",
+        )
+        subject = f"the receipt's authentication could not be determined ({cause})"
+    else:
+        subject = f"the receipt is {status.value} ({verification.detail})"
+    line = f"{Status.ERROR.value} ({Reason.PROTOCOL_BROKEN.value}) {run_id or 'unknown'}: --require-signature: "
+    return " ".join(f"{line}{subject}; {recorded}".split())
 
 
 def _cmd_verify(args: argparse.Namespace, out: TextIO) -> int:
@@ -246,12 +311,23 @@ def _cmd_verify(args: argparse.Namespace, out: TextIO) -> int:
     output = Path(args.output) if args.output else Path(DEFAULT_RUNS_DIR) / run.result.run_id
     try:
         written = write_run(run, output)
+    except ExportValidationError as exc:
+        _emit(out, f"ERROR verify: export validation failed: {exc.problems[0]}")
+        return _ERROR
     except (SafeIOError, OSError) as exc:
         _emit(out, f"ERROR verify: the {run.status.value} result could not be written to {output}: {exc}")
         return _ERROR
-    _emit(out, written.headline)
-    for path in written.paths:
-        _emit(out, str(path))
+    if args.require_signature:
+        # Judge the files as written, not the record in memory: that is what a later reader will have.
+        headline = require_signature_headline(
+            verify_receipt(written.run_dir / STATEMENT_FILE, require_signature=True),
+            run_id=run.result.run_id,
+            recorded=f"the run's own status {written.status.value} is recorded in run.json",
+        )
+        if headline is not None:
+            _emit_written(out, headline, written.paths)
+            return _ERROR
+    _emit_written(out, written.headline, written.paths)
     return written.exit_code
 
 
@@ -265,9 +341,17 @@ def _cmd_report(args: argparse.Namespace, out: TextIO) -> int:
     except (SafeIOError, OSError) as exc:
         _emit(out, f"ERROR report: cannot write the re-rendered report into {run_dir}: {exc}")
         return _ERROR
-    _emit(out, written.headline)
-    for path in written.paths:
-        _emit(out, str(path))
+    if args.require_signature:
+        verification = verify_receipt(run_dir / STATEMENT_FILE, require_signature=True)
+        headline = require_signature_headline(
+            verification,
+            run_id=verification.run_id,
+            recorded=f"the report's own status {written.status.value} is recorded in report.md",
+        )
+        if headline is not None:
+            _emit_written(out, headline, written.paths)
+            return _ERROR
+    _emit_written(out, written.headline, written.paths)
     return written.exit_code
 
 

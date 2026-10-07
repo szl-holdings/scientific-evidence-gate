@@ -1,0 +1,12 @@
+{
+  "schema": "science-gate-recompute-witness/v1",
+  "node_id": "analysis-run",
+  "invocation_id": "inv-5ca7b8cdc54e",
+  "started_at": "2026-01-02T02:00:00Z",
+  "completed_at": "2026-01-02T02:05:00Z",
+  "inputs": {
+    "source-snapshot": "2167a40ff7ec8bc812934a9df03e03732467dacb2865c37f90e2a73c3784f37f",
+    "study-design": "c69beb68b42ed077181fa034065d7ce930e0b1b3840137260081caec5b3b0cfe"
+  },
+  "output_sha256": "302a170db37f5977e1a40163fcd1576da0bcc6b83fc2b12d216d52d176aca56a"
+}

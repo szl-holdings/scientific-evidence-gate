@@ -1,0 +1,29 @@
+{
+  "description": "The capture's canary for 10.5555, a DOI that cannot exist, came back with body responseCode 1: the resolver says yes to everything. That is a proven miss (FAIL / BLIND_SPOT), and no DOI under the prefix may be reported DOI_RESOLVED.",
+  "status": "FAIL",
+  "reason": "BLIND_SPOT",
+  "exit_code": 1,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "PASS",
+    "doi-resolution": "FAIL",
+    "citation-metadata": "ABSTAIN"
+  },
+  "resolver_states": {
+    "10.5555/sgate.fx.0001": "SOURCE_UNAVAILABLE",
+    "10.5555/sgate.fx.0002": "SOURCE_UNAVAILABLE",
+    "10.5555/sgate.fx.0003": "SOURCE_UNAVAILABLE"
+  },
+  "dispositions": {
+    "C1": "SOURCE_UNAVAILABLE",
+    "C2": "SOURCE_UNAVAILABLE",
+    "C3": "SOURCE_UNAVAILABLE"
+  },
+  "canaries": {
+    "10.5555": {
+      "holds": false,
+      "source": "frozen",
+      "state": "DOI_RESOLVED"
+    }
+  }
+}

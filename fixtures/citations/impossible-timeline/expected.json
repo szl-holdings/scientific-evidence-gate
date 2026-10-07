@@ -1,0 +1,23 @@
+{
+  "description": "The log's invocation for C1 was retrieved at 2026-04-01T00:00:00Z, but the capture records the DOI as registered at 2026-05-01T00:00:00Z: nothing can be verified before it exists, so the claimed verification is narrated (ABSTAIN / UNVERIFIED) with both timestamps in evidence.",
+  "status": "ABSTAIN",
+  "reason": "UNVERIFIED",
+  "exit_code": 2,
+  "checks": {
+    "observations": "PASS",
+    "citation-log": "ABSTAIN",
+    "doi-resolution": "PASS",
+    "citation-metadata": "PASS"
+  },
+  "violated_invariants": [
+    "checked_claims_le_invocations"
+  ],
+  "impossible_timelines": [
+    {
+      "citation_id": "C1",
+      "doi": "10.5555/sgate.fx.0001",
+      "retrieved_at": "2026-04-01T00:00:00Z",
+      "registered_at": "2026-05-01T00:00:00Z"
+    }
+  ]
+}

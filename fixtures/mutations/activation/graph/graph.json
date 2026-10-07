@@ -1,0 +1,27 @@
+{
+  "edges": [
+    [
+      "design-protocol",
+      "samples-snapshot"
+    ]
+  ],
+  "nodes": [
+    {
+      "history": [],
+      "id": "design-protocol",
+      "kind": "DESIGN",
+      "path": "graph/design/protocol.md",
+      "recorded_sha256": "b82f6700647df5da74ae7e2242651fc704bf2dea1f0f096da40cc0d305789ef5",
+      "validity": "CURRENT"
+    },
+    {
+      "history": [],
+      "id": "samples-snapshot",
+      "kind": "SOURCE_SNAPSHOT",
+      "path": "data/samples.csv",
+      "recorded_sha256": "d22650268c556ab195a2f842aafc40708abc62fb96d0802bb876096bf9d6f5f0",
+      "validity": "CURRENT"
+    }
+  ],
+  "schema": "science-gate-graph/v1"
+}

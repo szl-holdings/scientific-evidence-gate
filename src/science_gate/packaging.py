@@ -44,7 +44,8 @@ Layout of a package::
 
     package.json            the index (science-gate-package/v1), written last
     schemas/*.schema.json   the schemas, from the source tree
-    expected/receipt.json   receipt of the packaging-time run
+    expected/receipt.json   receipt of the packaging-time run (the bare statement)
+    expected/receipt.auth.json   authentication sidecar of that receipt
     evaluation/...          manifest and data, at their manifest-relative paths
 
 The evaluation tree is kept under its own directory. Manifest-relative paths
@@ -95,7 +96,7 @@ from ._safeio import (
 )
 from .manifests import MAX_MANIFEST_BYTES, ApprovedRedaction, Manifest, ManifestError, SourceLicense, load_manifest
 from .models import EXIT_CODE, AccessClass, InputState, Permissions, Status
-from .receipts import SCIENTIFIC_VALIDITY, build_run_receipt, receipt_bytes
+from .receipts import SCIENTIFIC_VALIDITY, build_run_receipt, receipt_files
 from .verifier import NetworkPolicy, VerificationRun, verify
 
 __all__ = [
@@ -130,7 +131,8 @@ PACKAGE_SCHEMA = "science-gate-package/v1"
 PACKAGE_JSON = "package.json"
 EVALUATION_DIR = "evaluation"
 SCHEMAS_DIR = "schemas"
-EXPECTED_RECEIPT = "expected/receipt.json"
+EXPECTED_DIR = "expected"
+EXPECTED_RECEIPT = f"{EXPECTED_DIR}/receipt.json"
 
 #: The bundled schemas: ``science_gate/_schemas`` in an installed wheel,
 #: ``<repo>/schemas`` in a source checkout (see :mod:`science_gate._resources`).
@@ -932,9 +934,9 @@ def _local_execution(manifest_name: str, files: Sequence[PackageFile], expected_
     command = ["science-gate", "verify", f"{EVALUATION_DIR}/{manifest_name}", "--output", "local-run"]
     steps.append(f"Run: {' '.join(command)}")
     steps.append(
-        f"Expect exit code {expected_exit}. Reduce the body.predicate of local-run/receipt.json to the fields in "
-        "expected_results.reproducible and compare them; the fields under expected_results.not_reproducible "
-        "change on every run."
+        f"Expect exit code {expected_exit}. Reduce the predicate of local-run/receipt.json (the statement's top "
+        "level) to the fields in expected_results.reproducible and compare them; the fields under "
+        "expected_results.not_reproducible change on every run."
     )
     return {
         "requires": {"tool": TOOL_NAME, "version": __version__, "python": ">=3.11", "network": "none"},
@@ -1182,7 +1184,10 @@ def build_package(
             relpath = f"{SCHEMAS_DIR}/{name}"
             writer.write(relpath, data)
             schema_entries.append(writer.contents[relpath])
-        writer.write(EXPECTED_RECEIPT, receipt_bytes(receipt))
+        # The statement and its authentication sidecar (ARCHITECTURE.md 17.9): the statement's bytes are the
+        # same whether or not the receipt is authenticated, and the sidecar says which it is.
+        for name, data in receipt_files(receipt).items():
+            writer.write(f"{EXPECTED_DIR}/{name}", data)
         document = normalize(
             _redacted(
                 _package_document(

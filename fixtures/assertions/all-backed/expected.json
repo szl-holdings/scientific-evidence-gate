@@ -1,0 +1,15 @@
+{
+  "description": "Three synthetic assertions, each backed by a terminal invocation of the synthetic sealed run; two of them truthfully report FAIL results, so no failure is orphaned.",
+  "status": "PASS",
+  "reason": "VERIFIED",
+  "exit_code": 0,
+  "checks": {
+    "agent-claims": "PASS"
+  },
+  "counts": {
+    "BACKED": 3,
+    "NARRATED": 0,
+    "CONTRADICTED": 0,
+    "ORPHANED": 0
+  }
+}

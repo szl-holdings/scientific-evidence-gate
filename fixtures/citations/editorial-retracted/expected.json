@@ -1,0 +1,18 @@
+{
+  "description": "A retraction of C2's DOI appears only in the Retraction Watch snapshot channel; the publisher channel consulted it and recorded nothing. One channel's retraction is a recorded fact: the DOI is RETRACTED (FAIL / SOURCE_MISMATCH), with the channel and snapshot recorded.",
+  "status": "FAIL",
+  "reason": "SOURCE_MISMATCH",
+  "exit_code": 1,
+  "checks": {
+    "editorial": "FAIL"
+  },
+  "editorial_statuses": {
+    "10.5555/sgate.fx.0001": "NOT_RETRACTED_WITHIN_SCOPE",
+    "10.5555/sgate.fx.0002": "RETRACTED",
+    "10.5555/sgate.fx.0003": "NOT_RETRACTED_WITHIN_SCOPE"
+  },
+  "status_counts": {
+    "RETRACTED": 1,
+    "NOT_RETRACTED_WITHIN_SCOPE": 2
+  }
+}

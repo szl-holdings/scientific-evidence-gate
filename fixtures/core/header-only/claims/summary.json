@@ -1,0 +1,11 @@
+{
+  "schema": "science-gate-summary/v1",
+  "status": "PASS",
+  "pinned": {
+    "inputs": {
+      "measurements": {
+        "sha256": "7d6f1fd52c3692af1b94139e688f084b03ab19764c71efe6915acaf4b151cfc6"
+      }
+    }
+  }
+}

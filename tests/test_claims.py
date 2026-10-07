@@ -1,28 +1,35 @@
-"""Claim registry and manuscript scan (ARCHITECTURE.md section 7).
+"""Claim registry and manuscript scan (ARCHITECTURE.md sections 7 and 17.11).
 
 The pure parts (registry parsing, JSON Pointers, the manuscript scanner,
 token classification) are tested directly. The check itself is tested through
 ``verify`` on a private copy of the synthetic ``fixtures/claims/valid``
 project, which verifies as PASS, so each test's edit isolates exactly one
-defect. Every claim, value, site and reviewer here is invented.
+defect. Section 17 adds the skip labels, the falsifier generator and the
+comparator lookup tested at the end; the numeric forensics have their own
+files (test_numeric_forensics, test_narrated_numbers, test_numeric_coverage).
+Every claim, value, site and reviewer here is invented.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import unittest
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from _helpers import REPO_ROOT, TempDirTestCase
 
+from science_gate import invariants
 from science_gate._canonical import sha256_bytes, sha256_canonical
 from science_gate.claims import (
     CHAIN,
     CLAIM_KEYS,
     CLAIMS_SCHEMA,
+    CONSISTENCY_KEYS,
     CSV_SELECTOR_KEYS,
     DECLARED,
     DECLARED_NOT_A_CLAIM,
@@ -57,15 +64,27 @@ from science_gate.claims import (
     NotClaim,
     RegisteredClaim,
     RegistryFormatError,
+    check_claim_registry,
     classify_tokens,
+    falsify_claim_registry,
     parse_registry,
     resolve_json_pointer,
     scan_manuscript,
 )
 from science_gate.invariants import AGREES_AT_STATED_PRECISION, DISAGREES, EXACT, parse_decimal
-from science_gate.manifests import IDENTIFIER_PATTERN
-from science_gate.models import CheckResult, ExecutionState, FailureMode, Reason, Status
-from science_gate.verifier import MAX_LISTED, VerificationRun, verify
+from science_gate.discovery import discover
+from science_gate.manifests import IDENTIFIER_PATTERN, CheckSpec, load_manifest
+from science_gate.models import (
+    SKIP_JUSTIFICATION_KEY,
+    CheckResult,
+    ExecutionState,
+    FailureMode,
+    FalsifierCase,
+    Reason,
+    SkipJustification,
+    Status,
+)
+from science_gate.verifier import MAX_LISTED, CheckContext, VerificationRun, verify
 
 CLAIMS_FIXTURES = REPO_ROOT / "fixtures" / "claims"
 VALID_PROJECT = CLAIMS_FIXTURES / "valid"
@@ -228,20 +247,26 @@ class ParseRegistryTest(unittest.TestCase):
         self.assertEqual(schema["$id"], CLAIMS_SCHEMA)
         self.assertEqual(schema["properties"]["schema"]["const"], CLAIMS_SCHEMA)
         pairs = {
-            REGISTRY_KEYS: schema,
-            CLAIM_KEYS: definitions["claim"],
-            DERIVATION_KEYS: definitions["derivation"],
-            STORED_OUTPUT_KEYS: definitions["stored_output"],
-            CSV_SELECTOR_KEYS: definitions["csv_selector"],
-            NOT_CLAIMS_KEYS: definitions["not_claims"],
-            NOT_CLAIM_TOKEN_KEYS: definitions["not_claims"]["properties"]["tokens"]["items"],
+            "registry": (REGISTRY_KEYS, schema),
+            "claim": (CLAIM_KEYS, definitions.get("claim")),
+            "derivation": (DERIVATION_KEYS, definitions.get("derivation")),
+            "consistency": (CONSISTENCY_KEYS, definitions.get("consistency")),
+            "stored_output": (STORED_OUTPUT_KEYS, definitions.get("stored_output")),
+            "csv_selector": (CSV_SELECTOR_KEYS, definitions.get("csv_selector")),
+            "not_claims": (NOT_CLAIMS_KEYS, definitions.get("not_claims")),
+            "not_claims token": (
+                NOT_CLAIM_TOKEN_KEYS,
+                definitions.get("not_claims", {}).get("properties", {}).get("tokens", {}).get("items"),
+            ),
         }
-        for keys, node in pairs.items():
-            with self.subTest(keys=keys):
+        for name, (keys, node) in pairs.items():
+            with self.subTest(definition=name):
+                self.assertIsNotNone(node, f"the schema has no definition for {name}")
                 self.assertEqual(set(node["properties"]), set(keys))
                 self.assertFalse(node["additionalProperties"])
         self.assertEqual(definitions["claim"]["required"], ["claim_id"])
         self.assertEqual(definitions["claim"]["properties"]["claim_id"]["pattern"], f"^{IDENTIFIER_PATTERN.pattern}$")
+        self.assertEqual(definitions.get("consistency", {}).get("required"), ["test", "n"])
 
 
 class JsonPointerTest(unittest.TestCase):
@@ -559,25 +584,34 @@ class UnregisteredNumbersTest(ClaimsProjectCase):
         run = self.verify()
         self.assertEqual((run.status, run.result.reason, run.exit_code), (Status.ABSTAIN, Reason.UNVERIFIED, 2))
         result = self.claims_result(run)
-        self.assertOutcome(result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM)
+        # Section 17.11: the unchecked number also puts coverage below the floor, recorded after
+        # the 0.1.0 finding, so the primary reason stays UNVERIFIED.
+        self.assertOutcome(
+            result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM, FailureMode.OMITTED_POPULATION
+        )
         (listed,) = result.evidence["manuscript_scan"]["unregistered_tokens"]
         self.assertEqual(
             {key: listed[key] for key in ("line", "column", "text", "classification")},
             {"line": 7, "column": 37, "text": "42.5", "classification": UNREGISTERED},
         )
+        self.assertEqual(result.evidence["numeric_coverage"]["buckets"][UNREGISTERED], [{"line": 7, "text": "42.5"}])
         self.assertIn("line 7 '42.5'", " ".join(result.diagnostics))
 
     def test_a_number_printed_at_a_different_precision_is_unregistered(self) -> None:
         self.write_manuscript(self.manuscript().replace("was 6.27 and", "was 6.270 and"))
         result = self.claims_result()
-        self.assertOutcome(result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM)
+        self.assertOutcome(
+            result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM, FailureMode.OMITTED_POPULATION
+        )
         (listed,) = result.evidence["manuscript_scan"]["unregistered_tokens"]
         self.assertIn("equals C-001 (2 decimal(s)) but prints 3 decimal(s)", listed["detail"])
 
     def test_an_undeclared_thousands_separator_requires_review(self) -> None:
         self.set_claims_check(params={})
         result = self.claims_result()
-        self.assertOutcome(result, Status.ABSTAIN, Reason.REQUIRES_HUMAN_REVIEW)
+        self.assertOutcome(result, Status.ABSTAIN, Reason.REQUIRES_HUMAN_REVIEW, FailureMode.OMITTED_POPULATION)
+        buckets = result.evidence["numeric_coverage"]["buckets"]
+        self.assertEqual(buckets["AMBIGUOUS_SEPARATOR"], [{"line": 6, "text": "10,801"}])
         (listed,) = result.evidence["manuscript_scan"]["unregistered_tokens"]
         self.assertEqual((listed["text"], listed["number_state"]), ("10,801", "AMBIGUOUS_SEPARATOR"))
         self.assertEqual(result.evidence["manuscript_scan"]["unreadable"], 1)
@@ -589,9 +623,11 @@ class UnregisteredNumbersTest(ClaimsProjectCase):
         scan = result.evidence["manuscript_scan"]
         self.assertEqual(scan["classifications"][UNREGISTERED], MAX_LISTED + 5)
         self.assertEqual(len(scan["unregistered_tokens"]), MAX_LISTED)
-        (diagnostic,) = result.diagnostics
+        diagnostic, coverage = result.diagnostics
         self.assertTrue(diagnostic.startswith(f"UNREGISTERED: {MAX_LISTED + 5} manuscript number(s)"))
         self.assertTrue(diagnostic.endswith(", ..."))
+        self.assertTrue(coverage.startswith("NUMERIC_COVERAGE: 4 of 29 undeclared manuscript number(s) checked"))
+        self.assertEqual(result.evidence["numeric_coverage"]["bucket_counts"][UNREGISTERED], MAX_LISTED + 5)
 
 
 class ExemptionsTest(ClaimsProjectCase):
@@ -599,7 +635,10 @@ class ExemptionsTest(ClaimsProjectCase):
         self.write_manuscript(self.manuscript() + "A sentence without numbers.\n", repin=False)
         result = self.claims_result()
         # The draft number is no longer exempt, so it is unregistered: UNVERIFIED comes first.
-        self.assertOutcome(result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM)
+        self.assertOutcome(
+            result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM, FailureMode.OMITTED_POPULATION
+        )
+        self.assertEqual(result.evidence["numeric_coverage"]["declared"], 0)
         scan = result.evidence["manuscript_scan"]
         self.assertEqual(scan["exemptions"]["state"], EXEMPTIONS_STALE)
         self.assertEqual(scan["unregistered_tokens"][0]["text"], "3")
@@ -722,7 +761,9 @@ class StoredOutputTest(ClaimsProjectCase):
     def test_a_missing_stored_output_abstains(self) -> None:
         self.path(COUNTS_OUTPUT).unlink()
         result = self.claims_result()
-        self.assertOutcome(result, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE)
+        self.assertOutcome(result, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE, FailureMode.OMITTED_POPULATION)
+        buckets = result.evidence["numeric_coverage"]["buckets"]
+        self.assertEqual(buckets["NOT_COMPARED"], [{"line": 6, "text": "10,801"}])
         record = self.claim_record(result, "C-003")
         self.assertEqual(record["disposition"], STORED_OUTPUT_UNAVAILABLE)
         link = self.link(record, "STORED_OUTPUT")
@@ -732,7 +773,7 @@ class StoredOutputTest(ClaimsProjectCase):
     def test_an_unparseable_stored_output_abstains(self) -> None:
         self.write_output(SUMMARY_OUTPUT, "{not json")
         result = self.claims_result()
-        self.assertOutcome(result, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE)
+        self.assertOutcome(result, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE, FailureMode.OMITTED_POPULATION)
         self.assertEqual(self.claim_record(result, "C-001")["disposition"], STORED_OUTPUT_UNAVAILABLE)
 
     def test_values_that_cannot_be_located_abstain(self) -> None:
@@ -839,7 +880,9 @@ class DocumentAvailabilityTest(ClaimsProjectCase):
     def test_a_manuscript_without_a_registry_is_all_unregistered(self) -> None:
         self.update_manifest(claims=...)
         result = self.claims_result()
-        self.assertOutcome(result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM)
+        self.assertOutcome(
+            result, Status.ABSTAIN, Reason.UNVERIFIED, FailureMode.EPHEMERAL_CLAIM, FailureMode.OMITTED_POPULATION
+        )
         self.assertEqual(result.evidence["manuscript_scan"]["classifications"][UNREGISTERED], 5)
         self.assertIn("no claim registry", result.diagnostics[0])
 
@@ -905,6 +948,148 @@ class ParamsTest(ClaimsProjectCase):
                 result = self.claims_result(run)
                 self.assertEqual((result.verdict, run.status), (Status.ERROR, Status.ERROR))
                 self.assertIn(code, result.diagnostics[0])
+
+
+# ---------------------------------------------------------------------------
+# Section 17: skip labels, the falsifier generator, the comparator lookup
+# ---------------------------------------------------------------------------
+
+
+class SkipJustificationTest(ClaimsProjectCase):
+    """Every SKIPPED or NOT_APPLICABLE claims result carries a closed-vocabulary label (17.7)."""
+
+    def fresh(self, name: str) -> None:
+        self.project = self.tmp / name
+        shutil.copytree(VALID_PROJECT, self.project)
+
+    def empty_registry(self, manuscript: str | None) -> None:
+        self.save_registry(minimal_registry())
+        if manuscript is None:
+            self.path("claims/manuscript.md").unlink()
+        else:
+            self.write_file("claims/manuscript.md", manuscript)
+
+    def test_each_way_of_not_executing_is_labelled(self) -> None:
+        registry = "claims/registry.json"
+        cases = (
+            ("neither", lambda: self.update_manifest(claims=..., manuscript=...), "NOT_APPLICABLE", "NOT_DECLARED"),
+            ("missing", lambda: self.path(registry).unlink(), "SKIPPED", "INPUT_UNAVAILABLE"),
+            ("broken", lambda: self.write_file(registry, '{"schema": '), "SKIPPED", "EVIDENCE_MALFORMED"),
+            (
+                "malformed",
+                lambda: self.write_json(registry, {"schema": "x", "claims": []}),
+                "SKIPPED",
+                "EVIDENCE_MALFORMED",
+            ),
+            ("empty", lambda: self.empty_registry("No numbers here.\n"), "NOT_APPLICABLE", "EMPTY_POPULATION"),
+            ("unread", lambda: self.empty_registry(None), "NOT_APPLICABLE", "INPUT_UNAVAILABLE"),
+        )
+        for name, prepare, state, label in cases:
+            with self.subTest(case=name):
+                self.fresh(name)
+                prepare()
+                result = self.claims_result()
+                self.assertEqual((result.execution_state.value, result.verdict), (state, Status.ABSTAIN))
+                self.assertEqual(SkipJustification(result.evidence[SKIP_JUSTIFICATION_KEY]).value, label)
+
+    def test_an_executed_check_carries_no_label(self) -> None:
+        result = self.claims_result()
+        self.assertEqual(result.verdict, Status.PASS)
+        self.assertNotIn(SKIP_JUSTIFICATION_KEY, result.evidence)
+
+
+class FalsifierTest(ClaimsProjectCase):
+    """``falsify_claim_registry`` builds a known-bad twin the checker must reject (17.5)."""
+
+    def generate(self) -> tuple[tuple[FalsifierCase, ...], CheckContext, CheckSpec]:
+        manifest = load_manifest(self.path("manifest.json"))
+        _, inputs = discover(manifest)
+        (spec,) = [item for item in manifest.checks if item.check_id == "claims"]
+        ctx = CheckContext(manifest, inputs)
+        ctx.preload([spec.kind])
+        return falsify_claim_registry(ctx, spec, self.claims_result()), ctx, spec
+
+    def test_the_case_shifts_the_first_resolved_value_and_repins_only_its_output(self) -> None:
+        before = self.digest(SUMMARY_OUTPUT)
+        (case,), _, _ = self.generate()
+        self.assertEqual(
+            (case.case_id, case.expected_verdict, case.expected_reason),
+            ("shift-stored-value", Status.FAIL, Reason.SOURCE_MISMATCH),
+        )
+        self.assertEqual(sorted(case.documents), ["claims/registry.json", SUMMARY_OUTPUT])
+        changed = json.loads(case.documents[SUMMARY_OUTPUT])
+        self.assertEqual(changed["sites"]["site-alpha"]["mean_value"], "6.28")
+        self.assertEqual(changed["sites"]["site-beta"]["mean_value"], "15.3125")
+        pins = {
+            claim["claim_id"]: claim["stored_output"]["sha256"]
+            for claim in json.loads(case.documents["claims/registry.json"])["claims"]
+        }
+        digest = sha256_bytes(case.documents[SUMMARY_OUTPUT])
+        self.assertEqual({claim_id for claim_id, pin in pins.items() if pin == digest}, {"C-001", "C-002", "C-004"})
+        self.assertEqual(pins["C-003"], self.digest(COUNTS_OUTPUT))
+        self.assertEqual(self.digest(SUMMARY_OUTPUT), before, "a generator never writes")
+        self.assertEqual(self.generate()[0], (case,), "the case is deterministic")
+
+    def test_the_checker_rejects_the_case_on_the_value_not_the_digest(self) -> None:
+        (case,), _, _ = self.generate()
+        for relpath, data in case.documents.items():
+            self.path(relpath).write_bytes(data)
+        result = self.claims_result()
+        self.assertEqual((result.verdict, result.reason), (case.expected_verdict, case.expected_reason))
+        record = self.claim_record(result, "C-001")
+        self.assertEqual(record["disposition"], VALUE_DISAGREES)
+        self.assertEqual(self.link(record, "STORED_OUTPUT")["state"], DIGEST_MATCHES)
+
+    def test_the_checker_rejects_the_case_in_the_engine_overlay(self) -> None:
+        (case,), ctx, spec = self.generate()
+        outcome = check_claim_registry(ctx.overlay(case), spec)
+        self.assertEqual((outcome.verdict, outcome.reason), (Status.FAIL, Reason.SOURCE_MISMATCH))
+        self.assertEqual(check_claim_registry(ctx, spec).verdict, Status.PASS)
+
+    def test_a_passing_claims_check_carries_its_rejected_twin_as_a_witness(self) -> None:
+        result = self.claims_result()
+        self.assertEqual((result.verdict, result.evidence["falsification"]), (Status.PASS, "WITNESSED"))
+        (falsifier,) = result.evidence["falsifiers"]
+        self.assertEqual(
+            (falsifier["case_id"], falsifier["outcome"], falsifier["actual"]["verdict"]),
+            ("shift-stored-value", "REJECTED", "FAIL"),
+        )
+
+    def test_a_csv_value_is_shifted_in_its_cell(self) -> None:
+        document = self.registry()
+        document["claims"] = [document["claims"][2], *document["claims"][:2], document["claims"][3]]
+        self.save_registry(document)
+        (case,), _, _ = self.generate()
+        self.assertEqual(
+            case.documents[COUNTS_OUTPUT].decode("utf-8"),
+            "site,samples,total_count\nsite-alpha,2,1241\nsite-beta,2,2060\nsite-gamma,2,10802\n",
+        )
+        for relpath, data in case.documents.items():
+            self.path(relpath).write_bytes(data)
+        self.assertEqual(self.claim_record(self.claims_result(), "C-003")["disposition"], VALUE_DISAGREES)
+
+    def test_no_resolved_claim_means_no_case(self) -> None:
+        document = self.registry()
+        for claim in document["claims"]:
+            claim["derivation"] = None
+        self.save_registry(document)
+        self.assertEqual(self.generate()[0], ())
+
+
+class ComparatorLookupTest(ClaimsProjectCase):
+    """The check calls ``invariants.compare_decimal`` as found at call time, so the run's self-test judges it (17.6)."""
+
+    def test_a_patched_comparator_is_the_one_the_check_uses(self) -> None:
+        self.write_output(COUNTS_OUTPUT, "site,samples,total_count\nsite-gamma,2,10810\n")
+        self.assertEqual(self.claim_record(self.claims_result(), "C-003")["value_comparison"]["outcome"], DISAGREES)
+        real = invariants.compare_decimal
+
+        def always_exact(claim: Any, stored: Any, **kwargs: Any) -> Any:
+            return dataclasses.replace(real(claim, stored, **kwargs), outcome=EXACT)
+
+        with mock.patch.object(invariants, "compare_decimal", always_exact):
+            record = self.claim_record(self.claims_result(), "C-003")
+        self.assertEqual(record["value_comparison"]["outcome"], EXACT)
 
 
 if __name__ == "__main__":

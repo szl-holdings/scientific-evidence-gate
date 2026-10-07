@@ -15,6 +15,11 @@ than a frozen one. This module holds that shape:
   the answer is usable as a reference (``DOI_RESOLVED`` or
   ``DOI_TARGET_MISMATCH``), so a record with broken provenance can never be
   used as ground truth by accident.
+* The negative controls (extension #8): Handle body codes and what they mean
+  (:func:`state_for_handle_code`), the canary DOI form, and
+  :class:`CanaryCheck`, the outcome of asking a resolver about a DOI that
+  must not exist. A resolver that answers "yes" to everything makes every
+  positive answer worthless; a canary is how a run can tell.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import string
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
+from .._canonical import sha256_bytes
 from .._clock import ClockError, parse_utc
 from ..models import ResolverState
 
@@ -34,12 +40,23 @@ __all__ = [
     "SOURCE_FROZEN",
     "SOURCE_LIVE",
     "SOURCE_NONE",
+    "HANDLE_RESOLVED",
+    "HANDLE_NOT_FOUND",
+    "HANDLE_VALUES_NOT_FOUND",
+    "CANARY_LABEL",
     "RecordFormatError",
     "Author",
     "Work",
     "Resolution",
+    "CanaryCheck",
     "normalize_doi",
+    "doi_prefix",
+    "canary_nonce",
+    "canary_doi",
+    "is_canary_doi",
+    "state_for_handle_code",
     "is_sha256",
+    "is_utc",
     "require_object",
     "parse_work",
     "provenance_problems",
@@ -83,6 +100,19 @@ _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _YEAR = re.compile(r"\d{4}")
 
+#: Handle System response codes, read from the response *body*. The HTTP
+#: status never decides: the Handle proxy answers "values not found" (200)
+#: behind HTTP 200, and an HTML error page can sit behind any status.
+HANDLE_RESOLVED = 1
+HANDLE_NOT_FOUND = 100
+HANDLE_VALUES_NOT_FOUND = 200
+
+#: A canary DOI is ``<prefix>/science-gate-canary-<12 lowercase hex>``. The
+#: label is project-owned, so a registered DOI can only carry it by mistake.
+CANARY_LABEL = "science-gate-canary-"
+_CANARY_DOI = re.compile(r"10\.\d{4,9}/" + re.escape(CANARY_LABEL) + r"[0-9a-f]{12}")
+_NONCE = re.compile(r"[0-9a-f]{12}")
+
 
 class RecordFormatError(ValueError):
     """A citation, frozen or log document whose structure does not match its schema.
@@ -110,6 +140,49 @@ def normalize_doi(value: Any) -> str | None:
     if not _DOI.fullmatch(text):
         return None
     return text.translate(_ASCII_LOWER)
+
+
+def doi_prefix(doi: str) -> str:
+    """The registrant prefix of a DOI in comparison form: the text before the first slash."""
+    return doi.partition("/")[0]
+
+
+def canary_nonce(run_id: str) -> str:
+    """The live canary nonce of a run: the first 12 hex of ``sha256(run_id)``.
+
+    Deriving it from the run id makes it a content-hash id (D11) that no
+    resolver could have cached before the run existed.
+    """
+    return sha256_bytes(run_id.encode("utf-8"))[:12]
+
+
+def canary_doi(prefix: str, nonce: str) -> str:
+    """The canary DOI for ``prefix``; it must not resolve anywhere."""
+    if not _NONCE.fullmatch(nonce):
+        raise ValueError(f"a canary nonce is 12 lowercase hex characters, got {nonce!r}")
+    doi = f"{prefix}/{CANARY_LABEL}{nonce}"
+    if not _CANARY_DOI.fullmatch(doi):
+        raise ValueError(f"{prefix!r} is not a DOI prefix (10.<registrant>)")
+    return doi
+
+
+def is_canary_doi(doi: str) -> bool:
+    """True when ``doi`` (in comparison form) has the canary shape."""
+    return _CANARY_DOI.fullmatch(doi) is not None
+
+
+def state_for_handle_code(code: int) -> ResolverState:
+    """What a Handle body ``responseCode`` says on its own (section 17.14).
+
+    1 is DOI_RESOLVED; 100 (handle not found) and 200 (values not found) are
+    DOI_NOT_RESOLVED_AT_CAPTURE, so a "values not found" answer behind HTTP
+    200 can never read as resolved; anything else is no answer at all.
+    """
+    if code == HANDLE_RESOLVED:
+        return ResolverState.DOI_RESOLVED
+    if code in (HANDLE_NOT_FOUND, HANDLE_VALUES_NOT_FOUND):
+        return ResolverState.DOI_NOT_RESOLVED_AT_CAPTURE
+    return ResolverState.SOURCE_UNAVAILABLE
 
 
 def is_sha256(value: Any) -> bool:
@@ -234,7 +307,8 @@ def parse_work(value: Any, where: str, *, extra_keys: Iterable[str] = ()) -> Wor
     )
 
 
-def _is_utc(value: Any) -> bool:
+def is_utc(value: Any) -> bool:
+    """True for ISO-8601 UTC with a ``Z`` suffix, exactly as the clock module parses it."""
     try:
         parse_utc(value)
     except ClockError:
@@ -247,7 +321,7 @@ def _is_text(value: Any) -> bool:
 
 
 _PROVENANCE_CHECKS: Mapping[str, Callable[[Any], bool]] = {
-    "retrieved_at": _is_utc,
+    "retrieved_at": is_utc,
     "request_url_or_query": _is_text,
     "response_sha256": is_sha256,
     "resolver_identity": _is_text,
@@ -277,6 +351,8 @@ class Resolution:
     ``provenance`` always lists all six fields, with None where one is absent,
     so a reader sees exactly what an answer could and could not vouch for.
     ``body`` is the response text, kept only when redistribution is allowed.
+    ``handle_response_code`` is the Handle body code when the answer carried
+    one; when present, it alone decided the state.
     """
 
     doi: str
@@ -287,6 +363,7 @@ class Resolution:
     http_status: int | None = None
     diagnostics: tuple[str, ...] = ()
     body: str | None = None
+    handle_response_code: int | None = None
 
     def __post_init__(self) -> None:
         referenced = self.state in (ResolverState.DOI_RESOLVED, ResolverState.DOI_TARGET_MISMATCH)
@@ -302,9 +379,56 @@ class Resolution:
             "source": self.source,
             "returned_doi": None if self.work is None else self.work.doi,
             "http_status": self.http_status,
+            "handle_response_code": self.handle_response_code,
             "provenance": {name: self.provenance.get(name) for name in PROVENANCE_FIELDS},
             "diagnostics": list(self.diagnostics),
         }
         if self.body is not None:
             document["body"] = self.body
         return document
+
+
+@dataclass(frozen=True)
+class CanaryCheck:
+    """One negative control for one DOI prefix: a DOI that must not resolve (extension #8).
+
+    ``source`` says which resolver was asked: ``frozen`` (a record captured
+    with the frozen set), ``live`` (asked during this run) or ``none`` (no
+    canary could be asked, for example because the frozen set holds none).
+    ``holds`` is true only for a definite "does not exist": a usable answer
+    in state DOI_NOT_RESOLVED_AT_CAPTURE with Handle body code 100.
+    :attr:`resolved` is a proven miss: the resolver reached something for a
+    DOI that cannot exist, so none of its answers under the prefix can be
+    trusted. A canary can be neither (missing, unusable, or answering
+    "values not found"), which leaves coverage unknown rather than proven.
+    """
+
+    prefix: str
+    source: str
+    doi: str | None
+    state: ResolverState
+    handle_response_code: int | None
+    holds: bool
+    detail: str
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.source not in (SOURCE_FROZEN, SOURCE_LIVE, SOURCE_NONE):
+            raise ValueError(f"unknown canary source {self.source!r}")
+        if self.holds and self.state is not ResolverState.DOI_NOT_RESOLVED_AT_CAPTURE:
+            raise ValueError(f"a canary in state {self.state.value} cannot hold")
+
+    @property
+    def resolved(self) -> bool:
+        return self.state in (ResolverState.DOI_RESOLVED, ResolverState.DOI_TARGET_MISMATCH)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doi": self.doi,
+            "state": self.state.value,
+            "handle_response_code": self.handle_response_code,
+            "holds": self.holds,
+            "source": self.source,
+            "detail": self.detail,
+            "provenance": {name: self.provenance.get(name) for name in PROVENANCE_FIELDS},
+        }

@@ -1,10 +1,16 @@
-"""Tests for the three citation layers and the resolver adapters (ARCHITECTURE.md section 9).
+"""Tests for the three citation layers and the resolver adapters (ARCHITECTURE.md sections 9 and 17).
 
 Everything here is synthetic: invented titles and author names, DOIs under
 the 10.5555 test prefix, and resolver URLs under the reserved ``.invalid``
 domain. No test touches the network. Live lookups go through injected
 openers, and the fixture tests also make every socket connection fail, so an
 accidental network call would fail loudly instead of quietly succeeding.
+
+Section 17.14 changed two 0.1.0 behaviours these tests pin: every frozen set
+that is expected to PASS now carries a canary record for its prefix, and a
+live positive answer is followed by one live canary lookup (Handle API).
+The negative controls themselves are tested in ``test_resolver_controls.py``
+and editorial status in ``test_editorial_status.py``.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from unittest import mock
 from _helpers import FIXED_TIME, REPO_ROOT, SRC_DIR, TempDirTestCase
 
 from science_gate._canonical import sha256_bytes, strict_loads
+from science_gate.adapters import doi_handle as handle_adapter
 from science_gate.adapters import frozen as frozen_adapter
 from science_gate.adapters import live as live_adapter
 from science_gate.adapters.frozen import FROZEN_KEYS, FROZEN_SCHEMA, OUTCOMES, RECORD_KEYS, parse_frozen
@@ -34,6 +41,9 @@ from science_gate.adapters.records import (
     WORK_KEYS,
     RecordFormatError,
     Resolution,
+    canary_doi,
+    canary_nonce,
+    is_canary_doi,
     normalize_doi,
     parse_work,
     provenance_problems,
@@ -51,34 +61,52 @@ from science_gate.citations import (
     LOG_SCHEMA,
     VERIFIER_KEYS,
     Defect,
+    check_metadata,
+    check_verification_log,
+    falsify_metadata,
+    falsify_verification_log,
     normalize_text,
 )
-from science_gate.manifests import IDENTIFIER_PATTERN
+from science_gate.discovery import discover
+from science_gate.manifests import IDENTIFIER_PATTERN, CheckSpec, load_manifest
 from science_gate.models import (
+    SKIP_JUSTIFICATION_KEY,
     ExecutionState,
     FailureMode,
     MetadataState,
     Reason,
     ResolverState,
+    SkipJustification,
     Status,
 )
 from science_gate.receipts import HMAC_KEY_FILE_ENV
-from science_gate.verifier import NetworkPolicy, VerificationRun, verify
+from science_gate.verifier import REGISTRY, CheckContext, NetworkPolicy, VerificationRun, verify
 
 FIXTURES = REPO_ROOT / "fixtures" / "citations"
-FIXTURE_NAMES = (
+#: Trees with the three citation layers (and a frozen set and a log).
+RESOLVER_FIXTURES = (
     "all-good",
+    "canary-missing",
+    "canary-resolved",
     "conflated-entry",
+    "handle-values-not-found",
+    "impossible-timeline",
     "missing-from-frozen",
     "narrated-log",
     "nonexistent-doi",
     "target-mismatch",
     "wrong-author",
 )
+#: Trees with the editorial-status check over a synthetic channel-snapshot input.
+EDITORIAL_FIXTURES = ("editorial-retracted", "editorial-scoped")
+FIXTURE_NAMES = tuple(sorted(RESOLVER_FIXTURES + EDITORIAL_FIXTURES))
 CITATION_KINDS = ("verification_log", "citation_resolver", "citation_metadata")
 CAPTURED_AT = "2026-02-14T09:00:00Z"
 OBSERVATIONS = "observation_id,site,reading\nOBS-0001,Site-Alpha,4.20\nOBS-0002,Site-Beta,3.75\n"
 DIGEST = "ab" * 32
+PREFIX = "10.5555"
+#: The nonce of the synthetic frozen canary; any 12 lowercase hex characters will do.
+FROZEN_NONCE = "0123456789ab"
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +187,25 @@ def entries_document(*items: dict[str, Any]) -> dict[str, Any]:
     return {"schema": ENTRIES_SCHEMA, "citations": list(items)}
 
 
-def frozen_document(*records: dict[str, Any]) -> dict[str, Any]:
-    return {"schema": FROZEN_SCHEMA, "records": list(records)}
+def canary_record(prefix: str = PREFIX, nonce: str = FROZEN_NONCE, **changes: Any) -> dict[str, Any]:
+    """A frozen canary that holds: captured NOT_FOUND with Handle body code 100 (section 17.14)."""
+    doi = canary_doi(prefix, nonce)
+    record = {
+        "doi": doi,
+        "canary": True,
+        "outcome": "NOT_FOUND",
+        "http_status": 404,
+        "handle_response_code": 100,
+        "work": None,
+        **provenance(f"https://resolver.invalid/api/handles/{doi}"),
+    }
+    record.update(changes)
+    return record
+
+
+def frozen_document(*records: dict[str, Any], canary: bool = True) -> dict[str, Any]:
+    """A frozen set holding ``records`` plus, unless ``canary=False``, a holding canary for 10.5555."""
+    return {"schema": FROZEN_SCHEMA, "records": [*records, *([canary_record()] if canary else [])]}
 
 
 def invocation(invocation_id: str, citation_id: str, **changes: Any) -> dict[str, Any]:
@@ -258,8 +303,52 @@ def failing_opener() -> ScriptedOpener:
     return ScriptedOpener(OSError("synthetic: the network is unavailable in tests"))
 
 
+def handle_error(request: Any, code: int, body: dict[str, Any]) -> urllib.error.HTTPError:
+    """What the Handle proxy raises through urllib: an HTTP error that still carries a JSON body."""
+    return urllib.error.HTTPError(request.full_url, code, "synthetic", {}, io.BytesIO(json.dumps(body).encode()))
+
+
+def honest_handles(metadata: bytes) -> Callable[[Any], Any]:
+    """An honest resolver: ``metadata`` for cited DOIs, and "does not exist" for any canary DOI.
+
+    The Handle API answers body code 100 behind HTTP 404, and content
+    negotiation answers a canary with a plain 404, as the live canary
+    requires of both halves.
+    """
+
+    def answer(request: Any) -> Any:
+        if request.full_url.startswith(handle_adapter.HANDLE_API_URL):
+            raise handle_error(request, 404, {"responseCode": 100})
+        if "science-gate-canary-" in request.full_url:
+            raise handle_error(request, 404, {})
+        return FakeResponse(metadata)
+
+    return answer
+
+
 def live_policy(opener: Any) -> NetworkPolicy:
     return NetworkPolicy(live=True, opener=opener)
+
+
+#: The run id bound to contexts built directly by tests (a content-hash-shaped id, never random).
+RUN_ID = "run-0123456789abcdef"
+
+
+def context_for(
+    manifest_path: Path, *, network: NetworkPolicy | None = None, run_id: str | None = RUN_ID
+) -> tuple[CheckContext, dict[str, CheckSpec]]:
+    """A check context built the way ``verify`` builds one: discovered inputs, preloaded documents, a run id.
+
+    Lets a test call a check, or a falsifier generator and the engine's
+    overlay, directly. Each call loads a fresh manifest, so it is a fresh run.
+    """
+    manifest = load_manifest(manifest_path, registered_kinds=REGISTRY)
+    _, opened = discover(manifest)
+    ctx = CheckContext(manifest, opened, network or NetworkPolicy())
+    ctx.preload(spec.kind for spec in manifest.checks)
+    if run_id is not None:
+        ctx.bind_run_id(run_id)
+    return ctx, {spec.check_id: spec for spec in manifest.checks}
 
 
 def block_sockets(test: unittest.TestCase) -> None:
@@ -450,7 +539,7 @@ class FrozenAdapterTests(unittest.TestCase):
             not_found(WORK_C["doi"]),
         )
         works = parse_frozen(records).resolved_works()
-        self.assertEqual([item.doi for item in works], [WORK_D["doi"]])
+        self.assertEqual([item.doi for item in works], [WORK_D["doi"]], "the canary record is never a reference")
         self.assertEqual(works[0].title, "Direct capture of the redirect target")
 
 
@@ -787,17 +876,24 @@ class VerificationLogTests(CitationProjectCase):
         self.assertEqual(result.evidence["coverage"]["state"], "UNAVAILABLE")
 
     def test_nothing_to_examine_is_never_pass(self) -> None:
+        not_applicable, skipped = ExecutionState.NOT_APPLICABLE, ExecutionState.SKIPPED
         cases = {
-            "undeclared": (None, ExecutionState.NOT_APPLICABLE, Reason.OUT_OF_SCOPE),
-            "empty log": (log_document([], []), ExecutionState.NOT_APPLICABLE, Reason.INSUFFICIENT_EVIDENCE),
-            "empty file": ("", ExecutionState.SKIPPED, Reason.INSUFFICIENT_EVIDENCE),
-            "broken JSON": ("{broken", ExecutionState.SKIPPED, Reason.PROTOCOL_BROKEN),
+            "undeclared": (None, not_applicable, Reason.OUT_OF_SCOPE, SkipJustification.NOT_DECLARED),
+            "empty log": (
+                log_document([], []),
+                not_applicable,
+                Reason.INSUFFICIENT_EVIDENCE,
+                SkipJustification.EMPTY_POPULATION,
+            ),
+            "empty file": ("", skipped, Reason.INSUFFICIENT_EVIDENCE, SkipJustification.INPUT_UNAVAILABLE),
+            "broken JSON": ("{broken", skipped, Reason.PROTOCOL_BROKEN, SkipJustification.EVIDENCE_MALFORMED),
         }
-        for label, (log, state, reason) in cases.items():
+        for label, (log, state, reason, justification) in cases.items():
             with self.subTest(case=label):
                 run, result = self.run_log(log)
                 outcome = (result.execution_state, result.verdict, result.reason)
                 self.assertEqual(outcome, (state, Status.ABSTAIN, reason))
+                self.assertEqual(result.evidence[SKIP_JUSTIFICATION_KEY], justification.value)
                 self.assertNotEqual(run.status, Status.PASS)
 
     def test_malformed_logs_are_protocol_broken(self) -> None:
@@ -819,6 +915,7 @@ class VerificationLogTests(CitationProjectCase):
                 outcome = (result.execution_state, result.reason)
                 self.assertEqual(outcome, (ExecutionState.SKIPPED, Reason.PROTOCOL_BROKEN))
                 self.assertIn("MALFORMED_DOCUMENT", result.diagnostics[0])
+                self.assertEqual(result.evidence[SKIP_JUSTIFICATION_KEY], "EVIDENCE_MALFORMED")
 
 
 class ResolverTests(CitationProjectCase):
@@ -878,24 +975,30 @@ class ResolverTests(CitationProjectCase):
         self.assertEqual(result.rows_examined, 2)
 
     def test_citation_documents_that_cannot_be_used(self) -> None:
-        skipped, broken = ExecutionState.SKIPPED, Reason.PROTOCOL_BROKEN
+        skipped, broken, malformed = ExecutionState.SKIPPED, Reason.PROTOCOL_BROKEN, "EVIDENCE_MALFORMED"
         cases = {
-            "undeclared": (None, ExecutionState.NOT_APPLICABLE, Reason.OUT_OF_SCOPE),
-            "no citations": (entries_document(), ExecutionState.NOT_APPLICABLE, Reason.INSUFFICIENT_EVIDENCE),
-            "invalid DOI": (entries_document(cite("C1", WORK_A, doi="10.5555")), skipped, broken),
-            "duplicate id": (entries_document(cite("C1", WORK_A), cite("C1", WORK_B)), skipped, broken),
-            "bad id": (entries_document(cite("C 1", WORK_A)), skipped, broken),
-            "empty file": ("", ExecutionState.SKIPPED, Reason.INSUFFICIENT_EVIDENCE),
+            "undeclared": (None, ExecutionState.NOT_APPLICABLE, Reason.OUT_OF_SCOPE, "NOT_DECLARED"),
+            "no citations": (
+                entries_document(),
+                ExecutionState.NOT_APPLICABLE,
+                Reason.INSUFFICIENT_EVIDENCE,
+                "EMPTY_POPULATION",
+            ),
+            "invalid DOI": (entries_document(cite("C1", WORK_A, doi="10.5555")), skipped, broken, malformed),
+            "duplicate id": (entries_document(cite("C1", WORK_A), cite("C1", WORK_B)), skipped, broken, malformed),
+            "bad id": (entries_document(cite("C 1", WORK_A)), skipped, broken, malformed),
+            "empty file": ("", ExecutionState.SKIPPED, Reason.INSUFFICIENT_EVIDENCE, "INPUT_UNAVAILABLE"),
         }
-        for label, (cited, state, reason) in cases.items():
+        for label, (cited, state, reason, justification) in cases.items():
             with self.subTest(case=label):
                 _, result = self.run_resolver(cited=cited)
                 outcome = (result.execution_state, result.verdict, result.reason)
                 self.assertEqual(outcome, (state, Status.ABSTAIN, reason))
+                self.assertEqual(result.evidence[SKIP_JUSTIFICATION_KEY], justification)
 
 
 def partial_frozen() -> dict[str, Any]:
-    """A frozen set that captured the first two citations but not the third."""
+    """A frozen set that captured the first two citations (and the prefix's canary) but not the third."""
     return frozen_document(found(WORK_A["doi"]), found(WORK_B["doi"]))
 
 
@@ -934,17 +1037,30 @@ class LiveResolutionTests(CitationProjectCase):
             csl(WORK_C["doi"], title=WORK_C["title"], author=[{"family": "Deltatest", "given": "Dee"}],
                 issued={"date-parts": [[2030]]}, **{"container-title": WORK_C["journal"], "volume": "7", "issue": "2"})
         ).encode("utf-8")
-        opener = ScriptedOpener(FakeResponse(body))
+        opener = ScriptedOpener(honest_handles(body))
         run = self.run_project(frozen=partial_frozen(), live=True, opener=opener)
         self.assertEqual(run.status, Status.PASS, [item.detail for item in run.findings])
-        resolution = self.check(run, "citation_resolver").evidence["resolutions"][2]
+        resolver = self.check(run, "citation_resolver")
+        resolution = resolver.evidence["resolutions"][2]
         self.assertEqual((resolution["source"], resolution["provenance"]["live_refresh_performed"]), ("live", True))
         self.assertNotIn("body", resolution, "redistribution is not allowed by default")
         self.assertEqual(self.check(run, "citation_metadata").evidence["citations"][2]["reference"]["source"], "live")
+        # The live positive was vouched for by one live canary derived from the run id (section 17.14),
+        # asked once for the whole run, falsifier overlays included.
+        canary = canary_doi(PREFIX, canary_nonce(run.result.run_id))
+        self.assertEqual(
+            [request.full_url for request, _ in opener.calls],
+            [live_adapter.request_url(WORK_C["doi"]), handle_adapter.request_url(canary),
+             live_adapter.request_url(canary)],
+        )
+        live_canary = resolver.evidence["live_canaries"][PREFIX]
+        self.assertEqual((live_canary["doi"], live_canary["holds"], live_canary["handle_response_code"]),
+                         (canary, True, 100))
+        self.assertTrue(resolver.evidence["canaries"][PREFIX]["holds"], "the capture's own canary vouches for it")
 
     def test_the_body_is_recorded_only_when_redistribution_is_allowed(self) -> None:
         body = json.dumps(csl(WORK_C["doi"])).encode("utf-8")
-        run = self.run_project(frozen=partial_frozen(), live=True, opener=ScriptedOpener(FakeResponse(body)),
+        run = self.run_project(frozen=partial_frozen(), live=True, opener=ScriptedOpener(honest_handles(body)),
                                permissions={"redistribution_allowed": True})
         resolution = self.check(run, "citation_resolver").evidence["resolutions"][2]
         self.assertEqual(resolution["body"], body.decode("utf-8"))
@@ -1111,10 +1227,18 @@ class FixtureTests(TempDirTestCase):
 
     def assert_details(self, run: VerificationRun, expected: dict[str, Any]) -> None:
         checks = {item.kind: item for item in run.result.checks}
-        metadata = {item["citation_id"]: item for item in checks["citation_metadata"].evidence.get("citations", [])}
-        states = {item["doi"]: item["state"] for item in checks["citation_resolver"].evidence.get("resolutions", [])}
+
+        def evidence(kind: str) -> dict[str, Any]:
+            return dict(checks[kind].evidence) if kind in checks else {}
+
+        metadata = {item["citation_id"]: item for item in evidence("citation_metadata").get("citations", [])}
+        resolver = evidence("citation_resolver")
+        states = {item["doi"]: item["state"] for item in resolver.get("resolutions", [])}
         for doi, state in expected.get("resolver_states", {}).items():
             self.assertEqual(states[doi], state)
+        for prefix, expected_canary in expected.get("canaries", {}).items():
+            recorded = resolver["canaries"][prefix]
+            self.assertEqual({key: recorded[key] for key in expected_canary}, expected_canary)
         for citation_id, disposition in expected.get("dispositions", {}).items():
             self.assertEqual(metadata[citation_id]["primary_disposition"], disposition)
         for citation_id, defects in expected.get("defects", {}).items():
@@ -1122,6 +1246,18 @@ class FixtureTests(TempDirTestCase):
         for citation_id, dois in expected.get("replacement_candidates", {}).items():
             self.assertEqual([item["doi"] for item in metadata[citation_id]["replacement_candidates"]], dois)
             self.assertIsNone(metadata[citation_id]["reference"])
+        if "impossible_timelines" in expected:
+            impossible = evidence("verification_log")["timeline"]["impossible"]
+            fields = ("citation_id", "doi", "retrieved_at", "registered_at")
+            self.assertEqual([{key: item[key] for key in fields} for item in impossible],
+                             expected["impossible_timelines"])
+        editorial = evidence("editorial_status")
+        for doi, status in expected.get("editorial_statuses", {}).items():
+            self.assertEqual({item["doi"]: item["status"] for item in editorial["dois"]}[doi], status)
+        if "ignored_sources" in expected:
+            self.assertEqual(editorial["ignored_sources"], expected["ignored_sources"])
+        for status, count in expected.get("status_counts", {}).items():
+            self.assertEqual(editorial["status_counts"][status], count)
 
     def test_wrong_author_and_nonexistent_doi_work_offline(self) -> None:
         wrong = self.verify_fixture("wrong-author", live=False)
@@ -1150,7 +1286,7 @@ class FixtureTests(TempDirTestCase):
         self.assertEqual(len(opener.calls), 1)
 
     def test_every_fixture_has_one_primary_disposition_per_citation(self) -> None:
-        for name in FIXTURE_NAMES:
+        for name in RESOLVER_FIXTURES:
             with self.subTest(fixture=name):
                 metadata = {item.kind: item for item in self.verify_fixture(name).result.checks}["citation_metadata"]
                 cited = strict_loads((FIXTURES / name / "citations" / "entries.json").read_bytes())["citations"]
@@ -1159,13 +1295,19 @@ class FixtureTests(TempDirTestCase):
                     self.assertIn(item["primary_disposition"], DISPOSITIONS)
 
     def test_fixtures_are_synthetic_and_internally_consistent(self) -> None:
-        for name in FIXTURE_NAMES:
+        for name in RESOLVER_FIXTURES:
             with self.subTest(fixture=name):
                 root = FIXTURES / name
                 cited = strict_loads((root / "citations" / "entries.json").read_bytes())["citations"]
                 records = strict_loads((root / "citations" / "frozen.json").read_bytes())["records"]
                 log = strict_loads((root / "citations" / "verification-log.json").read_bytes())
-                for doi in [item["doi"] for item in cited] + [item["doi"] for item in records]:
+                canaries = [record for record in records if record.get("canary")]
+                expected_canaries = 0 if name == "canary-missing" else 1
+                self.assertEqual(len(canaries), expected_canaries, "one canary for 10.5555, unless it is the defect")
+                for record in canaries:
+                    self.assertTrue(is_canary_doi(record["doi"]) and record["doi"].startswith("10.5555/"))
+                works = [record for record in records if not record.get("canary")]
+                for doi in [item["doi"] for item in cited] + [item["doi"] for item in works]:
                     self.assertTrue(doi.startswith("10.5555/sgate.fx."), doi)
                 for record in records:
                     self.assertTrue(record["request_url_or_query"].startswith("https://resolver.invalid/"))
@@ -1176,10 +1318,78 @@ class FixtureTests(TempDirTestCase):
                     if doi in captured:
                         self.assertEqual(item["response_sha256"], captured[doi], item["invocation_id"])
 
+    def test_editorial_fixtures_are_synthetic(self) -> None:
+        """No Retraction Watch (or any other real) rows are shipped: DOIs are 10.5555 and digests are invented."""
+        for name in EDITORIAL_FIXTURES:
+            with self.subTest(fixture=name):
+                root = FIXTURES / name
+                snapshots = strict_loads((root / "editorial" / "snapshots.json").read_bytes())
+                for snapshot in snapshots:
+                    for doi in snapshot["consulted_dois"] + [notice["doi"] for notice in snapshot["notices"]]:
+                        self.assertTrue(doi.startswith("10.5555/sgate.fx."), doi)
+                    for notice in snapshot["notices"]:
+                        self.assertRegex(notice["notice_id"], r"^(RW|OA)-(SYN|FLAG)-\d{4}$")
+
     def find(self, run: VerificationRun, kind: str, citation_id: str) -> dict[str, Any]:
         result = {item.kind: item for item in run.result.checks}[kind]
         (item,) = [entry for entry in result.evidence["citations"] if entry["citation_id"] == citation_id]
         return item
+
+
+class FalsifierGeneratorTests(TempDirTestCase):
+    """The known-bad cases of the log and metadata layers (section 17.5), replayed through the engine's overlay.
+
+    The resolver's case is tested in ``test_resolver_controls.py`` and the
+    editorial one in ``test_editorial_status.py``.
+    """
+
+    MANIFEST = FIXTURES / "all-good" / "manifest.json"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixed_clock()
+        block_sockets(self)
+        run = verify(self.MANIFEST, network=NetworkPolicy(opener=failing_opener()))
+        self.results = {item.check_id: item for item in run.result.checks}
+        self.ctx, self.specs = context_for(self.MANIFEST)
+
+    def test_every_citation_pass_in_a_real_run_is_witnessed(self) -> None:
+        for check_id in ("citation-log", "doi-resolution", "citation-metadata"):
+            with self.subTest(check=check_id):
+                result = self.results[check_id]
+                self.assertEqual((result.verdict, result.evidence["falsification"]), (Status.PASS, "WITNESSED"))
+                self.assertEqual([item["outcome"] for item in result.evidence["falsifiers"]], ["REJECTED"])
+
+    def test_the_log_case_drops_every_invocation_of_the_first_verified_entry(self) -> None:
+        spec = self.specs["citation-log"]
+        (case,) = falsify_verification_log(self.ctx, spec, self.results["citation-log"])
+        self.assertEqual((case.case_id, case.expected_verdict, case.expected_reason),
+                         ("drop-backing-invocations", Status.ABSTAIN, Reason.UNVERIFIED))
+        log = strict_loads(case.documents["citations/verification-log.json"])
+        self.assertEqual(sorted(item["citation_id"] for item in log["invocations"]), ["C2", "C3"])
+        self.assertEqual(log["claimed_verified"], 3, "the claim is kept; only its backing is gone")
+        rejected = check_verification_log(self.ctx.overlay(case), spec)
+        self.assertEqual((rejected.verdict, rejected.reason), (Status.ABSTAIN, Reason.UNVERIFIED))
+        self.assertIn(FailureMode.NARRATED_VERIFICATION, rejected.failure_modes)
+
+    def test_the_metadata_case_renames_the_first_author_of_the_first_citation(self) -> None:
+        spec = self.specs["citation-metadata"]
+        (case,) = falsify_metadata(self.ctx, spec, self.results["citation-metadata"])
+        self.assertEqual((case.case_id, case.expected_verdict, case.expected_reason),
+                         ("replace-first-author", Status.FAIL, Reason.SOURCE_MISMATCH))
+        entries = strict_loads(case.documents["citations/entries.json"])
+        self.assertEqual(entries["citations"][0]["authors"][0]["family"], "Alphatest-falsified")
+        self.assertEqual(entries["citations"][1:], strict_loads(
+            (FIXTURES / "all-good" / "citations" / "entries.json").read_bytes())["citations"][1:])
+        rejected = check_metadata(self.ctx.overlay(case), spec)
+        self.assertEqual((rejected.verdict, rejected.reason), (Status.FAIL, Reason.SOURCE_MISMATCH))
+
+    def test_generators_find_no_case_where_none_exists(self) -> None:
+        ctx, specs = context_for(FIXTURES / "narrated-log" / "manifest.json")
+        log = verify(FIXTURES / "narrated-log" / "manifest.json", network=NetworkPolicy(opener=failing_opener()))
+        (result,) = [item for item in log.result.checks if item.check_id == "citation-log"]
+        self.assertEqual(falsify_verification_log(ctx, specs["citation-log"], result), (),
+                         "eight claims and no invocation: nothing backs a claim, so nothing can be removed")
 
 
 class DeterminismTests(TempDirTestCase):

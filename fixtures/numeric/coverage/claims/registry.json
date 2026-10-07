@@ -1,0 +1,45 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "N-SCORE",
+      "statement": "Mean synthetic score",
+      "value": "6.27",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/scores.json",
+        "sha256": "e1e15f8c107f73ca325ecf0571ac1416715e2e3c893056436b6fdf6096eb3e0c",
+        "selector": "/mean_score"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    },
+    {
+      "claim_id": "N-P",
+      "statement": "Synthetic p threshold",
+      "value": "0.05",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/scores.json",
+        "sha256": "e1e15f8c107f73ca325ecf0571ac1416715e2e3c893056436b6fdf6096eb3e0c",
+        "selector": "/threshold"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 7"
+    }
+  ]
+}

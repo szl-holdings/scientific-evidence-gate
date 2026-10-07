@@ -36,7 +36,8 @@ from _helpers import FIXED_TIME, REPO_ROOT, SRC_DIR
 from science_gate import _html
 from science_gate._html import NO_SENSITIVITY_SENTENCE, VALIDITY_LABEL, render
 from science_gate.cli import scaffold_project
-from science_gate.mutations import mutate
+from science_gate.invariants import INVARIANT_NAMES
+from science_gate.mutations import OPERATOR_IDS, mutate
 from science_gate.receipts import build_run_receipt
 from science_gate.reports import REPORT_HTML, REPORT_MD, RUN_JSON, report_run_dir, run_document, write_run
 from science_gate.verifier import VerificationRun, verify
@@ -657,8 +658,9 @@ class LatticeTests(unittest.TestCase):
 class InvariantRingTests(unittest.TestCase):
     def test_one_segment_per_invariant(self) -> None:
         ring = svg_of(page_source("pass"), "invariants")
-        self.assertEqual(ring.count("<title>"), 10)  # one tooltip per segment; the figure's own title has an id
-        self.assertIn(">10 of 10<", ring)
+        total = len(INVARIANT_NAMES)
+        self.assertEqual(ring.count("<title>"), total)  # one tooltip per segment; the figure's own title has an id
+        self.assertIn(f">{total} of {total}<", ring)
 
     def test_the_list_shows_the_numbers_the_ring_refers_to(self) -> None:
         """A grid list item loses its marker, so the numbers are written out and must match the ring's labels."""
@@ -666,21 +668,24 @@ class InvariantRingTests(unittest.TestCase):
         start = source.index('<ol class="invariant-list"')
         listing = source[start : source.index("</ol>", start)]
         written = re.findall(r'<li value="(\d+)"><span class="inv-num" aria-hidden="true">(\d+)</span>', listing)
-        self.assertEqual(written, [(str(n), str(n)) for n in range(1, 11)])
+        self.assertEqual(written, [(str(n), str(n)) for n in range(1, len(INVARIANT_NAMES) + 1)])
         labels = re.findall(r'text-anchor="middle">(\d+)</text>', svg_of(source, "invariants"))
-        self.assertEqual(sorted(labels, key=int), [str(n) for n in range(1, 11)])
+        self.assertEqual(sorted(labels, key=int), [str(n) for n in range(1, len(INVARIANT_NAMES) + 1)])
         listed = Page(source).text("data-equivalent-of=invariants")
-        self.assertIn(f"1 {_html._GLYPH_TEXT['check']} HOLDS checked_claims_le_invocations", listed)
+        # Rows follow the document's order, so the number is the invariant's position in run.json.
+        number = [item["name"] for item in DOCS["pass"]["invariants"]].index("checked_claims_le_invocations") + 1
+        self.assertIn(f"{number} {_html._GLYPH_TEXT['check']} HOLDS checked_claims_le_invocations", listed)
 
     def test_contract_invariants_missing_from_the_document_are_listed(self) -> None:
         document = doc()
         document["invariants"] = document["invariants"][:3]
         rows = _html._invariant_rows(document)
-        self.assertEqual(len(rows), 10)
-        self.assertEqual(sum(1 for row in rows if row.state == "NOT_RECORDED"), 7)
+        missing = len(INVARIANT_NAMES) - 3
+        self.assertEqual(len(rows), len(INVARIANT_NAMES))
+        self.assertEqual(sum(1 for row in rows if row.state == "NOT_RECORDED"), missing)
         page = Page(render(document))
-        self.assertEqual(page.text("data-equivalent-of=invariants").count("NOT_RECORDED"), 7)
-        self.assertIn("7 not recorded", svg_of(page.source, "invariants"))
+        self.assertEqual(page.text("data-equivalent-of=invariants").count("NOT_RECORDED"), missing)
+        self.assertIn(f"{missing} not recorded", svg_of(page.source, "invariants"))
 
     def test_a_violated_invariant_is_shown_violated(self) -> None:
         document = doc()
@@ -701,7 +706,12 @@ class LedgerChainTests(unittest.TestCase):
     def test_invocation_starts_sit_where_the_ledger_started_them(self) -> None:
         """Requirements 21 and 22: each verdict is placed on the chain at its own STARTED entry."""
         entries = RUNS["pass"].ledger.entries
-        started = {entry["invocation_id"]: entry["seq"] for entry in entries if entry["result"] == "STARTED"}
+        # Controls (falsifiers, the canary pair, the comparator) are invocations with no check result to place.
+        started = {
+            entry["invocation_id"]: entry["seq"]
+            for entry in entries
+            if entry["result"] == "STARTED" and not entry["check_id"].startswith("control:")
+        }
         view = _html._ledger_view(doc())
         placed = {check["invocation_id"]: seq for seq, checks in view.starts.items() for check in checks}
         self.assertEqual(placed, started)
@@ -804,6 +814,33 @@ class MutationConstellationTests(unittest.TestCase):
         table = Page(source).text("data-equivalent-of=mutations")
         self.assertEqual(table.count("it is not counted as a detection"), 2)
 
+    def test_report_v2_statuses_that_never_executed_are_neither_skipped_nor_detected(self) -> None:
+        """A v2 record (17.12) that was never executed is its own group: not SKIPPED, never a detection."""
+        records = detected_records()
+        for mutation_id, status in (
+            ("M07_changed_source_hash", "NOT_ACTIVATED"),
+            ("M11_changed_numeric_formatting", "CANONICALLY_EQUIVALENT"),
+            ("M12_timezone_shift", "NOOP_MUTATION"),
+            ("M14_pass_summary_without_evidence", "DUPLICATE_MUTANT"),
+        ):
+            records.append(dict(mutation_record(mutation_id, state="SKIPPED", detected=None), status=status))
+        records.append(dict(mutation_record("M04_duplicate_row", state="SKIPPED", detected=None), status="SKIPPED"))
+        crashed = dict(mutation_record("M10_changed_numeric_value", detected=False), status="VERIFIER_ERROR")
+        crashed["blind_spot"] = False
+        records.append(crashed)
+        report = mutation_report(
+            records, executed_mutations=4, detected_mutations=2, escaped_mutations=2, skipped_mutations=1
+        )
+        view = _html._mutation_view(report)
+        self.assertEqual(len(view.group("NOT_EXECUTED")), 4)
+        self.assertEqual(view.tallies["skipped_mutations"], 1, "only status SKIPPED counts as skipped")
+        self.assertEqual(view.tallies["detected_mutations"], 2)
+        self.assertEqual(view.discrepancies, ())
+        (error,) = [item for item in view.mutations if item.short == "M10"]
+        self.assertIn("VERIFIER_ERROR", error.note)
+        source = render(DOCS["pass"], report)
+        self.assertIn("NOT EXECUTED \u00b7 5", svg_of(source, "mutations"))
+
     def test_an_invalid_baseline_shows_no_sensitivity_figure(self) -> None:
         """Requirement 26: even a figure and counts carried by the report are withheld."""
         report = mutation_report(
@@ -902,7 +939,8 @@ class MutationEvidenceTests(unittest.TestCase):
             if item.group == "NOT_APPLICABLE":
                 self.assertEqual(item.firing, "NOT EXECUTED", item.mutation_id)
         text = Page(render(DOCS["pass"], report)).text("#mutations")
-        for expected in (report["report_id"], report["message"], "20 of 20 operators selected", "Applicable",
+        selected = f"{len(OPERATOR_IDS)} of {len(OPERATOR_IDS)} operators selected"
+        for expected in (report["report_id"], report["message"], selected, "Applicable",
                          report["sensitivity"]["decimal_rounding"], "What this mutation report does not prove",
                          report["not_proven"][0]):
             self.assertIn(expected, text)
@@ -1208,7 +1246,9 @@ class LargeDocumentTests(unittest.TestCase):
         source = render(document, report)
         self.assertIn("10 more check(s) are listed in the table.", svg_of(source, "lattice"))
         self.assertIn("5 more input(s) are listed in the table.", svg_of(source, "accounting"))
-        self.assertIn("5 more in the list", svg_of(source, "invariants"))
+        # The contract invariants plus 55 synthetic ones, against a ring of _html._MAX_RING_SEGMENTS segments.
+        hidden = len(INVARIANT_NAMES) + 55 - _html._MAX_RING_SEGMENTS
+        self.assertIn(f"{hidden} more in the list", svg_of(source, "invariants"))
         self.assertIn("10 more in the table", svg_of(source, "mutations"))
         page = Page(source)
         self.assertIn("synthetic-check-089", page.text("data-equivalent-of=lattice"))

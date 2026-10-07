@@ -348,17 +348,19 @@ class SyntheticPackageTests(PackageTestCase):
         document = self.index()
         receipt_path = self.out / "expected" / "receipt.json"
         self.assertTrue(verify_receipt(receipt_path).ok)
-        receipt = strict_loads(receipt_path.read_bytes())
+        # The receipt is the bare statement; its content hash lives in the authentication sidecar (17.9).
+        statement = strict_loads(receipt_path.read_bytes())
+        auth = strict_loads((self.out / "expected" / "receipt.auth.json").read_bytes())
         expected = document["expected_results"]
-        self.assertEqual(expected["reproducible"], expected_results_from_predicate(receipt["body"]["predicate"]))
-        self.assertEqual(expected["recorded_run"]["receipt"]["content_sha256"], receipt["content_sha256"])
-        self.assertEqual(expected["recorded_run"]["run_id"], receipt["body"]["predicate"]["run_id"])
+        self.assertEqual(expected["reproducible"], expected_results_from_predicate(statement["predicate"]))
+        self.assertEqual(expected["recorded_run"]["receipt"]["content_sha256"], auth["content_sha256"])
+        self.assertEqual(expected["recorded_run"]["run_id"], statement["predicate"]["run_id"])
         self.assertEqual((expected["reproducible"]["status"], expected["reproducible"]["exit_code"]), ("PASS", 0))
         self.assertEqual(expected["network"]["network_used"], False)
 
     def test_the_index_and_receipt_never_quote_input_content(self) -> None:
         self.package()
-        for relpath in (PACKAGE_JSON, "expected/receipt.json"):
+        for relpath in (PACKAGE_JSON, "expected/receipt.json", "expected/receipt.auth.json"):
             with self.subTest(file=relpath):
                 data = (self.out / relpath).read_bytes()
                 self.assertNotIn(b"SYN-0001", data)

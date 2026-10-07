@@ -1,0 +1,35 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "synthetic-claim-join-all-backed",
+  "inputs": [
+    {
+      "id": "assertions",
+      "path": "assertions/assertions.json",
+      "format": "json",
+      "required": true,
+      "row_key": [
+        "claim_id"
+      ],
+      "expected_rows": 3,
+      "denominator_source": "INDEPENDENT"
+    }
+  ],
+  "checks": [
+    {
+      "id": "agent-claims",
+      "kind": "claim_join",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "assertions"
+      ],
+      "params": {
+        "sealed_run": "sealed-run"
+      }
+    }
+  ],
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}

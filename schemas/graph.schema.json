@@ -78,8 +78,31 @@
           "type": "array",
           "items": {"$ref": "#/$defs/transition"},
           "default": []
+        },
+        "backed_by_checks": {
+          "description": "The checks whose PASS backed this node, as they were when it was recorded. dependency_currency compares each with the current manifest and tool version; a difference, or a check that no longer exists, makes the node and its descendants stale in memory with cause verifier:<check_id> (category VERIFIER). Nothing is written during verify.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/backing_check"},
+          "default": []
         }
       }
+    },
+    "backing_check": {
+      "description": "params_sha256 = sha256_canonical(params), as in the run PLAN (ARCHITECTURE.md 17.4).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "kind", "version", "params_sha256", "tool_version"],
+      "properties": {
+        "check_id": {"$ref": "#/$defs/identifier"},
+        "kind": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "params_sha256": {"$ref": "#/$defs/sha256"},
+        "tool_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "stale_cause": {
+      "description": "Why a node went stale: an upstream artifact changed, or a check that backed it drifted.",
+      "enum": ["UPSTREAM", "VERIFIER"]
     },
     "edge": {
       "description": "[parent, child]: child is derived from parent.",
@@ -101,11 +124,19 @@
         "trigger": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
         "recorded_sha256_before": {"$ref": "#/$defs/optional_sha256"},
         "recorded_sha256_after": {"$ref": "#/$defs/optional_sha256"},
-        "observed_sha256": {"$ref": "#/$defs/optional_sha256"}
+        "observed_sha256": {"$ref": "#/$defs/optional_sha256"},
+        "witness_id": {
+          "description": "The recompute witness that backed (or was refused for) this transition.",
+          "anyOf": [{"type": "string", "pattern": "^wit-[0-9a-f]{16}$"}, {"type": "null"}]
+        },
+        "cause_category": {
+          "description": "Set on transitions into STALE_PENDING_REVALIDATION and on refused cutoffs of a pending node; null elsewhere.",
+          "anyOf": [{"$ref": "#/$defs/stale_cause"}, {"type": "null"}]
+        }
       }
     },
     "state_transition": {
-      "description": "A transition as the tool writes it into graph-state.json: every key present.",
+      "description": "A transition as the tool writes it into graph-state.json. witness_id and cause_category are always written but read as null when absent, so a state saved before they existed stays readable; every other key is present.",
       "allOf": [{"$ref": "#/$defs/transition"}],
       "required": [
         "at",
@@ -147,9 +178,14 @@
               "validity": {"$ref": "#/$defs/validity"},
               "recorded_sha256": {"$ref": "#/$defs/optional_sha256"},
               "stale_because": {
-                "description": "Pending direct parents, plus the node itself when its own file changed or its pending state was declared. Early cutoff clears a node only when this becomes empty.",
+                "description": "Pending direct parents, plus the node itself when its own file changed, its pending state was declared, or a parent was revalidated with a changed digest; plus verifier:<check_id> for a drifted backing check. Early cutoff clears a node only when this becomes empty, and never removes a verifier cause.",
                 "type": "array",
-                "items": {"$ref": "#/$defs/identifier"},
+                "items": {
+                  "anyOf": [
+                    {"$ref": "#/$defs/identifier"},
+                    {"type": "string", "pattern": "^verifier:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+                  ]
+                },
                 "uniqueItems": true
               },
               "history": {"type": "array", "items": {"$ref": "#/$defs/state_transition"}}
@@ -195,7 +231,75 @@
           }
         },
         "impact": {"description": "Present for 'impact': origin and descendants (id, kind, depth, path_from_changed_node, prior_state, state, publication_node)."},
-        "revalidate": {"description": "Present for 'revalidate': outcome (REVALIDATED_UNCHANGED, REVALIDATED_CHANGED, REFUSED_UPSTREAM_PENDING, NO_FILE_TO_HASH, FILE_UNAVAILABLE), digests before and after, cleared and still-pending descendants."}
+        "revalidate": {"description": "Present for 'revalidate': outcome (REVALIDATED_UNCHANGED, REVALIDATED_CHANGED, REFUSED_UPSTREAM_PENDING, REFUSED_VACUOUS_CUTOFF, REFUSED_INVALID_WITNESS, NO_FILE_TO_HASH, FILE_UNAVAILABLE), digests before and after, cleared and still-pending descendants, and a witness block (witness_id, node_id, invocation_id, started_at, completed_at, consulted, problems) or null."}
+      }
+    },
+    "recompute_witness": {
+      "$id": "science-gate-recompute-witness/v1",
+      "description": "Evidence that a derived node was recomputed after its last upstream change (decision D6). It is required to revalidate a node that has a parent as unchanged: started_at strictly after the change, started_at <= completed_at, inputs equal to each stale-causing parent's current recorded digest, and output_sha256 equal to the node's recorded and current digest. witness_id is wit- plus 16 hex of the canonical digest of this document. The invocation_id is not looked up in any ledger.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "node_id", "invocation_id", "started_at", "completed_at", "inputs", "output_sha256"],
+      "properties": {
+        "schema": {"const": "science-gate-recompute-witness/v1"},
+        "node_id": {"$ref": "#/$defs/identifier"},
+        "invocation_id": {"$ref": "#/$defs/identifier"},
+        "started_at": {"$ref": "#/$defs/utc_timestamp"},
+        "completed_at": {"$ref": "#/$defs/utc_timestamp"},
+        "inputs": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {"$ref": "#/$defs/sha256"}
+        },
+        "output_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "what_if_report": {
+      "$id": "science-gate-what-if/v1",
+      "description": "What 'what-if ARTIFACT_ID' prints: the staleness detector mutation-tested in memory. The artifact gets a synthetic digest change. PASS when every declared descendant was marked and the currency assessment would FAIL; FAIL with BLIND_SPOT when one was not; ABSTAIN when nothing was marked or there is no descendant. Nothing is written.",
+      "type": "object",
+      "required": [
+        "what_if_id",
+        "schema",
+        "artifact",
+        "at",
+        "status",
+        "reason",
+        "failure_modes",
+        "execution_state",
+        "findings",
+        "injection",
+        "graph",
+        "state",
+        "descendants",
+        "counts",
+        "assessment",
+        "transitions",
+        "does_not_prove"
+      ],
+      "properties": {
+        "what_if_id": {"type": "string", "pattern": "^wif-[0-9a-f]{16}$"},
+        "schema": {"const": "science-gate-what-if/v1"},
+        "status": {"enum": ["PASS", "FAIL", "ABSTAIN", "ERROR"]},
+        "execution_state": {"enum": ["CHECKED", "NOT_APPLICABLE"]},
+        "injection": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["node", "path", "mode", "recorded_sha256", "injected_sha256"],
+              "properties": {"mode": {"enum": ["digest", "declared_change"]}}
+            },
+            {"type": "null"}
+          ]
+        },
+        "descendants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "kind", "publication_node", "prior_state", "state", "outcome"],
+            "properties": {"outcome": {"enum": ["MARKED", "ALREADY_PENDING", "DECLARED_BY_PERSON", "NOT_MARKED"]}}
+          }
+        }
       }
     }
   }

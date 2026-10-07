@@ -1,0 +1,9 @@
+{
+  "schema": "synthetic-analysis-output/v1",
+  "recipe": "invented mean-by-site recipe",
+  "rows_in": 6,
+  "sites": [
+    "site-alpha",
+    "site-beta"
+  ]
+}

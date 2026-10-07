@@ -1,0 +1,76 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "N-ALPHA",
+      "statement": "Synthetic quantity alpha",
+      "value": "12.35",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/measures.json",
+        "sha256": "34b86c121ca77a82d80478945b3523e7d8683ced9ac82665029486d54c3a1c06",
+        "selector": "/alpha"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    },
+    {
+      "claim_id": "N-BETA",
+      "statement": "Synthetic quantity beta",
+      "value": "10.25",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/measures.json",
+        "sha256": "34b86c121ca77a82d80478945b3523e7d8683ced9ac82665029486d54c3a1c06",
+        "selector": "/beta"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    },
+    {
+      "claim_id": "N-DIFF",
+      "statement": "Difference between synthetic alpha and beta",
+      "value": "2.10",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "must_derive_from": "stored_output",
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf",
+        "formula": "difference",
+        "operands": [
+          "N-ALPHA",
+          "N-BETA"
+        ]
+      },
+      "stored_output": {
+        "path": "outputs/summary-table.csv",
+        "sha256": "a444bf1a1a630d5819e0354636688f5821f3993f9a670b5556c2e47a4f774d77",
+        "selector": {
+          "row": {
+            "quantity": "difference"
+          },
+          "column": "value"
+        }
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 5"
+    }
+  ]
+}

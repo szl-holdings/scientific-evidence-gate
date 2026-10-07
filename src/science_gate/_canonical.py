@@ -10,12 +10,25 @@ module is deliberately strict:
   history-dependent (``0.1 + 0.2``), so a float in hashed content would make a
   hash depend on arithmetic accidents. Non-integer quantities travel as
   ``decimal.Decimal`` and are serialized as decimal strings such as ``"0.125"``.
+* Integers must lie within ``±(2**53 - 1)`` (:data:`MAX_SAFE_INTEGER`). A
+  consumer that reads JSON numbers as IEEE doubles silently rounds anything
+  larger, so a digest computed there would differ from ours while both sides
+  believe they hashed the same document. Larger quantities travel as decimal
+  strings.
 * NaN and infinities are refused in every form, because they have no stable
   JSON representation and usually signal a failed computation.
 * Mapping keys must be strings. ``json`` would silently coerce ``1`` and
   ``"1"`` to the same key, which could merge two distinct facts.
 * Sets are emitted as lists sorted by their canonical encoding, so iteration
   order never leaks into output.
+
+This encoding is **not** RFC 8785 (the JSON Canonicalization Scheme) and must
+never be described as such (decision D8). Keys sort by Unicode code point,
+whereas JCS sorts by UTF-16 code unit, so the two disagree whenever a key holds
+a character above U+FFFF: here a key U+E000 sorts before a key U+1F600, under
+JCS after it. The golden vectors in ``tests/test_canonical_vectors.py`` pin
+that divergence and the exact output bytes, so a change to the digest
+function is itself a test that fails.
 
 The strict loader mirrors these rules on the way in: duplicate keys, NaN and
 Infinity are errors, and JSON numbers with a fraction or exponent are parsed as
@@ -45,11 +58,17 @@ __all__ = [
     "sha256_file",
     "strict_loads",
     "HASH_CHUNK_BYTES",
+    "MAX_SAFE_INTEGER",
 ]
 
 #: Read size for streaming hashes. Large enough to be efficient, small enough
 #: that a multi-gigabyte input never has to fit in memory.
 HASH_CHUNK_BYTES = 1 << 16
+
+#: The largest magnitude an integer in canonical JSON may have (D8): every
+#: integer up to it is exact in an IEEE 754 double, so every JSON reader agrees
+#: on its value.
+MAX_SAFE_INTEGER = 2**53 - 1
 
 
 class CanonicalizationError(ValueError):
@@ -68,8 +87,8 @@ class StrictJSONError(ValueError):
     """Raised by :func:`strict_loads` for any input that is not strict JSON.
 
     ``kind`` is one of ``MALFORMED_JSON``, ``DUPLICATE_KEY``,
-    ``NON_FINITE_NUMBER`` or ``NON_INTEGER_NUMBER`` so callers can report a
-    named diagnostic instead of a traceback.
+    ``NON_FINITE_NUMBER``, ``NON_INTEGER_NUMBER`` or ``INTEGER_OUT_OF_RANGE``
+    so callers can report a named diagnostic instead of a traceback.
     """
 
     def __init__(self, kind: str, message: str, *, line: int | None = None, column: int | None = None) -> None:
@@ -84,13 +103,15 @@ class StrictJSONError(ValueError):
 def normalize(value: Any, _path: str = "$") -> Any:
     """Return a JSON-safe copy of ``value`` that obeys the canonical rules.
 
-    Accepted: ``None``, ``bool``, ``int``, ``str``, finite ``Decimal`` (emitted
-    as its string form), ``Enum`` (emitted as its value), mappings with string
-    keys, lists, tuples, sets, and objects exposing ``to_dict()``.
+    Accepted: ``None``, ``bool``, ``int`` within ``±MAX_SAFE_INTEGER``,
+    ``str``, finite ``Decimal`` (emitted as its string form), ``Enum``
+    (emitted as its value), mappings with string keys, lists, tuples, sets,
+    and objects exposing ``to_dict()``.
 
-    Refused: floats, non-finite decimals, bytes and filesystem paths. Paths are
-    refused because an absolute path would make output differ between
-    machines; callers must pass an explicit relative path string instead.
+    Refused: floats, integers beyond ``±MAX_SAFE_INTEGER``, non-finite
+    decimals, bytes and filesystem paths. Paths are refused because an
+    absolute path would make output differ between machines; callers must
+    pass an explicit relative path string instead.
 
     A ``Decimal`` keeps its own ``str`` form, so ``Decimal("1.50")`` stays
     ``"1.50"`` (printed precision is evidence) and an input such as ``1e999999``
@@ -98,7 +119,13 @@ def normalize(value: Any, _path: str = "$") -> Any:
     """
     if isinstance(value, Enum):
         return normalize(value.value, _path)
-    if value is None or isinstance(value, (bool, int, str)):
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        if abs(value) > MAX_SAFE_INTEGER:
+            raise CanonicalizationError(
+                f"integer at {_path} is outside +/-(2**53 - 1); carry it as a decimal string"
+            )
         return value
     if isinstance(value, float):
         raise CanonicalizationError(
@@ -235,12 +262,37 @@ def _reject_non_integer(text: str) -> Any:
     raise StrictJSONError("NON_INTEGER_NUMBER", f"{text} is not an integer; canonical documents carry integers only")
 
 
+def _canonical_integer(text: str) -> int:
+    """``parse_int`` hook for canonical documents: integers within ``±MAX_SAFE_INTEGER`` only.
+
+    :func:`normalize` never writes a larger integer, so one found on the way
+    back in was not written by this tool and is refused rather than trusted.
+    """
+    value = int(text)
+    if abs(value) > MAX_SAFE_INTEGER:
+        raise StrictJSONError("INTEGER_OUT_OF_RANGE", f"{text} is outside +/-(2**53 - 1)")
+    return value
+
+
+def _data_integer(text: str) -> int | Decimal:
+    """``parse_int`` hook for input data: an unsafe integer is carried as a ``Decimal``.
+
+    Input data are not ours to refuse, but an integer beyond
+    ``±MAX_SAFE_INTEGER`` must never reach hashed content as a JSON number
+    (D8). As a ``Decimal`` it keeps every digit and is serialized as a decimal
+    string, exactly like a number with a fraction.
+    """
+    value = int(text)
+    return Decimal(text) if abs(value) > MAX_SAFE_INTEGER else value
+
+
 def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
     """Parse strict JSON from text or UTF-8 bytes (a leading BOM is accepted).
 
-    Non-integer numbers are returned as ``Decimal``, or refused when
-    ``integers_only`` is set (use it to re-read documents this tool wrote in
-    canonical form, such as ledgers and receipts). Every failure is raised as
+    Non-integer numbers, and integers beyond ``±MAX_SAFE_INTEGER``, are
+    returned as ``Decimal``. With ``integers_only`` (use it to re-read
+    documents this tool wrote in canonical form, such as ledgers and
+    receipts) both are refused instead. Every failure is raised as
     :class:`StrictJSONError`, never as a bare ``json``, ``Unicode`` or
     recursion error, so callers can always produce a named diagnostic.
     """
@@ -257,6 +309,7 @@ def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
             parse_float=_reject_non_integer if integers_only else Decimal,
+            parse_int=_canonical_integer if integers_only else _data_integer,
         )
     except StrictJSONError:
         raise

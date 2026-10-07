@@ -1,0 +1,71 @@
+{
+  "schema": "science-gate-manifest/v1",
+  "run_label": "synthetic-witnessed-dependencies",
+  "inputs": [
+    {
+      "id": "measurements",
+      "path": "data/measurements.csv",
+      "format": "csv",
+      "required": true,
+      "sha256": "2167a40ff7ec8bc812934a9df03e03732467dacb2865c37f90e2a73c3784f37f",
+      "row_key": [
+        "sample_id"
+      ],
+      "expected_rows": 6,
+      "denominator_source": "INDEPENDENT"
+    },
+    {
+      "id": "summary",
+      "path": "analysis/site-summary.csv",
+      "format": "csv",
+      "required": true,
+      "row_key": [
+        "site"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "id": "rows",
+      "kind": "row_count",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "measurements"
+      ]
+    },
+    {
+      "id": "numeric",
+      "kind": "numeric_agreement",
+      "version": "1",
+      "required": true,
+      "inputs": [
+        "summary"
+      ],
+      "params": {
+        "column": "mean_value",
+        "expected": [
+          {
+            "key": "site-alpha",
+            "value": "6.27"
+          },
+          {
+            "key": "site-beta",
+            "value": "14.05"
+          }
+        ]
+      }
+    },
+    {
+      "id": "currency",
+      "kind": "dependency_currency",
+      "version": "1",
+      "required": true
+    }
+  ],
+  "dependencies": "graph/graph.json",
+  "corpus": {
+    "access_class": "SYNTHETIC",
+    "permissions": {}
+  }
+}

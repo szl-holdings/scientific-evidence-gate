@@ -16,6 +16,10 @@ evidence will not be accepted.
   text. The package itself never starts a subprocess; only the test suite
   runs the CLI as one.
 - **Every write goes through `science_gate._safeio.safe_write`.**
+- **A new check kind needs a falsifier generator** (ARCHITECTURE.md 17.5)
+  that builds a known-bad case of the check's own input. Without one, its
+  PASS is never WITNESSED and the run abstains. A skip or not-applicable
+  result must carry a `SkipJustification` (17.7).
 - **Missing evidence is never zero, false, PASS or "no defects".** An unknown
   count is `None` (JSON `null`) with an explicit state.
 - **Determinism.** Sort mappings and sets before output. Take time only from

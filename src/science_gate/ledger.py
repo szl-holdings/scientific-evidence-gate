@@ -20,6 +20,14 @@ run seals the ledger with its head hash and length. :func:`verify_chain`
 therefore detects edited, reordered, inserted and truncated entries.
 
 ``seq`` is 1-based, so the last entry's ``seq`` equals ``ledger_length``.
+
+Every ``verify`` ledger opens with one **PLAN** entry (section 17.4): the
+checks, inputs, population denominators and harness pins the run committed
+to *before* anything executed, hash-chained ahead of the first STARTED entry.
+A population that shrinks after results are seen therefore contradicts a
+hash the run already sealed. The PLAN has no invocation id, so the
+invocation index ignores it, and :func:`reseal` exists so that tests and the
+mutation harness can forge exactly what a thorough tamperer would.
 """
 
 from __future__ import annotations
@@ -46,15 +54,22 @@ __all__ = [
     "GENESIS_SHA256",
     "ENTRY_FIELDS",
     "IDENTITY_FIELDS",
+    "PLAN_RESULT",
+    "PLAN_KIND",
+    "PLAN_SCHEMA",
     "LedgerError",
     "LedgerFormatError",
     "ChainVerification",
     "InvocationTrace",
+    "ResealResult",
     "Ledger",
     "invocation_id_for",
     "entry_digest",
     "verify_chain",
     "index_invocations",
+    "is_plan_entry",
+    "plan_of",
+    "reseal",
     "parse_jsonl",
 ]
 
@@ -84,6 +99,11 @@ ENTRY_FIELDS = (
 #: Fields that describe *what* was invoked. A terminal entry must repeat its
 #: STARTED entry's values exactly, or it closes a different invocation.
 IDENTITY_FIELDS = ("check_id", "check_kind", "check_version", "input_ids", "input_sha256s", "started_at")
+
+#: The PLAN entry's ``result`` and ``check_kind``, and its body's schema.
+PLAN_RESULT = "PLAN"
+PLAN_KIND = "PLAN"
+PLAN_SCHEMA = "science-gate-plan/v1"
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -289,6 +309,63 @@ def index_invocations(entries: Iterable[Mapping[str, Any]]) -> dict[str, Invocat
     return {invocation_id: _trace(invocation_id, groups[invocation_id]) for invocation_id in sorted(groups)}
 
 
+def is_plan_entry(entry: Mapping[str, Any]) -> bool:
+    """True for an entry recording a run's pre-committed PLAN."""
+    return isinstance(entry, Mapping) and entry.get("result") == PLAN_RESULT and entry.get("check_kind") == PLAN_KIND
+
+
+def plan_of(entries: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """The PLAN body, when entry 1 is a PLAN and no other entry is; otherwise None.
+
+    A second PLAN would let a run commit to one plan and execute another, so
+    an ambiguous ledger has no plan at all.
+    """
+    if not entries or not is_plan_entry(entries[0]):
+        return None
+    if any(is_plan_entry(entry) for entry in entries[1:]):
+        return None
+    body = entries[0].get("evidence")
+    return body if isinstance(body, Mapping) else None
+
+
+@dataclass(frozen=True)
+class ResealResult:
+    """A ledger rebuilt by :func:`reseal`, with its new seal and the invocation ids it renamed."""
+
+    entries: tuple[dict[str, Any], ...]
+    ledger_head_sha256: str | None
+    ledger_length: int
+    invocation_ids: Mapping[str, str]
+
+
+def reseal(entries: Sequence[Mapping[str, Any]], run_id: str) -> ResealResult:
+    """Renumber, re-derive ids, re-link and re-hash ``entries`` as one consistent chain.
+
+    This is what a thorough forger would do after deleting or editing
+    entries: every hash and link verifies again, and every STARTED entry's
+    id is derived afresh from ``run_id`` and its new ``seq`` (its terminal
+    entry follows the rename). Only facts that live *outside* the chain, such
+    as a PLAN that no longer matches the manifest, can then expose the edit.
+    """
+    renamed: dict[str, str] = {}
+    rebuilt: list[dict[str, Any]] = []
+    previous = GENESIS_SHA256
+    for seq, original in enumerate(entries, start=1):
+        entry = copy.deepcopy(dict(original))
+        entry["seq"] = seq
+        current = entry.get("invocation_id")
+        if isinstance(current, str):
+            if entry.get("result") == InvocationResult.STARTED.value:
+                renamed[current] = invocation_id_for(run_id, seq)
+            entry["invocation_id"] = renamed.get(current, current)
+        entry["prev_entry_sha256"] = previous
+        entry["entry_sha256"] = entry_digest(entry)
+        previous = entry["entry_sha256"]
+        rebuilt.append(entry)
+    head = rebuilt[-1]["entry_sha256"] if rebuilt else None
+    return ResealResult(tuple(rebuilt), head, len(rebuilt), dict(sorted(renamed.items())))
+
+
 def parse_jsonl(data: bytes | str) -> tuple[dict[str, Any], ...]:
     """Read a serialized ledger back into entries.
 
@@ -365,6 +442,43 @@ class Ledger:
     def open_invocations(self) -> tuple[str, ...]:
         """Invocations that were started and not yet finished, sorted."""
         return tuple(sorted(self._open))
+
+    def plan(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Record the run's PLAN as entry 1 and return a copy of the entry.
+
+        The PLAN must come first, before any invocation starts: a plan written
+        after results exist commits to nothing. ``input_ids`` and
+        ``input_sha256s`` repeat the planned inputs and their declared digests
+        (None when undeclared), so the entry has exactly the shape of every
+        other entry.
+        """
+        if self._entries:
+            raise LedgerError("the PLAN must be the first entry of the ledger")
+        if not isinstance(body, Mapping):
+            raise ValueError("a PLAN body must be a mapping")
+        planned = body.get("inputs", [])
+        if not isinstance(planned, (list, tuple)) or any(not isinstance(item, Mapping) for item in planned):
+            raise ValueError("a PLAN body's inputs must be a list of objects")
+        ids = _sorted_unique_ids((item.get("input_id") for item in planned), "planned input ids")
+        declared = {item["input_id"]: item.get("declared_sha256") for item in planned}
+        entry = self._append(
+            {
+                "seq": 1,
+                "invocation_id": None,
+                "check_id": None,
+                "check_kind": PLAN_KIND,
+                "check_version": PLAN_SCHEMA,
+                "input_ids": ids,
+                "input_sha256s": {input_id: declared[input_id] for input_id in ids},
+                "started_at": now(),
+                "completed_at": None,
+                "result": PLAN_RESULT,
+                "evidence": redact(body),
+                "verdict": None,
+                "reason": None,
+            }
+        )
+        return copy.deepcopy(entry)
 
     def start(
         self,

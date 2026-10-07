@@ -1,4 +1,4 @@
-"""Mutation testing of the verifier (ARCHITECTURE.md section 10).
+"""Mutation testing of the verifier (ARCHITECTURE.md sections 10 and 17.12).
 
 The shared fixture is ``fixtures/mutations/rich/``: synthetic data, invented
 reviewers, invented citations under the 10.5555 test prefix, and a synthetic
@@ -9,6 +9,14 @@ adds the claim, citation and dependency checks.
 Each test copies what it edits into a private temporary directory. The
 fixture itself is only ever read, and mutation testing writes nothing outside
 the OS temporary directory and the chosen output directory.
+
+Section 17.12 changed some 0.1.0 expectations, and these tests follow it:
+M21_removed_plan is a twenty-first operator (so the core fixture has 16
+applicable operators), M15 is detected as FAIL / PARTIAL_EXECUTION (D1), a
+verifier crash is VERIFIER_ERROR (FAIL / PROTOCOL_BROKEN, not BLIND_SPOT), the
+report schema is v2, records carry one MutationStatus, and a report whose
+records do not balance is FAIL / UNMEASURED_MUTANTS rather than
+unconstructible.
 """
 
 from __future__ import annotations
@@ -34,9 +42,20 @@ from science_gate import cli, mutations
 from science_gate._canonical import pretty_json_bytes, sha256_bytes, strict_loads
 from science_gate.cli import DEFAULT_RUNS_DIR, LAZY_COMMANDS
 from science_gate.invariants import DISAGREES, INVARIANT_NAMES, compare_decimal
-from science_gate.models import BUILTIN_CHECK_KINDS, ExecutionState, FailureMode, InputState, Reason, Status
+from science_gate.models import (
+    BUILTIN_CHECK_KINDS,
+    ExecutionState,
+    FailureMode,
+    InputState,
+    MutationStatus,
+    PieStage,
+    Reason,
+    Status,
+)
 from science_gate.mutations import (
+    ALL_COUNT_KEYS,
     COUNT_KEYS,
+    FORCED_DETECTION,
     INVALID_BASELINE_MESSAGE,
     NO_EXECUTION_MESSAGE,
     OPERATOR_IDS,
@@ -45,6 +64,7 @@ from science_gate.mutations import (
     BaselineSummary,
     Detector,
     FiredDetector,
+    ForcedDetection,
     MutationRecord,
     MutationReport,
     NotApplicable,
@@ -56,6 +76,7 @@ from science_gate.mutations import (
     write_mutation_report,
 )
 from science_gate.receipts import HMAC_KEY_FILE_ENV
+from science_gate.ledger import verify_chain
 from science_gate.verifier import REGISTRY, Finding, verify
 
 RICH = REPO_ROOT / "fixtures" / "mutations" / "rich"
@@ -92,6 +113,7 @@ CONTRACT_OPERATOR_IDS = (
     "M18_changed_upstream_design",
     "M19_replaced_stored_claim_output",
     "M20_metadata_change_under_unchanged_pass_summary",
+    "M21_removed_plan",
 )
 RECORD_FIELDS = {
     "mutation_id",
@@ -106,6 +128,12 @@ RECORD_FIELDS = {
     "blind_spot",
     "diagnostics",
     "target",
+    "status",
+    "activation",
+    "pie_stage",
+    "mutant_sha256",
+    "mutant_canonical_sha256",
+    "duplicate_of",
 }
 
 
@@ -172,13 +200,14 @@ class MutationTestCase(TempDirTestCase):
 
 
 class OperatorCatalogueTests(unittest.TestCase):
-    def test_the_twenty_contract_operators_in_order(self) -> None:
+    def test_the_twenty_one_contract_operators_in_order(self) -> None:
         self.assertEqual(OPERATOR_IDS, CONTRACT_OPERATOR_IDS)
         self.assertEqual(tuple(operator.mutation_id for operator in OPERATORS), OPERATOR_IDS)
+        self.assertNotIn(FORCED_DETECTION.mutation_id, OPERATOR_IDS, "M00 is a harness control, never an operator")
 
     def test_every_expected_detector_names_a_real_mechanism(self) -> None:
         states = {state.value for state in InputState}
-        for operator in OPERATORS:
+        for operator in (*OPERATORS, FORCED_DETECTION):
             with self.subTest(operator=operator.mutation_id):
                 source, _, name = operator.detector.label.partition(":")
                 known = {
@@ -198,6 +227,13 @@ class OperatorCatalogueTests(unittest.TestCase):
         by_id = {operator.mutation_id: operator for operator in OPERATORS}
         for mutation_id in ("M16_truncated_ledger", "M17_reordered_hash_chain"):
             self.assertEqual(by_id[mutation_id].detector.label, "invariant:ledger_chain_intact")
+        self.assertEqual(by_id["M21_removed_plan"].detector.label, "invariant:plan_closure")
+        self.assertEqual(FORCED_DETECTION.detector.label, "invariant:ledger_chain_intact")
+
+    def test_a_skipped_required_checker_must_be_caught_as_fail_under_d1(self) -> None:
+        (m15,) = [operator for operator in OPERATORS if operator.mutation_id == "M15_skipped_required_checker"]
+        self.assertEqual(m15.detector.statuses, frozenset({Status.FAIL}))
+        self.assertEqual(m15.detector.signals, frozenset({Reason.PARTIAL_EXECUTION.value}))
 
     def test_default_output_root_is_the_one_verify_uses(self) -> None:
         self.assertEqual(mutations.DEFAULT_OUTPUT_ROOT, DEFAULT_RUNS_DIR)
@@ -290,6 +326,7 @@ class CoreFixtureTests(unittest.TestCase):
             if operator.mutation_id in SPECIALIST_OPERATORS:
                 continue
             with self.subTest(operator=operator.mutation_id):
+                self.assertIs(record.status, MutationStatus.DETECTED, record.diagnostics)
                 self.assertIs(record.execution_state, ExecutionState.CHECKED, record.diagnostics)
                 self.assertTrue(record.detected, record.diagnostics)
                 self.assertIs(record.blind_spot, False)
@@ -303,7 +340,10 @@ class CoreFixtureTests(unittest.TestCase):
         for mutation_id in SPECIALIST_OPERATORS:
             record = self.records[mutation_id]
             with self.subTest(operator=mutation_id):
+                self.assertIs(record.status, MutationStatus.NOT_APPLICABLE)
                 self.assertIs(record.execution_state, ExecutionState.NOT_APPLICABLE)
+                self.assertIsNone(record.activation)
+                self.assertIsNone(record.mutant_sha256)
                 self.assertIsNone(record.detected)
                 self.assertIsNone(record.blind_spot)
                 self.assertIsNone(record.actual_result)
@@ -312,19 +352,23 @@ class CoreFixtureTests(unittest.TestCase):
                 self.assertTrue(record.diagnostics[0].startswith("NOT_APPLICABLE: "))
 
     def test_counts_sensitivity_status_and_exit_code(self) -> None:
+        counts = self.report.counts
         self.assertEqual(
-            self.report.counts,
+            {key: counts[key] for key in COUNT_KEYS},
             {
-                "applicable_mutations": 15,
-                "executed_mutations": 15,
-                "detected_mutations": 15,
+                "applicable_mutations": 16,
+                "executed_mutations": 16,
+                "detected_mutations": 16,
                 "escaped_mutations": 0,
                 "skipped_mutations": 0,
                 "not_applicable_mutations": 5,
             },
         )
+        self.assertEqual(counts["generated_mutations"], 21)
+        self.assertEqual(set(counts), set(ALL_COUNT_KEYS))
+        self.assertEqual({key: counts[key] for key in ALL_COUNT_KEYS[7:]}, dict.fromkeys(ALL_COUNT_KEYS[7:], 0))
         sensitivity = self.report.sensitivity
-        self.assertEqual((sensitivity["fraction"], sensitivity["decimal"]), ("15/15", "1.0000"))
+        self.assertEqual((sensitivity["fraction"], sensitivity["decimal"]), ("16/16", "1.0000"))
         outcome = (self.report.status, self.report.reason, self.report.exit_code)
         self.assertEqual(outcome, (Status.PASS, Reason.VERIFIED, 0))
 
@@ -333,6 +377,7 @@ class CoreFixtureTests(unittest.TestCase):
         self.assertEqual(counts["applicable_mutations"], counts["executed_mutations"] + counts["skipped_mutations"])
         self.assertEqual(counts["executed_mutations"], counts["detected_mutations"] + counts["escaped_mutations"])
         self.assertEqual(counts["applicable_mutations"] + counts["not_applicable_mutations"], len(OPERATOR_IDS))
+        self.assertTrue(self.report.conservation["holds"])
 
     def test_the_detectors_fired_for_the_named_defect(self) -> None:
         def reasons_of(mutation_id: str, label: str) -> set[str]:
@@ -350,6 +395,12 @@ class CoreFixtureTests(unittest.TestCase):
         self.assertIn("SOURCE_MISMATCH", reasons_of("M12_timezone_shift", "check:time_source"))
         self.assertIn("VACUOUS_PASS", reasons_of("M14_pass_summary_without_evidence", "check:summary_consistency"))
         self.assertIn("PARTIAL_EXECUTION", reasons_of("M15_skipped_required_checker", "contract:checks_executed"))
+        m15 = [
+            item
+            for item in self.records["M15_skipped_required_checker"].detecting_invariants_fired
+            if item.detector == "contract:checks_executed"
+        ]
+        self.assertEqual({item.status for item in m15}, {Status.FAIL}, "D1: an unjustified skip is FAIL")
 
     def test_thousands_separators_cannot_evade_comparison(self) -> None:
         record = self.records["M11_changed_numeric_formatting"]
@@ -361,6 +412,12 @@ class CoreFixtureTests(unittest.TestCase):
         self.assertEqual(record.actual_result["mode"], "sealed-run replay")
         self.assertEqual(record.actual_result["run_id"], self.report.baseline.run_id)
         self.assertEqual(fired_labels(record), {"invariant:ledger_chain_intact"})
+
+    def test_a_removed_plan_is_caught_only_by_plan_closure_once_the_chain_is_resealed(self) -> None:
+        record = self.records["M21_removed_plan"]
+        self.assertEqual(record.actual_result["mode"], "sealed-run replay")
+        self.assertEqual(fired_labels(record), {"invariant:plan_closure"})
+        self.assertEqual(record.activation, {"mode": "replay", "activated": True})
 
     def test_a_truncated_ledger_breaks_the_chain_against_the_original_seal(self) -> None:
         record = self.records["M16_truncated_ledger"]
@@ -380,7 +437,7 @@ class CoreFixtureTests(unittest.TestCase):
 
     def test_the_report_is_json_safe_and_every_record_has_the_contract_fields(self) -> None:
         document = strict_loads(pretty_json_bytes(self.report.to_dict()), integers_only=True)
-        self.assertEqual(document["schema"], "science-gate-mutation-report/v1")
+        self.assertEqual(document["schema"], "science-gate-mutation-report/v2")
         self.assertEqual(document["report_id"], self.report.report_id)
         self.assertLessEqual(set(COUNT_KEYS), set(document))
         self.assertEqual(document["operators"], list(OPERATOR_IDS))
@@ -391,8 +448,8 @@ class CoreFixtureTests(unittest.TestCase):
     def test_markdown_sections_follow_the_contract_order(self) -> None:
         markdown = render_markdown(self.report)
         self.assertEqual(headings(markdown), list(REPORT_HEADINGS))
-        self.assertIn("No executed mutation escaped.", markdown)
-        self.assertIn("15/15 = 1.0000", markdown)
+        self.assertIn("No executed mutation escaped as a blind spot.", markdown)
+        self.assertIn("16/16 = 1.0000", markdown)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +485,7 @@ class BlindSpotTests(MutationTestCase):
     def test_metadata_change_under_an_optional_summary_is_reported_as_a_blind_spot(self) -> None:
         manifest = self.edit_check("summary", required=False)
         report = mutate(manifest, operators=["M20_metadata_change_under_unchanged_pass_summary"])
-        record = report.mutations[-1]
+        (record,) = [item for item in report.mutations if item.mutation_id.startswith("M20_")]
         self.assertEqual(record.actual_result["status"], Status.PASS.value)
         self.assertIs(record.detected, False)
         self.assertIs(record.blind_spot, True)
@@ -444,12 +501,14 @@ class BlindSpotTests(MutationTestCase):
         with mock.patch.object(mutations, "verify", side_effect=crash_on_mutants):
             report = mutate(self.rich / "manifest-core.json", operators=["M01_empty_input"])
         record = report.mutations[0]
+        self.assertIs(record.status, MutationStatus.VERIFIER_ERROR)
         self.assertIs(record.execution_state, ExecutionState.CHECKED)
         self.assertEqual(record.actual_result["status"], Status.ERROR.value)
         self.assertIsNone(record.actual_result["run_id"])
         self.assertEqual(fired_labels(record), {"verifier:crash"})
         self.assertIs(record.detected, False)
-        self.assertEqual(report.reason, Reason.BLIND_SPOT)
+        self.assertIs(record.blind_spot, False, "a crash is not a blind spot, and never a detection")
+        self.assertEqual((report.status, report.reason), (Status.FAIL, Reason.PROTOCOL_BROKEN))
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +525,9 @@ class InvalidBaselineTests(MutationTestCase):
         self.assertEqual(report.mutations, ())
         self.assertEqual(report.message, INVALID_BASELINE_MESSAGE)
         document = report.to_dict()
-        for key in (*COUNT_KEYS, "sensitivity", "mutations"):
+        for key in (*ALL_COUNT_KEYS, "sensitivity", "mutations", "buckets", "conservation"):
             self.assertNotIn(key, document)
+        self.assertIsNone(document["forced_detection"])
         self.assertEqual(
             document["message"],
             "No sensitivity figure was produced because the verifier failed its accepting baseline.",
@@ -531,22 +591,24 @@ class SkippedAndNotApplicableTests(MutationTestCase):
     def test_unselected_mutations_are_skipped_and_never_counted_as_detections(self) -> None:
         report = mutate(self.rich / "manifest-core.json", operators=["M16_truncated_ledger"])
         skipped = [record for record in report.mutations if record.execution_state is ExecutionState.SKIPPED]
-        self.assertEqual(len(skipped), 14)
+        self.assertEqual(len(skipped), 15)
         for record in skipped:
             with self.subTest(operator=record.mutation_id):
                 self.assertTrue(record.applicable)
                 self.assertIsNone(record.detected)
                 self.assertIsNone(record.blind_spot)
                 self.assertIsNone(record.actual_result)
+                self.assertIs(record.status, MutationStatus.SKIPPED)
+                self.assertIsNone(record.mutant_sha256, "an unselected operator is never applied")
                 self.assertEqual(record.diagnostics, ("SKIPPED: the operator was not selected for this run",))
         self.assertEqual(
-            report.counts,
+            {key: report.counts[key] for key in COUNT_KEYS},
             {
-                "applicable_mutations": 15,
+                "applicable_mutations": 16,
                 "executed_mutations": 1,
                 "detected_mutations": 1,
                 "escaped_mutations": 0,
-                "skipped_mutations": 14,
+                "skipped_mutations": 15,
                 "not_applicable_mutations": 5,
             },
         )
@@ -579,7 +641,7 @@ class SkippedAndNotApplicableTests(MutationTestCase):
         self.assertIs(record.execution_state, ExecutionState.SKIPPED)
         self.assertIsNone(record.detected)
         self.assertIn("could not be built (OSError: synthetic write failure)", record.diagnostics[0])
-        self.assertEqual((report.counts["executed_mutations"], report.counts["skipped_mutations"]), (1, 14))
+        self.assertEqual((report.counts["executed_mutations"], report.counts["skipped_mutations"]), (1, 15))
 
     def test_ledger_operators_are_skipped_when_the_sealed_baseline_does_not_replay(self) -> None:
         real_decide = mutations.decide
@@ -745,10 +807,45 @@ class OperatorTargetTests(unittest.TestCase):
 
     def test_ledger_operators_tamper_with_a_copy_of_the_sealed_entries(self) -> None:
         entries = self.core.baseline.ledger.entries
-        self.assertEqual(locate(self, "M16_truncated_ledger", self.core).ledger_entries, entries[:-1])
-        reordered = locate(self, "M17_reordered_hash_chain", self.core).ledger_entries
+        seal = self.core.baseline.ledger.seal()
+        truncated = locate(self, "M16_truncated_ledger", self.core).replay
+        self.assertEqual(truncated.entries, entries[:-1])
+        self.assertEqual(truncated.ledger_head_sha256, seal["ledger_head_sha256"])
+        self.assertEqual(truncated.ledger_length, seal["ledger_length"])
+        reordered = locate(self, "M17_reordered_hash_chain", self.core).replay.entries
         self.assertEqual((reordered[1], reordered[2]), (entries[2], entries[1]))
         self.assertEqual(self.core.baseline.ledger.entries, entries, "the baseline's own ledger is never edited")
+
+    def test_the_forced_detection_flips_one_hex_digit_of_the_head_only(self) -> None:
+        seal = self.core.baseline.ledger.seal()
+        target = FORCED_DETECTION.locate(self.core)
+        self.assertIsInstance(target, Target)
+        head = target.replay.ledger_head_sha256
+        self.assertEqual(target.replay.entries, self.core.baseline.ledger.entries)
+        self.assertEqual(target.replay.ledger_length, seal["ledger_length"])
+        differing = [index for index, (a, b) in enumerate(zip(head, seal["ledger_head_sha256"])) if a != b]
+        self.assertEqual(differing, [0])
+        self.assertRegex(head, r"^[0-9a-f]{64}$")
+
+    def test_removed_plan_reseals_the_rest_into_a_consistent_chain(self) -> None:
+        entries = self.core.baseline.ledger.entries
+        replay = locate(self, "M21_removed_plan", self.core).replay
+        self.assertEqual(entries[0]["result"], "PLAN")
+        self.assertNotEqual(replay.entries[0]["result"], "PLAN")
+        self.assertEqual(len(replay.entries), len(entries) - 1)
+        check = verify_chain(replay.entries, replay.ledger_head_sha256, replay.ledger_length)
+        self.assertTrue(check.intact, "only facts outside the chain can expose a resealed forgery")
+        started = {entry["invocation_id"] for entry in entries if entry["result"] == "STARTED"}
+        self.assertEqual(set(replay.invocation_ids), started)
+        # A thorough forger also renames the invocations that entry evidence names.
+        renamed = {entry["invocation_id"] for entry in replay.entries if entry["result"] == "STARTED"}
+        subjects = {
+            entry["evidence"]["subject_invocation_id"]
+            for entry in replay.entries
+            if isinstance(entry.get("evidence"), dict) and "subject_invocation_id" in entry["evidence"]
+        }
+        self.assertTrue(subjects, "the core run records falsifier witnesses")
+        self.assertLessEqual(subjects, renamed)
 
 
 class OperatorFallbackTests(MutationTestCase):
@@ -911,6 +1008,9 @@ def invalid_report(detail: str = "synthetic") -> MutationReport:
     return MutationReport("manifest.json", None, FIXED_TIME, baseline, OPERATOR_IDS)
 
 
+DIGEST = "0" * 64
+
+
 class ReportTypeTests(unittest.TestCase):
     def record(self, **overrides: Any) -> MutationRecord:
         values: dict[str, Any] = {
@@ -919,33 +1019,69 @@ class ReportTypeTests(unittest.TestCase):
             "target": "synthetic",
             "expected_result": {},
             "expected_detector": "input:EMPTY",
-            "applicable": True,
-            "execution_state": ExecutionState.CHECKED,
+            "status": MutationStatus.BLIND_SPOT,
             "actual_result": {"status": "ABSTAIN"},
             "detecting_invariants_fired": (),
-            "detected": False,
+            "activation": {"mode": "file", "activated": True},
+            "pie_stage": PieStage.NOT_READ,
+            "mutant_sha256": DIGEST,
+            "mutant_canonical_sha256": DIGEST,
         }
         values.update(overrides)
         return MutationRecord(**values)
 
     def test_inconsistent_records_are_unrepresentable(self) -> None:
-        self.assertIs(self.record().blind_spot, True)
+        record = self.record()
+        self.assertEqual(
+            (record.blind_spot, record.detected, record.execution_state), (True, False, ExecutionState.CHECKED)
+        )
+        unexecuted = {"actual_result": None, "detecting_invariants_fired": None, "activation": None, "pie_stage": None}
         with self.assertRaises(ValueError):
-            self.record(execution_state=ExecutionState.NOT_APPLICABLE)
+            self.record(status=MutationStatus.NOT_APPLICABLE)  # a target, yet not applicable
         with self.assertRaises(ValueError):
-            self.record(detected=None)
+            self.record(activation=None)  # executed without an activation record
         with self.assertRaises(ValueError):
-            self.record(execution_state=ExecutionState.SKIPPED)
+            self.record(status=MutationStatus.SKIPPED, pie_stage=None)  # skipped, yet with an outcome
         with self.assertRaises(ValueError):
-            self.record(applicable=False, execution_state=ExecutionState.NOT_APPLICABLE, actual_result=None,
-                        detecting_invariants_fired=None, detected=True)
+            self.record(pie_stage=None)  # a blind spot must say where its defect stopped
+        with self.assertRaises(ValueError):
+            self.record(status=MutationStatus.DETECTED)  # a detection has no PIE stage
+        with self.assertRaises(ValueError):
+            self.record(status=MutationStatus.DUPLICATE_MUTANT, **unexecuted)  # a duplicate names its original
+        with self.assertRaises(ValueError):
+            self.record(status=MutationStatus.SKIPPED, **unexecuted)  # never built, so no digest
+        with self.assertRaises(ValueError):
+            self.record(mutant_canonical_sha256=None)  # built, so both digests
+        skipped = self.record(
+            status=MutationStatus.SKIPPED, mutant_sha256=None, mutant_canonical_sha256=None, **unexecuted
+        )
+        self.assertEqual(
+            (skipped.detected, skipped.blind_spot, skipped.execution_state), (None, None, ExecutionState.SKIPPED)
+        )
 
     def test_reports_cannot_mix_an_invalid_baseline_with_mutations(self) -> None:
+        forced = ForcedDetection("synthetic", True)
+        invalid = invalid_report().baseline
         with self.assertRaises(ValueError):
-            MutationReport("m.json", None, FIXED_TIME, invalid_report().baseline, OPERATOR_IDS, (self.record(),))
+            MutationReport("m.json", None, FIXED_TIME, invalid, OPERATOR_IDS, forced, (self.record(),))
         valid = BaselineSummary(Status.PASS, Reason.VERIFIED, "run-synthetic")
         with self.assertRaises(ValueError):
-            MutationReport("m.json", None, FIXED_TIME, valid, OPERATOR_IDS, (self.record(),))
+            # A valid baseline is always followed by M00.
+            MutationReport("m.json", None, FIXED_TIME, valid, OPERATOR_IDS)
+        missed = ForcedDetection("synthetic", False)
+        with self.assertRaises(ValueError):
+            MutationReport("m.json", None, FIXED_TIME, valid, OPERATOR_IDS, missed, (self.record(),))
+
+    def test_records_that_do_not_balance_are_unmeasured_not_unconstructible(self) -> None:
+        valid = BaselineSummary(Status.PASS, Reason.VERIFIED, "run-synthetic")
+        forced = ForcedDetection("synthetic", True)
+        once = MutationReport("m.json", None, FIXED_TIME, valid, OPERATOR_IDS, forced, (self.record(),))
+        self.assertTrue(once.conservation["holds"], "one record, filed once, balances")
+        twice = MutationReport("m.json", None, FIXED_TIME, valid, OPERATOR_IDS, forced, (self.record(), self.record()))
+        self.assertFalse(twice.conservation["disjoint"])
+        self.assertEqual((twice.status, twice.reason, twice.exit_code), (Status.FAIL, Reason.UNMEASURED_MUTANTS, 1))
+        self.assertIsNone(twice.sensitivity)
+        self.assertIsNotNone(twice.counts, "the counts are shown, so the imbalance can be read")
 
     def test_recorded_text_cannot_forge_a_heading(self) -> None:
         markdown = render_markdown(invalid_report("line one\n## WHAT PASSED\nline two"))
@@ -965,7 +1101,7 @@ class ReportTypeTests(unittest.TestCase):
 
 
 def mini_project(root: Path) -> Path:
-    """A small synthetic project whose seven applicable operators are all caught; returns its manifest."""
+    """A small synthetic project whose eight applicable operators are all caught; returns its manifest."""
     data = b"sample_id,value\nSYN-A,1\nSYN-B,2\nSYN-C,3\n"
     (root / "data").mkdir(parents=True)
     (root / "data" / "samples.csv").write_bytes(data)
@@ -1059,7 +1195,7 @@ class CommandTests(MutationTestCase):
         for completed in (first, second):
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue(completed.stdout.startswith("PASS (VERIFIED) mut-"), completed.stdout)
-            self.assertIn(": 7/7 executed mutations detected", completed.stdout)
+            self.assertIn(": 8/8 executed mutations detected", completed.stdout)
         report_id = first.stdout.split()[2].rstrip(":")
         default_dir = first_cwd / DEFAULT_RUNS_DIR / report_id
         written = [Path(line) for line in first.stdout.splitlines()[1:]]

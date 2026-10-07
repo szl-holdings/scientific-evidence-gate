@@ -1,0 +1,26 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "N-RATE",
+      "statement": "Synthetic rate from an invented third party",
+      "value": "0.13",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "rounding": "EITHER_HALF",
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/rates.json",
+        "sha256": "cdb9f6a4b8f848d44d089b110ca93e58b85ca8c191803e052764be545673105f",
+        "selector": "/rate"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    }
+  ]
+}

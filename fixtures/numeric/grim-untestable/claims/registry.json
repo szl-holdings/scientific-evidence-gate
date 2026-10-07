@@ -1,0 +1,49 @@
+{
+  "schema": "science-gate-claims/v1",
+  "claims": [
+    {
+      "claim_id": "N-COUNT",
+      "statement": "Number of invented respondents",
+      "value": "150",
+      "unit": "synthetic units",
+      "precision_decimals": 0,
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/ratings.json",
+        "sha256": "d8e0357509ffd37a2c33f1db35687f02d32efb921b6ac0b19dc206815309b439",
+        "selector": "/respondents"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    },
+    {
+      "claim_id": "N-MEAN",
+      "statement": "Mean synthetic rating (778/150; GRIM has no power at n=150)",
+      "value": "5.19",
+      "unit": "synthetic units",
+      "precision_decimals": 2,
+      "consistency": {
+        "test": "grim",
+        "n": 150
+      },
+      "derivation": {
+        "analysis_recipe": "recipes/synthetic-forensics (invented recipe name)",
+        "code_version": "synthetic-analysis 0.0.2 (invented)",
+        "environment": "CPython 3.11, standard library only (synthetic)",
+        "input_manifest_sha256": "ed91600622ebf5bea20a23875cacf4713f90ea20eebf2793afabc806de51fdaf"
+      },
+      "stored_output": {
+        "path": "outputs/ratings.json",
+        "sha256": "d8e0357509ffd37a2c33f1db35687f02d32efb921b6ac0b19dc206815309b439",
+        "selector": "/mean_rating"
+      },
+      "review_state": "REVIEWED (synthetic review by invented reviewer-n)",
+      "publication_location": "claims/manuscript.md line 4"
+    }
+  ]
+}

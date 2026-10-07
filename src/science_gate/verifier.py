@@ -14,30 +14,41 @@ drift apart:
   the PASS contract and the ERROR > FAIL > ABSTAIN > PASS precedence.
 
 The governing rule is that a passing check must emit enough evidence to prove
-that it had the opportunity to fail. The engine enforces this in three ways.
-A check that reports PASS without rows or evidence is downgraded before its
-verdict is recorded. Invariants are evaluated against the status the run is
-about to claim. And every finding that blocks PASS is kept, with its source,
-so the reports can say exactly why.
+that it had the opportunity to fail. The engine enforces this in five ways.
+A check that reports PASS without rows, evidence or discrimination is
+downgraded before its verdict is recorded. Every would-be PASS is replayed
+against known-bad variants of its own evidence (its **falsifier witness**,
+section 17.5) and keeps its PASS only if the same checker, with the same
+params, rejected one of them. Every run also executes controls that judge the
+harness rather than the data: a must-fail canary and its known-good twin, and
+a comparator self-test. The run commits to a **PLAN** and pins its evidence
+and check modules before anything executes, and a single gated audit hook
+records any write to a pinned file. Finally, invariants are evaluated against
+the status the run is about to claim, and every finding that blocks PASS is
+kept, with its source, so the reports can say exactly why.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from . import TOOL_NAME, __version__
+from . import TOOL_NAME, __version__, _audit
+from . import invariants as _invariants
 from ._canonical import (
     SizeLimitExceeded,
     StrictJSONError,
+    canonical_bytes,
     sha256_bytes,
     sha256_canonical,
     sha256_file,
@@ -57,38 +68,64 @@ from ._safeio import (
     SafeIOError,
     UnsafePathError,
     normalize_relpath,
+    resolve_under_root,
     safe_read,
 )
 from .discovery import OpenedInput, Row, discover, row_key_of
 from .invariants import (
+    CANARY_MUST_FAIL,
+    CANARY_MUST_PASS,
+    COMPARATOR_CONTROL,
     DISAGREES,
+    PLANNED_CONTROLS,
     VIOLATION_OUTCOMES,
     ClaimTally,
     InvariantContext,
-    compare_decimal,
     evaluate_invariants,
+    falsifier_check_id,
+    is_control,
     parse_decimal,
 )
-from .ledger import Ledger, index_invocations
-from .manifests import MAX_MANIFEST_BYTES, CheckSpec, Manifest, ManifestError, ManifestIssue, load_manifest
+from .ledger import PLAN_SCHEMA, InvocationTrace, Ledger, index_invocations
+from .manifests import MAX_MANIFEST_BYTES, CheckSpec, InputSpec, Manifest, ManifestError, ManifestIssue, load_manifest
 from .models import (
     ACCOUNTING_COUNTERS,
+    EMPTY_AGGREGATE_OUTCOME,
+    FALSIFICATION_OUTCOMES,
+    SKIP_JUSTIFICATION_KEY,
+    SKIP_JUSTIFICATION_OUTCOMES,
+    UNJUSTIFIED_SHORTFALL_OUTCOME,
     AccountingCount,
+    AssertionOutcome,
     CheckResult,
     Closure,
     DenominatorSource,
     ExecutionState,
     FailureMode,
+    FalsifierCase,
+    FalsifierOutcome,
     InputAccounting,
+    InputOverride,
+    InputRecord,
     InputState,
     InvariantResult,
+    Ratio,
+    RatioState,
     Reason,
+    RowCounts,
     RunResult,
+    SkipJustification,
     Status,
+    VerdictLevel,
+    VerdictTransition,
+    WitnessState,
+    empty_controls,
+    fold_verdicts,
 )
 
 __all__ = [
     "REGISTRY",
+    "FALSIFIERS",
     "ROLE_DOCUMENTS",
     "DEFAULT_USER_AGENT",
     "SNAPSHOT_SCHEMA",
@@ -105,6 +142,7 @@ __all__ = [
     "CheckUnavailable",
     "PRELOADS",
     "Findings",
+    "memory_input",
     "takes_no_inputs",
     "document_unavailable",
     "malformed_document",
@@ -119,8 +157,20 @@ __all__ = [
     "check_reviewer_protocol",
     "check_time_source",
     "check_summary_consistency",
+    "falsify_row_count",
+    "falsify_required_columns",
+    "falsify_duplicate_rows",
+    "falsify_snapshot_completeness",
+    "falsify_numeric_agreement",
+    "falsify_reviewer_protocol",
+    "falsify_time_source",
+    "falsify_summary_consistency",
+    "module_source_sha256",
+    "params_sha256",
+    "checker_sha256",
     "ledger_evidence",
     "run_checks",
+    "build_plan",
     "Finding",
     "DecisionInputs",
     "Decision",
@@ -148,19 +198,49 @@ REGISTRY: Mapping[str, str] = MappingProxyType(
         "claim_registry": "science_gate.claims:check_claim_registry",
         "dependency_currency": "science_gate.dependencies:check_dependency_currency",
         "summary_consistency": "science_gate.verifier:check_summary_consistency",
+        "claim_join": "science_gate.assertions:check_claim_join",
+        "editorial_status": "science_gate.citations:check_editorial_status",
+        "mutation_accounting": "science_gate.mutations:check_mutation_accounting",
     }
 )
 
 #: Files a specialist check reads beyond the role documents (stored claim
-#: outputs, dependency node files, saved graph state), keyed by check kind.
-#: Each ``"module:function"`` takes the :class:`CheckContext` and reads those
-#: files through it before any check runs. Reading them up front puts their
-#: digests into the run id, so two runs over different files never share an
-#: id, and lets ``summary_consistency`` see them as evidence it should pin.
+#: outputs, dependency node files, saved graph state, a sealed run's ledger),
+#: keyed by check kind. Each ``"module:function"`` takes the
+#: :class:`CheckContext` and reads those files through it before any check
+#: runs. Reading them up front puts their digests into the run id, so two
+#: runs over different files never share an id, and lets
+#: ``summary_consistency`` see them as evidence it should pin.
 PRELOADS: Mapping[str, str] = MappingProxyType(
     {
         "claim_registry": "science_gate.claims:preload_stored_outputs",
         "dependency_currency": "science_gate.dependencies:preload_graph_files",
+        "claim_join": "science_gate.assertions:preload_claim_join",
+    }
+)
+
+#: The negative-control generator of each kind (section 17.5):
+#: ``falsify(ctx, spec, result) -> tuple[FalsifierCase, ...]``. A kind with no
+#: entry, or whose generator cannot be imported, has no way to show that its
+#: checker can reject anything, so it can never PASS (NO_GENERATOR).
+FALSIFIERS: Mapping[str, str] = MappingProxyType(
+    {
+        "row_count": "science_gate.verifier:falsify_row_count",
+        "required_columns": "science_gate.verifier:falsify_required_columns",
+        "duplicate_rows": "science_gate.verifier:falsify_duplicate_rows",
+        "snapshot_completeness": "science_gate.verifier:falsify_snapshot_completeness",
+        "numeric_agreement": "science_gate.verifier:falsify_numeric_agreement",
+        "reviewer_protocol": "science_gate.verifier:falsify_reviewer_protocol",
+        "time_source": "science_gate.verifier:falsify_time_source",
+        "summary_consistency": "science_gate.verifier:falsify_summary_consistency",
+        "verification_log": "science_gate.citations:falsify_verification_log",
+        "citation_resolver": "science_gate.citations:falsify_resolver",
+        "citation_metadata": "science_gate.citations:falsify_metadata",
+        "editorial_status": "science_gate.citations:falsify_editorial_status",
+        "claim_registry": "science_gate.claims:falsify_claim_registry",
+        "dependency_currency": "science_gate.dependencies:falsify_dependency_currency",
+        "claim_join": "science_gate.assertions:falsify_claim_join",
+        "mutation_accounting": "science_gate.mutations:falsify_mutation_accounting",
     }
 )
 
@@ -207,7 +287,6 @@ _PATH_SAFETY_CODES = (
     SYMLINK_LOOP,
 )
 
-_RANK: Mapping[Status, int] = MappingProxyType({Status.PASS: 0, Status.ABSTAIN: 1, Status.FAIL: 2, Status.ERROR: 3})
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -287,6 +366,54 @@ class _FileRead:
     diagnostic: str | None = None
 
 
+def memory_input(
+    spec: InputSpec,
+    override: InputOverride,
+    *,
+    base_columns: tuple[str, ...] | None = None,
+    base_document: Any = None,
+) -> OpenedInput:
+    """An in-memory, fully PARSED input holding ``override``'s records (falsifier overlays, the canary).
+
+    The record counts every row as admitted and re-evaluates closure against
+    the spec's own ``expected_rows`` and ``denominator_source``, so a
+    falsifier that drops a row meets exactly the rule a real deletion would.
+    The digest is the canonical digest of the override itself: it names what
+    the check saw and can never be mistaken for a file on disk.
+    """
+    # CSV records are read-only {column: str} mappings, exactly as discovery admits them.
+    csv_like = spec.format == "csv"
+    rows = tuple(
+        Row(index, None, MappingProxyType(dict(values)) if csv_like and isinstance(values, Mapping) else values)
+        for index, values in enumerate(override.rows, start=1)
+    )
+    count = len(rows)
+    counts = RowCounts(admitted=count, excluded=0, deferred=0, unresolved=0, failed=0)
+    record = InputRecord(
+        input_id=spec.input_id,
+        path=spec.path,
+        required=spec.required,
+        format=spec.format,
+        state=InputState.PARSED,
+        discovered=True,
+        opened=True,
+        parsed=True,
+        sha256=sha256_canonical(override.to_dict()),
+        declared_sha256=spec.sha256,
+        size_bytes=None,
+        rows=count,
+        counts=counts,
+        closure=Closure.evaluate(spec.denominator_source, spec.expected_rows, count),
+        diagnostics=("IN_MEMORY: records supplied by a control, not read from disk",),
+    )
+    columns = override.columns if override.columns is not None else base_columns
+    document: Any = None
+    if spec.format == "json":
+        values = [row.values for row in rows]
+        document = values[0] if len(values) == 1 and not isinstance(base_document, list) else values
+    return OpenedInput(spec, record, None, columns if csv_like else None, rows, document)
+
+
 @dataclass(frozen=True, eq=False)
 class CheckContext:
     """Everything a check may look at (section 5).
@@ -297,14 +424,81 @@ class CheckContext:
     once, confines it to the manifest directory and the size limit, and
     records its digest, so every file a check relied on appears in the
     evidence manifest.
+
+    ``run_id`` is bound (:meth:`bind_run_id`) before any check runs, so a
+    check can derive run-specific nonces from it. :meth:`overlay` builds the
+    in-memory variant a falsifier runs against; an overlay never reads the
+    disk, so a negative control can never touch, or be touched by, the files
+    the run is judging.
     """
 
     manifest: Manifest
     inputs: Mapping[str, OpenedInput]
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
+    run_id: str | None = None
     _files: dict[str, _FileRead] = field(default_factory=dict, init=False, repr=False)
     _roles: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
     _preloaded: set[str] = field(default_factory=set, init=False, repr=False)
+    _sealed: bool = field(default=False, init=False, repr=False)
+
+    def bind_run_id(self, run_id: str) -> None:
+        """Record the run id once, before any check runs; a different second id is refused."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        if self.run_id is not None and self.run_id != run_id:
+            raise ValueError(f"this context already belongs to run {self.run_id!r}")
+        object.__setattr__(self, "run_id", run_id)
+
+    def _derive(
+        self,
+        inputs: Mapping[str, OpenedInput],
+        *,
+        files: dict[str, _FileRead] | None = None,
+        roles: dict[str, set[str]] | None = None,
+        preloaded: set[str] | None = None,
+        sealed: bool | None = None,
+    ) -> CheckContext:
+        """A context over other inputs. Omitted caches are shared with this one, not copied.
+
+        A sealed context (an overlay or a control) is also offline: a
+        negative control is answered from memory and never makes a request.
+        """
+        network = dataclasses.replace(self.network, live=False) if sealed else self.network
+        derived = CheckContext(self.manifest, inputs, network, self.run_id)
+        object.__setattr__(derived, "_files", self._files if files is None else files)
+        object.__setattr__(derived, "_roles", self._roles if roles is None else roles)
+        object.__setattr__(derived, "_preloaded", self._preloaded if preloaded is None else preloaded)
+        object.__setattr__(derived, "_sealed", self._sealed if sealed is None else sealed)
+        return derived
+
+    def overlay(self, case: FalsifierCase) -> CheckContext:
+        """An in-memory copy of this context with ``case``'s inputs and documents replaced (section 17.5).
+
+        Each overridden input becomes a PARSED input whose rows are numbered
+        1..n, whose counts admit all n, whose closure is re-evaluated against
+        the input's own declared expectation, and whose digest is the
+        canonical digest of the override. Overridden documents are served
+        through the normal parse rules. Files this context never read are
+        reported as unavailable rather than read: nothing touches the disk.
+        """
+        undeclared = sorted(set(case.inputs) - set(self.inputs))
+        if undeclared:
+            raise ValueError(f"case {case.case_id!r} overrides undeclared input(s) {undeclared}")
+        inputs = dict(self.inputs)
+        for input_id, override in case.inputs.items():
+            base = self.inputs[input_id]
+            inputs[input_id] = memory_input(base.spec, override, base_columns=base.columns, base_document=base.document)
+        files = dict(self._files)
+        for path, data in case.documents.items():
+            files[path] = _FileRead(
+                InputState.PARSED if data else InputState.EMPTY,
+                sha256_bytes(data),
+                len(data),
+                data,
+                None if data else f"EMPTY: {path} has no content",
+            )
+        roles = {path: set(names) for path, names in self._roles.items()}
+        return self._derive(inputs, files=files, roles=roles, preloaded=set(self._preloaded), sealed=True)
 
     @property
     def root(self) -> Path:
@@ -413,6 +607,9 @@ class CheckContext:
         except UnsafePathError as exc:
             return relpath, self._files.setdefault(relpath, _FileRead(InputState.REFUSED, diagnostic=f"REFUSED: {exc}"))
         if key not in self._files:
+            if self._sealed:
+                # An overlay or control context answers only from memory.
+                return key, _FileRead(InputState.OPEN_FAILED, diagnostic=f"OVERLAY_UNREAD: {key} is not in memory")
             self._files[key] = self._read_file(key)
         return key, self._files[key]
 
@@ -546,17 +743,29 @@ class Findings:
             claim_tallies=claim_tallies,
         )
 
-    def not_applicable(self, reason: Reason, detail: str, evidence: Mapping[str, Any]) -> CheckOutcome:
-        """Nothing to examine: never PASS, and 0 rows is the true count."""
+    def not_applicable(
+        self, reason: Reason, detail: str, evidence: Mapping[str, Any], *, justification: SkipJustification
+    ) -> CheckOutcome:
+        """Nothing to examine: never PASS, and 0 rows is the true count.
+
+        The closed-vocabulary ``justification`` is required (extension #24):
+        free text alone never excuses a required check from running, and an
+        unlabelled shortfall is FAIL / PARTIAL_EXECUTION (D1).
+        """
         return CheckOutcome(
             execution_state=ExecutionState.NOT_APPLICABLE,
             verdict=Status.ABSTAIN,
             reason=reason,
             failure_modes=self._modes(),
             rows_examined=0,
-            evidence=evidence,
+            evidence=_labelled(evidence, justification),
             diagnostics=(*self.diagnostics, detail),
         )
+
+
+def _labelled(evidence: Mapping[str, Any], justification: SkipJustification) -> dict[str, Any]:
+    """``evidence`` plus its skip justification, under :data:`SKIP_JUSTIFICATION_KEY`."""
+    return {**evidence, SKIP_JUSTIFICATION_KEY: SkipJustification(justification).value}
 
 
 def _params(spec: CheckSpec, allowed: Iterable[str] = (), required: Iterable[str] = ()) -> Mapping[str, Any]:
@@ -654,12 +863,42 @@ def _examinable(ctx: CheckContext, spec: CheckSpec, findings: Findings) -> list[
     return usable
 
 
-def _no_rows_to_examine(spec: CheckSpec, findings: Findings, evidence: Mapping[str, Any]) -> CheckOutcome:
+#: Input states whose content cannot be examined at all, and why (17.7).
+_UNAVAILABLE_STATES = frozenset(
+    {InputState.MISSING, InputState.REFUSED, InputState.OPEN_FAILED, InputState.PARSE_ERROR}
+)
+
+
+def _population_justification(ctx: CheckContext, spec: CheckSpec) -> SkipJustification:
+    """Why a check's inputs left nothing to examine, in the closed vocabulary.
+
+    The most serious cause wins: content that is not the declared artifact
+    (SOURCE_REJECTED), then content that could not be read
+    (INPUT_UNAVAILABLE), then a genuinely empty population.
+    """
+    states = [ctx.inputs[input_id].state if input_id in ctx.inputs else None for input_id in spec.inputs]
+    if InputState.HASH_MISMATCH in states:
+        return SkipJustification.SOURCE_REJECTED
+    if None in states or _UNAVAILABLE_STATES & set(states):
+        return SkipJustification.INPUT_UNAVAILABLE
+    return SkipJustification.EMPTY_POPULATION
+
+
+def _no_rows_to_examine(
+    ctx: CheckContext, spec: CheckSpec, findings: Findings, evidence: Mapping[str, Any]
+) -> CheckOutcome:
     """NOT_APPLICABLE, citing the first recorded cause (e.g. SOURCE_MISMATCH for a digest mismatch)."""
     if not spec.inputs:
-        return findings.not_applicable(Reason.OUT_OF_SCOPE, f"{spec.kind} was given no inputs", evidence)
+        return findings.not_applicable(
+            Reason.OUT_OF_SCOPE,
+            f"{spec.kind} was given no inputs",
+            evidence,
+            justification=SkipJustification.NOT_DECLARED,
+        )
     reason = findings.first_reason(Reason.INSUFFICIENT_EVIDENCE)
-    return findings.not_applicable(reason, "no input has rows to examine", evidence)
+    return findings.not_applicable(
+        reason, "no input has rows to examine", evidence, justification=_population_justification(ctx, spec)
+    )
 
 
 def document_unavailable(document: Document, evidence: Mapping[str, Any]) -> CheckOutcome:
@@ -667,25 +906,28 @@ def document_unavailable(document: Document, evidence: Mapping[str, Any]) -> Che
 
     Absence or damage is missing evidence (ABSTAIN), not a verdict about content.
     """
-    reason = Reason.PROTOCOL_BROKEN if document.state is InputState.PARSE_ERROR else Reason.INSUFFICIENT_EVIDENCE
+    damaged = document.state is InputState.PARSE_ERROR
+    reason = Reason.PROTOCOL_BROKEN if damaged else Reason.INSUFFICIENT_EVIDENCE
+    label = SkipJustification.EVIDENCE_MALFORMED if damaged else SkipJustification.INPUT_UNAVAILABLE
     detail = document.diagnostic or f"{document.role} is {document.state}"
     return CheckOutcome(
         execution_state=ExecutionState.SKIPPED,
         verdict=Status.ABSTAIN,
         reason=reason,
         rows_examined=0,
-        evidence={**evidence, "document": document.to_dict()},
+        evidence=_labelled({**evidence, "document": document.to_dict()}, label),
         diagnostics=(f"{document.role} ({document.path}) unavailable: {detail}",),
     )
 
 
 def malformed_document(document: Document, problem: str, evidence: Mapping[str, Any]) -> CheckOutcome:
+    """A role document that parsed but does not match its schema: SKIPPED as EVIDENCE_MALFORMED."""
     return CheckOutcome(
         execution_state=ExecutionState.SKIPPED,
         verdict=Status.ABSTAIN,
         reason=Reason.PROTOCOL_BROKEN,
         rows_examined=0,
-        evidence={**evidence, "document": document.to_dict()},
+        evidence=_labelled({**evidence, "document": document.to_dict()}, SkipJustification.EVIDENCE_MALFORMED),
         diagnostics=(f"MALFORMED_DOCUMENT: {document.role} ({document.path}): {problem}",),
     )
 
@@ -751,7 +993,7 @@ def check_row_count(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     usable = _examinable(ctx, spec, findings)
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     if not usable:
-        return _no_rows_to_examine(spec, findings, {"inputs": per_input})
+        return _no_rows_to_examine(ctx, spec, findings, {"inputs": per_input})
     for opened in usable:
         closure = opened.record.closure
         per_input[opened.input_id].update(
@@ -786,7 +1028,7 @@ def check_required_columns(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     evidence: dict[str, Any] = {"columns": list(columns), "inputs": per_input}
     if not usable:
-        return _no_rows_to_examine(spec, findings, evidence)
+        return _no_rows_to_examine(ctx, spec, findings, evidence)
     for opened in usable:
         summary = per_input[opened.input_id]
         if opened.spec.format == "csv":
@@ -830,7 +1072,7 @@ def check_duplicate_rows(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     usable = _examinable(ctx, spec, findings)
     per_input = {input_id: _input_summary(ctx.inputs[input_id]) for input_id in spec.inputs if input_id in ctx.inputs}
     if not usable:
-        return _no_rows_to_examine(spec, findings, {"inputs": per_input})
+        return _no_rows_to_examine(ctx, spec, findings, {"inputs": per_input})
     for opened in usable:
         key_fields = opened.spec.row_key
         exact: dict[str, list[int]] = {}
@@ -997,7 +1239,12 @@ def check_snapshot_completeness(ctx: CheckContext, spec: CheckSpec) -> CheckOutc
     findings = Findings()
     evidence: dict[str, Any] = {"snapshot": snapshot.to_dict()}
     if not snapshot.declared:
-        return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no accepted_snapshot", evidence)
+        return findings.not_applicable(
+            Reason.OUT_OF_SCOPE,
+            "the manifest declares no accepted_snapshot",
+            evidence,
+            justification=SkipJustification.NOT_DECLARED,
+        )
     if not snapshot.loaded:
         return document_unavailable(snapshot, evidence)
     try:
@@ -1016,7 +1263,7 @@ def check_snapshot_completeness(ctx: CheckContext, spec: CheckSpec) -> CheckOutc
         per_input[opened.input_id] = {**_input_summary(opened), **_compare_snapshot(opened, entry, findings)}
     evidence["inputs"] = per_input
     if not compared:
-        return _no_rows_to_examine(spec, findings, evidence)
+        return _no_rows_to_examine(ctx, spec, findings, evidence)
     return findings.outcome(rows_examined=sum(len(opened.rows) for opened in compared), evidence=evidence)
 
 
@@ -1078,9 +1325,17 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     ``params``: ``column`` (where the stored value is), ``expected`` (a list
     of ``{key, value, precision_decimals?}`` located by the input's
     ``row_key``), and optionally ``thousands`` and ``decimal_point``. Every
-    comparison goes through :func:`~science_gate.invariants.compare_decimal`.
-    Rounding therefore never creates agreement, and a separator never evades
-    comparison: undeclared, it makes the value ambiguous, never equal.
+    comparison goes through :func:`~science_gate.invariants.compare_decimal`,
+    looked up on the module at call time so the comparator the self-test
+    judged is the one used. Rounding therefore never creates agreement, and a
+    separator never evades comparison: undeclared, it makes the value
+    ambiguous, never equal.
+
+    Each comparison also records its **discrimination**: how many of the 21
+    nearest printable claims the comparator would reject (section 17.8). The
+    check records the weakest as ``discrimination`` and
+    ``discrimination_ratio``; agreement from a comparison that could reject
+    nothing is refused as vacuous.
     """
     params = _params(spec, ("column", "expected", "thousands", "decimal_point"), ("column", "expected"))
     column = params["column"]
@@ -1103,7 +1358,7 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
         "decimal_point": decimal_point,
     }
     if not usable:
-        return _no_rows_to_examine(spec, findings, evidence)
+        return _no_rows_to_examine(ctx, spec, findings, evidence)
     opened = usable[0]
     key_fields = opened.spec.row_key
     if not key_fields:
@@ -1115,6 +1370,7 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
             index.setdefault(key, []).append(row)
     comparisons: list[dict[str, Any]] = []
     outcomes: Counter[str] = Counter()
+    ratios: list[Ratio] = []
     for key, claimed, precision in expected:
         entry: dict[str, Any] = {"key": list(key), "claimed": claimed}
         comparisons.append(entry)
@@ -1133,10 +1389,15 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
             entry["outcome"] = "NOT_A_PRINTED_NUMBER"
             findings.abstain(Reason.REQUIRES_HUMAN_REVIEW, f"row {list(key)}: {column!r} is not a printed number")
         else:
-            comparison = compare_decimal(
+            comparison = _invariants.compare_decimal(
                 claimed, stored, thousands=thousands, decimal_point=decimal_point, precision_decimals=precision
             )
             entry.update(comparison.to_dict())
+            ratio = _invariants.comparison_discrimination(
+                claimed, stored, thousands=thousands, decimal_point=decimal_point, precision_decimals=precision
+            )
+            ratios.append(ratio)
+            entry["discrimination"] = ratio.to_dict()
             if comparison.outcome == DISAGREES:
                 findings.fail(
                     Reason.SOURCE_MISMATCH, f"key {list(key)}: {comparison.detail}", FailureMode.SOURCE_MISMATCH
@@ -1147,8 +1408,29 @@ def check_numeric_agreement(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     evidence.update(
         {"rows_indexed": len(opened.rows), "comparisons": comparisons, "outcomes": dict(sorted(outcomes.items()))}
     )
+    weakest = _weakest(ratios)
+    if weakest is not None:
+        evidence["discrimination"] = weakest.decimal
+        evidence["discrimination_ratio"] = weakest.to_dict()
     compared = sum(1 for entry in comparisons if entry["outcome"] != "ROW_NOT_FOUND")
     return findings.outcome(rows_examined=compared, evidence=evidence)
+
+
+def _weakest(ratios: Sequence[Ratio]) -> Ratio | None:
+    """The least discriminating ratio: the first undefined one, else the minimum by exact value (first on ties).
+
+    An undefined ratio wins because "could not be measured" is weaker than
+    any measured discrimination; it must never be skipped as if absent.
+    """
+    weakest: Ratio | None = None
+    lowest: Fraction | None = None
+    for ratio in ratios:
+        value = ratio.value
+        if value is None:
+            return ratio
+        if lowest is None or value < lowest:
+            weakest, lowest = ratio, value
+    return weakest
 
 
 # ---------------------------------------------------------------------------
@@ -1186,7 +1468,12 @@ def check_reviewer_protocol(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     findings = Findings()
     reviews = ctx.manifest.reviews
     if reviews is None:
-        return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no review protocol", {})
+        return findings.not_applicable(
+            Reason.OUT_OF_SCOPE,
+            "the manifest declares no review protocol",
+            {},
+            justification=SkipJustification.NOT_DECLARED,
+        )
     document = ctx.role_document("reviews.verdicts")
     evidence: dict[str, Any] = {"required_reviewers": list(reviews.required_reviewers)}
     if not document.loaded:
@@ -1343,7 +1630,12 @@ def check_time_source(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
     document = ctx.role_document("time_sources")
     evidence: dict[str, Any] = {"document": document.to_dict()}
     if not document.declared:
-        return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no time_sources", evidence)
+        return findings.not_applicable(
+            Reason.OUT_OF_SCOPE,
+            "the manifest declares no time_sources",
+            evidence,
+            justification=SkipJustification.NOT_DECLARED,
+        )
     if not document.loaded:
         return document_unavailable(document, evidence)
     try:
@@ -1352,7 +1644,12 @@ def check_time_source(ctx: CheckContext, spec: CheckSpec) -> CheckOutcome:
         return malformed_document(document, str(exc), evidence)
     evidence["window"] = {"start": format_utc(window[0]), "end": format_utc(window[1])}
     if not events:
-        return findings.not_applicable(Reason.INSUFFICIENT_EVIDENCE, "the time sources list no events", evidence)
+        return findings.not_applicable(
+            Reason.INSUFFICIENT_EVIDENCE,
+            "the time sources list no events",
+            evidence,
+            justification=SkipJustification.EMPTY_POPULATION,
+        )
     judged = [_judge_event(event, window) for event in events]
     problems = [item for item in judged if item["outcome"] != "CONSISTENT"]
     for item in problems:
@@ -1476,7 +1773,12 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
     document = ctx.role_document("summary_claim")
     evidence: dict[str, Any] = {"summary": document.to_dict()}
     if not document.declared:
-        return findings.not_applicable(Reason.OUT_OF_SCOPE, "the manifest declares no summary_claim", evidence)
+        return findings.not_applicable(
+            Reason.OUT_OF_SCOPE,
+            "the manifest declares no summary_claim",
+            evidence,
+            justification=SkipJustification.NOT_DECLARED,
+        )
     if not document.loaded:
         return document_unavailable(document, evidence)
     try:
@@ -1486,7 +1788,10 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
     evidence["stored_status"] = status
     if status != Status.PASS.value:
         return findings.not_applicable(
-            Reason.OUT_OF_SCOPE, f"the stored summary claims {status}, not PASS: there is no PASS to confirm", evidence
+            Reason.OUT_OF_SCOPE,
+            f"the stored summary claims {status}, not PASS: there is no PASS to confirm",
+            evidence,
+            justification=SkipJustification.NOT_DECLARED,
         )
     if not pinned_inputs and not pinned_documents:
         findings.abstain(
@@ -1535,6 +1840,301 @@ def check_summary_consistency(ctx: CheckContext, spec: CheckSpec) -> CheckOutcom
 
 
 # ---------------------------------------------------------------------------
+# Falsifier generators for the built-in kinds (section 17.5)
+# ---------------------------------------------------------------------------
+#
+# Each generator builds the known-bad variant of exactly the evidence its
+# check just passed, and names the rejection that variant must provoke. They
+# read only through ``ctx``, write nothing, and return () when this instance
+# admits no known-bad case (which leaves the PASS unwitnessed, never PASS).
+
+
+def _record_values(values: Any) -> Any:
+    """A record as plain data: CSV rows become ordinary dicts."""
+    return dict(values) if isinstance(values, Mapping) else values
+
+
+def _with_rows(opened: OpenedInput, rows: Iterable[Any], columns: tuple[str, ...] | None = None) -> InputOverride:
+    """An override holding ``rows`` (record values) under ``columns`` or the input's own header."""
+    return InputOverride(tuple(_record_values(values) for values in rows), columns if columns else opened.columns)
+
+
+def _rows_of(ctx: CheckContext, spec: CheckSpec) -> list[OpenedInput]:
+    """The check's inputs that have admitted rows, in declaration order."""
+    found = []
+    for input_id in spec.inputs:
+        opened = ctx.inputs.get(input_id)
+        if opened is not None and opened.usable and opened.rows:
+            found.append(opened)
+    return found
+
+
+def falsify_row_count(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``drop-last-row``: one admitted row fewer than an INDEPENDENT expectation must FAIL."""
+    overrides = {
+        opened.input_id: _with_rows(opened, (row.values for row in opened.rows[:-1]))
+        for opened in _rows_of(ctx, spec)
+        if opened.spec.denominator_source is DenominatorSource.INDEPENDENT and opened.spec.expected_rows is not None
+    }
+    if not overrides:
+        return ()
+    return (
+        FalsifierCase(
+            "drop-last-row",
+            "the last admitted row of each input with an INDEPENDENT expected_rows removed",
+            Status.FAIL,
+            Reason.SOURCE_MISMATCH,
+            inputs=overrides,
+        ),
+    )
+
+
+def falsify_required_columns(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``drop-column``: the first declared column removed from the header and from every record must FAIL."""
+    columns = spec.params.get("columns")
+    if not isinstance(columns, list) or not columns or not isinstance(columns[0], str):
+        return ()
+    dropped = columns[0]
+    overrides: dict[str, InputOverride] = {}
+    for input_id in spec.inputs:
+        opened = ctx.inputs.get(input_id)
+        if opened is None or not opened.usable or opened.rows is None:
+            continue
+        rows = [
+            {name: value for name, value in row.values.items() if name != dropped}
+            if isinstance(row.values, Mapping)
+            else row.values
+            for row in opened.rows
+        ]
+        # A CSV header keeps every other column (possibly none); other formats have no header.
+        header = None if opened.columns is None else tuple(name for name in opened.columns if name != dropped)
+        overrides[input_id] = InputOverride(tuple(rows), header)
+    if not overrides:
+        return ()
+    return (
+        FalsifierCase(
+            "drop-column",
+            f"declared column {dropped!r} removed from the header and every record",
+            Status.FAIL,
+            Reason.SOURCE_MISMATCH,
+            inputs=overrides,
+        ),
+    )
+
+
+def falsify_duplicate_rows(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``duplicate-first-row``: a copy of the first admitted row appended must FAIL."""
+    overrides = {
+        opened.input_id: _with_rows(opened, (*(row.values for row in opened.rows), opened.rows[0].values))
+        for opened in _rows_of(ctx, spec)
+    }
+    if not overrides:
+        return ()
+    return (
+        FalsifierCase(
+            "duplicate-first-row",
+            "a copy of the first admitted row appended to each input",
+            Status.FAIL,
+            Reason.SOURCE_MISMATCH,
+            inputs=overrides,
+        ),
+    )
+
+
+def falsify_snapshot_completeness(
+    ctx: CheckContext, spec: CheckSpec, result: CheckResult
+) -> tuple[FalsifierCase, ...]:
+    """``delete-accepted-row``: the first admitted row the snapshot accepts, removed, must FAIL."""
+    snapshot = ctx.accepted_snapshot
+    if not snapshot.loaded:
+        return ()
+    try:
+        accepted = _parse_snapshot(snapshot.content)
+    except _FormatError:
+        return ()
+    overrides: dict[str, InputOverride] = {}
+    for opened in _rows_of(ctx, spec):
+        entry = accepted.get(opened.input_id)
+        if entry is None or not entry.rows:
+            continue
+        if entry.row_key:
+            keys = {key for key, _ in entry.rows}
+            hits = [row_key_of(row.values, entry.row_key) in keys for row in opened.rows]
+        else:
+            digests = {digest for _, digest in entry.rows}
+            hits = [row_digest(row.values) in digests for row in opened.rows]
+        if True not in hits:
+            continue
+        removed = hits.index(True)
+        overrides[opened.input_id] = _with_rows(
+            opened, (row.values for position, row in enumerate(opened.rows) if position != removed)
+        )
+    if not overrides:
+        return ()
+    return (
+        FalsifierCase(
+            "delete-accepted-row",
+            "the first admitted row the accepted snapshot vouches for removed from each input",
+            Status.FAIL,
+            Reason.SOURCE_MISMATCH,
+            inputs=overrides,
+        ),
+    )
+
+
+def falsify_numeric_agreement(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``shift-stored-value``: the first compared stored value set one printed unit above its claim must FAIL.
+
+    The shifted value is ``claim + 10**-d`` (``d`` = the claim's printed
+    decimals), printed with ``d`` decimals and no grouping, so it is the
+    nearest value the claim must not agree with.
+    """
+    params = spec.params
+    column = params.get("column")
+    thousands, decimal_point = params.get("thousands"), params.get("decimal_point", ".")
+    if len(spec.inputs) != 1 or not isinstance(column, str):
+        return ()
+    opened = ctx.inputs.get(spec.inputs[0])
+    if opened is None or not opened.usable or not opened.rows or not opened.spec.row_key:
+        return ()
+    expected = _expected_values(params.get("expected"))
+    index: dict[tuple[str, ...], list[int]] = {}
+    for position, row in enumerate(opened.rows):
+        key = row_key_of(row.values, opened.spec.row_key)
+        if key is not None:
+            index.setdefault(key, []).append(position)
+    for key, claimed, _precision in expected:
+        positions = index.get(key, [])
+        if len(positions) != 1 or not isinstance(opened.rows[positions[0]].values, Mapping):
+            continue
+        target = opened.rows[positions[0]].values
+        if target.get(column) is None:
+            continue
+        parsed = parse_decimal(claimed, thousands=thousands, decimal_point=decimal_point)
+        if not parsed.ok or parsed.value is None or parsed.decimals is None:
+            continue
+        unit = Decimal((0, (1,), -parsed.decimals))
+        shifted = format((parsed.value + unit).quantize(unit), "f")
+        if decimal_point != ".":
+            shifted = shifted.replace(".", decimal_point)
+        rows = [
+            {**_record_values(row.values), column: shifted} if position == positions[0] else row.values
+            for position, row in enumerate(opened.rows)
+        ]
+        return (
+            FalsifierCase(
+                "shift-stored-value",
+                f"the stored {column!r} of key {list(key)} set to {shifted}, one printed unit above the claim",
+                Status.FAIL,
+                Reason.SOURCE_MISMATCH,
+                inputs={opened.input_id: _with_rows(opened, rows)},
+            ),
+        )
+    return ()
+
+
+def _json_document(document: Document) -> tuple[str, Mapping[str, Any]] | None:
+    """A loaded role document's path and JSON object, or None."""
+    if not document.loaded or document.path is None or not isinstance(document.content, Mapping):
+        return None
+    return document.path, document.content
+
+
+def falsify_reviewer_protocol(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``drop-required-reviewer``: every verdict of the first required reviewer removed must be PROTOCOL_BROKEN."""
+    reviews = ctx.manifest.reviews
+    loaded = _json_document(ctx.role_document("reviews.verdicts"))
+    if reviews is None or not reviews.required_reviewers or loaded is None:
+        return ()
+    path, content = loaded
+    verdicts = content.get("verdicts")
+    if not isinstance(verdicts, list):
+        return ()
+    first = reviews.required_reviewers[0].strip().casefold()
+    kept = [
+        item
+        for item in verdicts
+        if not (isinstance(item, Mapping) and isinstance(item.get("reviewer"), str))
+        or item["reviewer"].strip().casefold() != first
+    ]
+    return (
+        FalsifierCase(
+            "drop-required-reviewer",
+            f"every verdict of required reviewer {reviews.required_reviewers[0]!r} removed",
+            Status.ABSTAIN,
+            Reason.PROTOCOL_BROKEN,
+            documents={path: canonical_bytes({**content, "verdicts": kept})},
+        ),
+    )
+
+
+def falsify_time_source(ctx: CheckContext, spec: CheckSpec, result: CheckResult) -> tuple[FalsifierCase, ...]:
+    """``shift-utc``: one hour added to the first event's recorded UTC must FAIL."""
+    loaded = _json_document(ctx.role_document("time_sources"))
+    if loaded is None:
+        return ()
+    path, content = loaded
+    events = content.get("events")
+    if not isinstance(events, list) or not events or not isinstance(events[0], Mapping):
+        return ()
+    try:
+        shifted = format_utc(parse_utc(events[0].get("utc")) + timedelta(hours=1))
+    except (ClockError, TypeError, ValueError):
+        return ()
+    changed = [{**events[0], "utc": shifted}, *events[1:]]
+    return (
+        FalsifierCase(
+            "shift-utc",
+            f"one hour added to the recorded utc of event {events[0].get('id')!r}",
+            Status.FAIL,
+            Reason.SOURCE_MISMATCH,
+            documents={path: canonical_bytes({**content, "events": changed})},
+        ),
+    )
+
+
+def _other_digest(digest: str) -> str:
+    """A well-formed digest that differs from ``digest`` and is derived from it, never random."""
+    return sha256_bytes(f"science-gate falsifier: replaced {digest}".encode("utf-8"))
+
+
+def falsify_summary_consistency(
+    ctx: CheckContext, spec: CheckSpec, result: CheckResult
+) -> tuple[FalsifierCase, ...]:
+    """``alter-pinned-digest``: the first pinned input digest (else document digest), replaced, must FAIL."""
+    loaded = _json_document(ctx.role_document("summary_claim"))
+    if loaded is None:
+        return ()
+    path, content = loaded
+    pinned = content.get("pinned")
+    if not isinstance(pinned, Mapping):
+        return ()
+    for section in ("inputs", "documents"):
+        pins = pinned.get(section)
+        if not isinstance(pins, Mapping) or not pins:
+            continue
+        name = sorted(pins)[0]
+        pin = pins[name]
+        if section == "inputs" and isinstance(pin, Mapping) and isinstance(pin.get("sha256"), str):
+            replaced: Any = {**pin, "sha256": _other_digest(pin["sha256"])}
+        elif section == "documents" and isinstance(pin, str):
+            replaced = _other_digest(pin)
+        else:
+            continue
+        altered = {**content, "pinned": {**pinned, section: {**pins, name: replaced}}}
+        return (
+            FalsifierCase(
+                "alter-pinned-digest",
+                f"the summary's pinned digest of {section[:-1]} {name!r} replaced",
+                Status.FAIL,
+                Reason.SOURCE_MISMATCH,
+                documents={path: canonical_bytes(altered)},
+            ),
+        )
+    return ()
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -1576,66 +2176,70 @@ def _errored(spec: CheckSpec, invocation_id: str, diagnostic: str) -> CheckResul
     )
 
 
+def _discrimination_problem(evidence: Mapping[str, Any]) -> str | None:
+    """Why a recorded ``discrimination_ratio`` cannot back a PASS; None when it can or none is recorded."""
+    if "discrimination_ratio" not in evidence:
+        return None
+    ratio = evidence["discrimination_ratio"]
+    if not isinstance(ratio, Mapping) or ratio.get("state") != RatioState.DEFINED.value:
+        return "its discrimination is not defined"
+    numerator = ratio.get("numerator")
+    if isinstance(numerator, bool) or not isinstance(numerator, int) or numerator < 1:
+        return "its comparison could not have rejected any nearby value (discrimination 0)"
+    return None
+
+
 def _refuse_vacuous_pass(outcome: CheckOutcome) -> CheckOutcome:
-    """A check may not PASS without examined rows and non-empty evidence.
+    """A check may not PASS without examined rows, non-empty evidence and, where measured, discrimination.
 
     Built-in checks never try. This guard makes the rule hold for every
     registered check, so the verdict written to the ledger is already honest.
+    A PASS whose evidence records a ``discrimination_ratio`` that is
+    undefined or zero (section 17.8) came from a comparison that could not
+    have failed, so it abstains too.
     """
-    if outcome.verdict is not Status.PASS or (outcome.rows_examined and outcome.evidence):
+    if outcome.verdict is not Status.PASS:
         return outcome
-    missing = "rows examined" if not outcome.rows_examined else "evidence"
+    if not outcome.rows_examined or not outcome.evidence:
+        missing = "rows examined" if not outcome.rows_examined else "evidence"
+        diagnostic = f"VACUOUS_PASS_REFUSED: the check reported PASS with no {missing}"
+    else:
+        problem = _discrimination_problem(outcome.evidence)
+        if problem is None:
+            return outcome
+        diagnostic = f"NO_DISCRIMINATION: the check reported PASS but {problem}"
     return dataclasses.replace(
         outcome,
         verdict=Status.ABSTAIN,
         reason=Reason.INSUFFICIENT_EVIDENCE,
         failure_modes=(*outcome.failure_modes, FailureMode.VACUOUS_PASS),
-        diagnostics=(*outcome.diagnostics, f"VACUOUS_PASS_REFUSED: the check reported PASS with no {missing}"),
+        diagnostics=(*outcome.diagnostics, diagnostic),
     )
 
 
-def _run_one(
-    ctx: CheckContext, spec: CheckSpec, ledger: Ledger, registry: Mapping[str, str]
-) -> tuple[CheckResult, tuple[ClaimTally, ...]]:
-    """Run one check inside its ledger invocation. Always closes the invocation."""
-    digests = {input_id: ctx.inputs[input_id].sha256 if input_id in ctx.inputs else None for input_id in spec.inputs}
-    invocation_id = ledger.start(
-        check_id=spec.check_id,
-        check_kind=spec.kind,
-        check_version=spec.version,
-        input_ids=spec.inputs,
-        input_sha256s=digests,
-    )
-    tallies: tuple[ClaimTally, ...] = ()
+def _check_justification(outcome: CheckOutcome) -> None:
+    """Refuse a skip label outside the closed vocabulary, or on anything but a skipped abstention (17.7)."""
+    if not isinstance(outcome.evidence, Mapping) or SKIP_JUSTIFICATION_KEY not in outcome.evidence:
+        return
+    label = outcome.evidence[SKIP_JUSTIFICATION_KEY]
     try:
-        function = resolve_check(registry[spec.kind])
-    except (KeyError, CheckUnavailable) as exc:
-        result = _errored(spec, invocation_id, f"CHECK_UNAVAILABLE: {exc}")
-    else:
-        try:
-            outcome = function(ctx, spec)
-        except CheckParamError as exc:
-            result = _errored(spec, invocation_id, f"INVALID_PARAMS: {exc}")
-        except Exception as exc:  # the contract: a check that raises is ERRORED, never a crash
-            message = f"CHECK_RAISED: {type(exc).__name__}" + (f": {exc}" if str(exc) else "")
-            result = _errored(spec, invocation_id, message)
-        else:
-            try:
-                result, tallies = _result_from(spec, invocation_id, outcome)
-            except (TypeError, ValueError) as exc:
-                result = _errored(spec, invocation_id, f"INVALID_OUTCOME: {exc}")
-    evidence = ledger_evidence(result.to_dict())
-    ledger.finish(invocation_id, verdict=result.verdict, reason=result.reason, evidence=evidence)
-    return result, tallies
+        SkipJustification(label)
+    except ValueError:
+        raise ValueError(f"{SKIP_JUSTIFICATION_KEY} {label!r} is not a SkipJustification") from None
+    skipped = ExecutionState(outcome.execution_state) in (ExecutionState.SKIPPED, ExecutionState.NOT_APPLICABLE)
+    if not skipped or Status(outcome.verdict) is not Status.ABSTAIN:
+        raise ValueError(f"{SKIP_JUSTIFICATION_KEY} may label only a SKIPPED or NOT_APPLICABLE result that abstains")
 
 
 def _result_from(
     spec: CheckSpec, invocation_id: str, outcome: Any
 ) -> tuple[CheckResult, tuple[ClaimTally, ...]]:
+    """The single result builder: every check, falsifier and canary result is built here."""
     if not isinstance(outcome, CheckOutcome):
         raise TypeError(f"a check must return CheckOutcome, not {type(outcome).__name__}")
     if any(not isinstance(tally, ClaimTally) for tally in outcome.claim_tallies):
         raise TypeError("claim_tallies must contain ClaimTally instances")
+    _check_justification(outcome)
     outcome = _refuse_vacuous_pass(outcome)
     result = CheckResult(
         check_id=spec.check_id,
@@ -1655,25 +2259,528 @@ def _result_from(
     return result, tuple(outcome.claim_tallies)
 
 
+CheckFunction = Callable[[CheckContext, CheckSpec], CheckOutcome]
+
+
+def _invoke(
+    function: CheckFunction, ctx: CheckContext, spec: CheckSpec, invocation_id: str
+) -> tuple[CheckResult, tuple[ClaimTally, ...], CheckOutcome | None]:
+    """Call one check function and build its result. Never raises: every failure becomes an ERROR result."""
+    try:
+        outcome = function(ctx, spec)
+    except CheckParamError as exc:
+        return _errored(spec, invocation_id, f"INVALID_PARAMS: {exc}"), (), None
+    except Exception as exc:  # the contract: a check that raises is ERRORED, never a crash
+        message = f"CHECK_RAISED: {type(exc).__name__}" + (f": {exc}" if str(exc) else "")
+        return _errored(spec, invocation_id, message), (), None
+    try:
+        result, tallies = _result_from(spec, invocation_id, outcome)
+    except (TypeError, ValueError) as exc:
+        return _errored(spec, invocation_id, f"INVALID_OUTCOME: {exc}"), (), None
+    return result, tallies, outcome
+
+
+def _module_origin(module_name: str) -> Path | None:
+    """The source file of ``module_name``, found without importing it, or None."""
+    try:
+        found = importlib.util.find_spec(module_name)
+    except (ImportError, ValueError):
+        return None
+    origin = getattr(found, "origin", None) if found is not None else None
+    if not isinstance(origin, str):
+        return None
+    path = Path(origin)
+    return path if path.is_file() else None
+
+
+def module_source_sha256(module_name: str) -> str | None:
+    """SHA-256 of a module's source file; None when the module or its file cannot be found."""
+    origin = _module_origin(module_name)
+    if origin is None:
+        return None
+    try:
+        return sha256_file(origin)[0]
+    except OSError:
+        return None
+
+
+def params_sha256(params: Mapping[str, Any]) -> str:
+    """``sha256_canonical(dict(params))``: the digest of a check's params, as every module computes it (17.4)."""
+    return sha256_canonical(dict(params))
+
+
+def checker_sha256(target: str, module_sha256: str | None) -> str:
+    """The digest naming a checker: its ``module:function`` target and its module's source digest (17.4)."""
+    return sha256_canonical({"target": target, "module_sha256": module_sha256})
+
+
+class _Checkers:
+    """Checker digests for one run, computed from each module's source once."""
+
+    def __init__(self, registry: Mapping[str, str], module_digests: Mapping[str, str | None]) -> None:
+        self._registry = registry
+        self._modules = dict(module_digests)
+
+    def digest(self, kind: str) -> str:
+        target = self._registry.get(kind, "")
+        module = target.partition(":")[0]
+        if module not in self._modules:
+            self._modules[module] = module_source_sha256(module)
+        return checker_sha256(target, self._modules[module])
+
+
+def _validated_cases(cases: Any, ctx: CheckContext) -> tuple[FalsifierCase, ...]:
+    """A generator's return value, refused unless it is distinct cases over declared inputs."""
+    if not isinstance(cases, (list, tuple)):
+        raise TypeError(f"a falsifier generator must return a tuple of FalsifierCase, not {type(cases).__name__}")
+    seen: set[str] = set()
+    for case in cases:
+        if not isinstance(case, FalsifierCase):
+            raise TypeError(f"a falsifier generator returned {type(case).__name__}, not FalsifierCase")
+        if case.case_id in seen:
+            raise ValueError(f"case id {case.case_id!r} is returned twice")
+        seen.add(case.case_id)
+        undeclared = sorted(set(case.inputs) - set(ctx.inputs))
+        if undeclared:
+            raise ValueError(f"case {case.case_id!r} overrides undeclared input(s) {undeclared}")
+    return tuple(cases)
+
+
+@dataclass(frozen=True)
+class _Subject:
+    """The would-be PASS a falsifier tests: the same function, spec and digests for every case."""
+
+    spec: CheckSpec
+    function: CheckFunction
+    invocation_id: str
+    checker_sha256: str
+    params_sha256: str
+
+
+def _run_falsifier(ctx: CheckContext, subject: _Subject, case: FalsifierCase, ledger: Ledger) -> dict[str, Any]:
+    """Run the subject's checker over one known-bad overlay, inside its own ledger invocation."""
+    spec = subject.spec
+    overlay = ctx.overlay(case)
+    control_id = falsifier_check_id(spec.check_id, case.case_id)
+    digests = {input_id: overlay.inputs[input_id].sha256 if input_id in overlay.inputs else None for input_id in spec.inputs}
+    invocation_id = ledger.start(
+        check_id=control_id,
+        check_kind=spec.kind,
+        check_version=spec.version,
+        input_ids=spec.inputs,
+        input_sha256s=digests,
+    )
+    with _audit.current_check(control_id):
+        result, _, _ = _invoke(subject.function, overlay, spec, invocation_id)
+    if (result.verdict, result.reason) == (case.expected_verdict, case.expected_reason):
+        outcome = FalsifierOutcome.REJECTED
+    elif result.verdict is Status.PASS:
+        outcome = FalsifierOutcome.ACCEPTED
+    else:
+        outcome = FalsifierOutcome.INCONCLUSIVE
+    ledger.finish(
+        invocation_id,
+        verdict=result.verdict,
+        reason=result.reason,
+        evidence={
+            "control": "falsifier",
+            "subject_check_id": spec.check_id,
+            "subject_invocation_id": subject.invocation_id,
+            "case": case.to_dict(),
+            "checker_sha256": subject.checker_sha256,
+            "params_sha256": subject.params_sha256,
+            "outcome": outcome.value,
+        },
+    )
+    # The record names its invocation by its ledger check id, never by the run-derived invocation id:
+    # check evidence must stay a function of content, so a packaged run reproduces on another day (18.10).
+    # The ledger binds the two: the falsifier's terminal entry names the subject's invocation.
+    return {
+        "case_id": case.case_id,
+        "description": case.description,
+        "control_id": control_id,
+        "checker_sha256": subject.checker_sha256,
+        "params_sha256": subject.params_sha256,
+        "expected": {"verdict": case.expected_verdict.value, "reason": case.expected_reason.value},
+        "actual": {
+            "verdict": result.verdict.value,
+            "reason": result.reason.value,
+            "execution_state": result.execution_state.value,
+        },
+        "outcome": outcome.value,
+    }
+
+
+def _witness(
+    ctx: CheckContext,
+    subject: _Subject,
+    preliminary: CheckResult,
+    ledger: Ledger,
+    falsifiers: Mapping[str, str],
+    records: list[dict[str, Any]],
+) -> tuple[WitnessState, str]:
+    """Generate and run the subject's falsifiers; return the witness state and, unless WITNESSED, why."""
+    kind = subject.spec.kind
+    target = falsifiers.get(kind)
+    if target is None:
+        return WitnessState.NO_GENERATOR, f"no negative-control generator is registered for kind {kind!r}"
+    try:
+        generator = resolve_check(target)
+    except CheckUnavailable as exc:
+        return WitnessState.NO_GENERATOR, f"the negative-control generator for {kind!r} is unavailable: {exc}"
+    try:
+        # Preparing a case is not a check examining the data, so its reads are attributed to nobody.
+        with _audit.current_check(None):
+            cases = _validated_cases(generator(ctx, subject.spec, preliminary), ctx)
+    except Exception as exc:  # a broken generator leaves the PASS unwitnessed, never PASS
+        return WitnessState.UNWITNESSED, f"the generator for {kind!r} failed: {type(exc).__name__}: {exc}"
+    if not cases:
+        return WitnessState.NO_CASE, f"the generator found no known-bad case for this {kind} instance"
+    records.extend(_run_falsifier(ctx, subject, case, ledger) for case in cases)
+    accepted = [record["case_id"] for record in records if record["outcome"] == FalsifierOutcome.ACCEPTED.value]
+    if accepted:
+        return WitnessState.REFUTED, f"known-bad case(s) {accepted} were accepted as PASS: the checker cannot reject them"
+    if any(record["outcome"] == FalsifierOutcome.REJECTED.value for record in records):
+        return WitnessState.WITNESSED, ""
+    shown = "; ".join(
+        f"{record['case_id']} ended {record['actual']['verdict']}/{record['actual']['reason']}, "
+        f"expected {record['expected']['verdict']}/{record['expected']['reason']}"
+        for record in records
+    )
+    return WitnessState.UNWITNESSED, f"no known-bad case produced its expected rejection: {shown}"
+
+
+def _falsified(
+    ctx: CheckContext,
+    subject: _Subject,
+    preliminary: CheckResult,
+    outcome: CheckOutcome,
+    ledger: Ledger,
+    falsifiers: Mapping[str, str],
+) -> CheckResult:
+    """The subject's final result: its PASS kept only when WITNESSED (section 17.5, D2).
+
+    The witness evidence is added in every case, and the final result is
+    built by the same result builder as every other result.
+    """
+    records: list[dict[str, Any]] = []
+    state, detail = _witness(ctx, subject, preliminary, ledger, falsifiers, records)
+    evidence = {
+        **outcome.evidence,
+        "falsification": state.value,
+        "checker_sha256": subject.checker_sha256,
+        "params_sha256": subject.params_sha256,
+        "falsifiers": records,
+    }
+    final = dataclasses.replace(outcome, evidence=evidence)
+    if state is not WitnessState.WITNESSED:
+        status, reason, modes = FALSIFICATION_OUTCOMES[state]
+        final = dataclasses.replace(
+            final,
+            verdict=status,
+            reason=reason,
+            failure_modes=(*outcome.failure_modes, *modes),
+            diagnostics=(*outcome.diagnostics, f"FALSIFIER_{state.value}: {detail}"),
+        )
+    try:
+        return _result_from(subject.spec, subject.invocation_id, final)[0]
+    except (TypeError, ValueError) as exc:
+        return _errored(subject.spec, subject.invocation_id, f"INVALID_OUTCOME: {exc}")
+
+
+def _run_one(
+    ctx: CheckContext,
+    spec: CheckSpec,
+    ledger: Ledger,
+    registry: Mapping[str, str],
+    falsifiers: Mapping[str, str],
+    checkers: _Checkers,
+) -> tuple[CheckResult, tuple[ClaimTally, ...]]:
+    """Run one check inside its ledger invocation, falsify a would-be PASS, and always close the invocation.
+
+    Ledger order: the subject's STARTED entry, then each falsifier's STARTED
+    and terminal entries, then the subject's terminal entry, which records
+    the final (possibly downgraded) verdict.
+    """
+    digests = {input_id: ctx.inputs[input_id].sha256 if input_id in ctx.inputs else None for input_id in spec.inputs}
+    invocation_id = ledger.start(
+        check_id=spec.check_id,
+        check_kind=spec.kind,
+        check_version=spec.version,
+        input_ids=spec.inputs,
+        input_sha256s=digests,
+    )
+    tallies: tuple[ClaimTally, ...] = ()
+    try:
+        function = resolve_check(registry[spec.kind])
+    except (KeyError, CheckUnavailable) as exc:
+        result = _errored(spec, invocation_id, f"CHECK_UNAVAILABLE: {exc}")
+    else:
+        with _audit.current_check(spec.check_id):
+            result, tallies, outcome = _invoke(function, ctx, spec, invocation_id)
+        if result.verdict is Status.PASS and outcome is not None:
+            subject = _Subject(spec, function, invocation_id, checkers.digest(spec.kind), params_sha256(spec.params))
+            result = _falsified(ctx, subject, result, outcome, ledger, falsifiers)
+    ledger.finish(invocation_id, verdict=result.verdict, reason=result.reason, evidence=ledger_evidence(result.to_dict()))
+    return result, tallies
+
+
+def _recording_view(ctx: CheckContext) -> CheckContext:
+    """The same context with every mapping-valued row wrapped so value reads are reported (17.6, 17.12)."""
+    inputs: dict[str, OpenedInput] = {}
+    for input_id, opened in ctx.inputs.items():
+        if opened.rows is None:
+            inputs[input_id] = opened
+            continue
+        rows = tuple(
+            Row(row.index, row.line, _audit.RecordingMapping(row.values, input_id, row.index))
+            if isinstance(row.values, Mapping)
+            else row
+            for row in opened.rows
+        )
+        inputs[input_id] = dataclasses.replace(opened, rows=rows)
+    return ctx._derive(inputs)
+
+
 def run_checks(
     ctx: CheckContext,
     specs: Iterable[CheckSpec],
     ledger: Ledger,
     registry: Mapping[str, str] = REGISTRY,
+    falsifiers: Mapping[str, str] = FALSIFIERS,
+    module_digests: Mapping[str, str | None] | None = None,
 ) -> tuple[tuple[CheckResult, ...], tuple[tuple[str, ClaimTally], ...]]:
     """Run every declared check, in manifest order, each in its own invocation.
 
     A failing or crashing check never stops the run: the remaining checks
-    still execute, so one early FAIL cannot hide a later problem. Returns the
+    still execute, so one early FAIL cannot hide a later problem. Every
+    would-be PASS is falsified before its verdict is recorded. Returns the
     results and the ``(check_id, ClaimTally)`` pairs the checks reported.
+    ``module_digests`` supplies the source digests already pinned, so a
+    checker digest names exactly the module the PLAN pinned.
     """
+    view = _recording_view(ctx) if _audit.values_requested() else ctx
+    checkers = _Checkers(registry, module_digests or {})
     results: list[CheckResult] = []
     tallies: list[tuple[str, ClaimTally]] = []
     for spec in specs:
-        result, reported = _run_one(ctx, spec, ledger, registry)
+        result, reported = _run_one(view, spec, ledger, registry, falsifiers, checkers)
         results.append(result)
         tallies.extend((spec.check_id, tally) for tally in reported)
     return tuple(results), tuple(tallies)
+
+
+# ---------------------------------------------------------------------------
+# Run-level controls: comparator self-test and canary (sections 17.5, 17.6)
+# ---------------------------------------------------------------------------
+
+COMPARATOR_KIND = "comparator_self_test"
+CANARY_INPUT = "control-canary"
+_CANARY_COLUMNS = ("id", "value")
+_CANARY_SPEC = InputSpec(input_id=CANARY_INPUT, path=CANARY_INPUT, format="csv")
+#: ``(control id, rows, expected verdict)``: an exact duplicate must FAIL; two distinct rows must PASS.
+_CANARIES: tuple[tuple[str, tuple[tuple[str, str], ...], Status], ...] = (
+    (CANARY_MUST_FAIL, (("c1", "1"), ("c1", "1")), Status.FAIL),
+    (CANARY_MUST_PASS, (("c1", "1"), ("c2", "2")), Status.PASS),
+)
+
+
+def _run_comparator_control(ledger: Ledger) -> dict[str, Any]:
+    """Invocation ``control:comparator``: PASS only if the live comparator told every known pair apart."""
+    invocation_id = ledger.start(check_id=COMPARATOR_CONTROL, check_kind=COMPARATOR_KIND, check_version="1")
+    with _audit.current_check(COMPARATOR_CONTROL):
+        pairs = [dict(pair) for pair in _invariants.run_comparator_self_test()]
+    holds = all(pair["actual"] == pair["expected"] for pair in pairs)
+    verdict, reason = (Status.PASS, Reason.VERIFIED) if holds else (Status.FAIL, Reason.BLIND_SPOT)
+    ledger.finish(invocation_id, verdict=verdict, reason=reason, evidence={"control": "comparator", "pairs": pairs, "holds": holds})
+    return {"invocation_id": invocation_id, "pairs": pairs, "holds": holds}
+
+
+def _run_canary(ctx: CheckContext, ledger: Ledger, control_id: str, rows: Sequence[tuple[str, str]]) -> dict[str, Any]:
+    """One canary: ``check_duplicate_rows`` over an in-memory CSV, through the same builder and ledger as every check."""
+    override = InputOverride(tuple(dict(zip(_CANARY_COLUMNS, row)) for row in rows), _CANARY_COLUMNS)
+    opened = memory_input(_CANARY_SPEC, override)
+    canary_ctx = ctx._derive({CANARY_INPUT: opened}, files={}, roles={}, preloaded=set(), sealed=True)
+    spec = CheckSpec(check_id=control_id, kind="duplicate_rows", version="1", required=True, inputs=(CANARY_INPUT,))
+    invocation_id = ledger.start(
+        check_id=control_id,
+        check_kind=spec.kind,
+        check_version=spec.version,
+        input_ids=spec.inputs,
+        input_sha256s={CANARY_INPUT: opened.sha256},
+    )
+    with _audit.current_check(control_id):
+        result, _, _ = _invoke(check_duplicate_rows, canary_ctx, spec, invocation_id)
+    ledger.finish(
+        invocation_id,
+        verdict=result.verdict,
+        reason=result.reason,
+        evidence={"control": "canary", **ledger_evidence(result.to_dict())},
+    )
+    return {"invocation_id": invocation_id, "verdict": result.verdict.value, "reason": result.reason.value}
+
+
+def _run_canaries(ctx: CheckContext, ledger: Ledger) -> dict[str, Any]:
+    """The must-fail canary and its known-good twin; ``holds`` only when each ended as it must."""
+    summary: dict[str, Any] = {}
+    holds = True
+    for control_id, rows, expected in _CANARIES:
+        name = control_id.rsplit(":", 1)[1]
+        summary[name] = _run_canary(ctx, ledger, control_id, rows)
+        holds = holds and summary[name]["verdict"] == expected.value
+    summary["holds"] = holds
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# PLAN and harness pins (sections 17.4, 17.6)
+# ---------------------------------------------------------------------------
+
+#: The module that holds the engine itself; it is pinned in every run.
+ENGINE_MODULE = "science_gate.verifier"
+
+
+@dataclass(frozen=True)
+class _Pin:
+    """One pinned file: what it is, how the run names it, and its digest before anything ran."""
+
+    role: str
+    path: str
+    sha256: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"role": self.role, "path": self.path, "sha256": self.sha256}
+
+
+def _pin_location(manifest: Manifest, role: str, path: str) -> Path | None:
+    """The file a pin names: a module's source, or a path confined to the manifest directory."""
+    if role == "check_module":
+        return _module_origin(path)
+    try:
+        return resolve_under_root(manifest.root, path)
+    except (SafeIOError, OSError, ValueError):
+        return None
+
+
+def _pin_digest(manifest: Manifest, role: str, path: str) -> str | None:
+    """The current digest of a pinned file, by the one rule used before and after the run; None when unreadable."""
+    location = _pin_location(manifest, role, path)
+    if location is None:
+        return None
+    limit = None if role == "check_module" else max(manifest.limits.max_file_bytes, MAX_MANIFEST_BYTES)
+    try:
+        return sha256_file(location, max_bytes=limit)[0]
+    except (OSError, SizeLimitExceeded):
+        return None
+
+
+def _display_path(path: str) -> str:
+    """A declared path as reports show it: normalized when it is safe, verbatim otherwise."""
+    try:
+        return normalize_relpath(path)
+    except UnsafePathError:
+        return path
+
+
+def _harness_pins(
+    manifest: Manifest, ctx: CheckContext, registry: Mapping[str, str], falsifiers: Mapping[str, str]
+) -> tuple[_Pin, ...]:
+    """Pin the manifest, every declared input, every file read so far, and every module that will judge them.
+
+    Taken after preloading and before the PLAN, so the PLAN commits to the
+    exact bytes the checks will see and to the code that will judge them.
+    """
+    wanted = {("manifest", manifest.path.name)}
+    wanted |= {("input", _display_path(spec.path)) for spec in manifest.inputs}
+    wanted |= {("document", item["path"]) for item in ctx.read_log()}
+    kinds = {spec.kind for spec in manifest.checks}
+    modules = {ENGINE_MODULE}
+    modules |= {table[kind].partition(":")[0] for table in (registry, falsifiers) for kind in kinds if kind in table}
+    wanted |= {("check_module", module) for module in modules}
+    return tuple(_Pin(role, path, _pin_digest(manifest, role, path)) for role, path in sorted(wanted))
+
+
+def _watched(manifest: Manifest, pins: Sequence[_Pin]) -> dict[str, str]:
+    """Every spelling the audit hook may report for a pinned file, mapped to the pin's path."""
+    watched: dict[str, str] = {}
+    for pin in pins:
+        location = _pin_location(manifest, pin.role, pin.path)
+        if location is not None:
+            watched[_audit.normalize_path(location)] = pin.path
+            watched[_audit.normalize_path(location, resolve=True)] = pin.path
+    return watched
+
+
+def _pin_report(
+    manifest: Manifest, pins: Sequence[_Pin], watched: Mapping[str, str], recorder: _audit.AuditRecorder
+) -> dict[str, Any]:
+    """Re-hash every pin from disk and list every write that touched one (``DecisionInputs.pins``)."""
+    pinned = [{**pin.to_dict(), "sha256_after": _pin_digest(manifest, pin.role, pin.path)} for pin in pins]
+    writes: list[dict[str, str]] = []
+    for event in recorder.writes:
+        item = {"path": watched.get(event.path, event.path), "action": event.action, "event": event.event}
+        if item not in writes:
+            writes.append(item)
+    return {"pinned": pinned, "writes": writes, "hook_errors": recorder.errors}
+
+
+def build_plan(
+    manifest: Manifest,
+    accounting: InputAccounting,
+    pins: Sequence[Mapping[str, Any]],
+    run_id: str,
+    registry: Mapping[str, str] = REGISTRY,
+) -> dict[str, Any]:
+    """The body of the run's PLAN entry (section 17.4): what this run commits to before executing.
+
+    Inputs come from the accounting records joined to their declarations,
+    with the population each input must have (``expected_rows`` and its
+    source). Checks carry their params and checker digests, so a changed
+    checker or a weakened parameter is a different plan. ``pins`` are the
+    harness pins; a checker digest reuses its module's pinned digest.
+    """
+    records = {record.input_id: record for record in accounting.records}
+    inputs = []
+    for spec in sorted(manifest.inputs, key=lambda item: item.input_id):
+        record = records.get(spec.input_id)
+        inputs.append(
+            {
+                "input_id": spec.input_id,
+                "required": record.required if record is not None else spec.required,
+                "format": record.format if record is not None else spec.format,
+                "declared_sha256": record.declared_sha256 if record is not None else spec.sha256,
+                "row_key": list(spec.row_key),
+                "expected_rows": spec.expected_rows,
+                "denominator_source": spec.denominator_source.value,
+            }
+        )
+    modules = {pin["path"]: pin["sha256"] for pin in pins if pin.get("role") == "check_module"}
+    checkers = _Checkers(registry, modules)
+    checks = [
+        {
+            "check_id": spec.check_id,
+            "kind": spec.kind,
+            "version": spec.version,
+            "required": spec.required,
+            "inputs": sorted(spec.inputs),
+            "params_sha256": params_sha256(spec.params),
+            "checker_sha256": checkers.digest(spec.kind),
+        }
+        for spec in sorted(manifest.checks, key=lambda item: item.check_id)
+    ]
+    return {
+        "schema": PLAN_SCHEMA,
+        "run_id": run_id,
+        "manifest_sha256": manifest.sha256,
+        "tool": {"name": TOOL_NAME, "version": __version__},
+        "inputs": inputs,
+        "checks": checks,
+        "pins": sorted(
+            ({"role": pin["role"], "path": pin["path"], "sha256": pin["sha256"]} for pin in pins),
+            key=lambda pin: (pin["role"], pin["path"]),
+        ),
+        "controls": sorted(PLANNED_CONTROLS),
+    }
 
 
 def _examined_inputs(checks: Iterable[CheckResult], inputs: Mapping[str, OpenedInput]) -> set[str]:
@@ -1688,23 +2795,17 @@ def _examined_inputs(checks: Iterable[CheckResult], inputs: Mapping[str, OpenedI
 
 
 def _rows_examined(checks: Sequence[CheckResult], inputs: Mapping[str, OpenedInput]) -> int:
-    """Distinct rows examined in scope.
+    """The run's ``rows_examined`` (G1): distinct admitted data rows of declared inputs an executed check consumed.
 
-    Admitted rows of each input that an executed check consumed are counted
-    once, however many checks read them. Checks that read no declared input
-    (reviewer verdicts, time events) add the records they examined.
+    Each row counts once, however many checks read it. Comparisons, pins,
+    verdicts, events, citations and claims are never rows, so a check that
+    compared a digest cannot make a header-only input look examined.
     """
-    from_inputs = sum(len(inputs[input_id].rows or ()) for input_id in _examined_inputs(checks, inputs))
-    standalone = sum(
-        check.rows_examined
-        for check in checks
-        if check.execution_state is ExecutionState.CHECKED and not check.inputs and check.rows_examined is not None
-    )
-    return from_inputs + standalone
+    return sum(len(inputs[input_id].rows or ()) for input_id in _examined_inputs(checks, inputs))
 
 
 # ---------------------------------------------------------------------------
-# Decision (section 6)
+# Decision (section 6, amended by 17.7)
 # ---------------------------------------------------------------------------
 
 
@@ -1738,7 +2839,9 @@ class DecisionInputs:
 
     ``declared_checks`` maps each declared check id to ``required``. It is
     None only when the manifest could not be read, in which case the number of
-    expected checks is unknown, not zero.
+    expected checks is unknown, not zero. ``expected_plan``, ``pins`` and
+    ``controls`` (section 17) are optional, so a sealed run can be replayed;
+    an absent one leaves its invariant not applicable rather than holding.
     """
 
     accounting: InputAccounting
@@ -1752,11 +2855,14 @@ class DecisionInputs:
     rows_examined: int | None = None
     claim_tallies: tuple[ClaimTally, ...] = ()
     manifest_issues: tuple[str, ...] = ()
+    expected_plan: Mapping[str, Any] | None = None
+    pins: Mapping[str, Any] | None = None
+    controls: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class Decision:
-    """The decided status, with every finding and invariant that led to it."""
+    """The decided status, with every finding and invariant that led to it, and the lattice's transition log."""
 
     status: Status
     reason: Reason
@@ -1765,6 +2871,60 @@ class Decision:
     findings: tuple[Finding, ...]
     invariants: tuple[InvariantResult, ...]
     counters: Mapping[str, Any]
+    transitions: tuple[VerdictTransition, ...] = ()
+
+
+@dataclass(frozen=True)
+class _Shortfall:
+    """A required check that did not execute, why, and the closed-vocabulary label it carries (if any)."""
+
+    check_id: str
+    why: str
+    justification: SkipJustification | None
+
+
+def _executed(check: CheckResult, traces: Mapping[str, InvocationTrace]) -> bool:
+    """Executed means CHECKED with a terminal ledger invocation; anything less is a shortfall."""
+    trace = traces.get(check.invocation_id) if check.invocation_id else None
+    return check.execution_state is ExecutionState.CHECKED and trace is not None and trace.terminal
+
+
+def _justification_of(check: CheckResult) -> SkipJustification | None:
+    """The label of a skipped abstention, or None. A label on anything else justifies nothing."""
+    if check.execution_state is ExecutionState.CHECKED or check.verdict is not Status.ABSTAIN:
+        return None
+    try:
+        return SkipJustification(check.evidence.get(SKIP_JUSTIFICATION_KEY))
+    except ValueError:
+        return None
+
+
+def _shortfalls(
+    checks: Sequence[CheckResult], declared_checks: Mapping[str, bool] | None, traces: Mapping[str, InvocationTrace]
+) -> tuple[_Shortfall, ...] | None:
+    """Every required check that did not execute, in check-id order (G2). None when nothing is known to be required.
+
+    A result whose verdict is ERROR is not a shortfall: its own ERROR
+    decides the run.
+    """
+    if declared_checks is None:
+        return None
+    by_id = {check.check_id: check for check in checks}
+    found: list[_Shortfall] = []
+    for check_id in sorted(check_id for check_id, required in declared_checks.items() if required):
+        check = by_id.get(check_id)
+        if check is None:
+            found.append(_Shortfall(check_id, "it has no result", None))
+            continue
+        if check.verdict is Status.ERROR or _executed(check, traces):
+            continue
+        why = (
+            "its result has no terminal invocation"
+            if check.execution_state is ExecutionState.CHECKED
+            else f"it was {check.execution_state.value}"
+        )
+        found.append(_Shortfall(check_id, why, _justification_of(check)))
+    return tuple(found)
 
 
 def run_counters(
@@ -1779,20 +2939,19 @@ def run_counters(
     Check counters count **required** checks, so ``checks_executed`` is
     comparable with ``checks_expected``. A required check counts as executed
     only if it reached CHECKED *and* its invocation has a terminal ledger
-    entry. Unknown values are None, never zero.
+    entry. ``checks_shortfall`` counts required checks that did not execute
+    (ERROR excluded) and ``checks_justified`` those of them carrying a
+    closed-vocabulary label. Unknown values are None, never zero.
     """
     traces = index_invocations(entries)
     known = declared_checks is not None
     required_ids = sorted(check_id for check_id, required in (declared_checks or {}).items() if required)
     by_id = {check.check_id: check for check in checks}
     required = [by_id[check_id] for check_id in required_ids if check_id in by_id]
+    shortfalls = _shortfalls(checks, declared_checks, traces)
 
     def count(predicate: Callable[[CheckResult], bool]) -> int | None:
         return sum(1 for check in required if predicate(check)) if known else None
-
-    def executed(check: CheckResult) -> bool:
-        trace = traces.get(check.invocation_id) if check.invocation_id else None
-        return check.execution_state is ExecutionState.CHECKED and trace is not None and trace.terminal
 
     return {
         "expected_inputs": accounting.value("expected"),
@@ -1803,13 +2962,16 @@ def run_counters(
         "rows_examined": rows_examined,
         "checks_declared": len(declared_checks) if known else None,
         "checks_expected": len(required_ids) if known else None,
-        "checks_executed": count(executed),
+        "checks_executed": count(lambda check: _executed(check, traces)),
         "checks_passed": count(lambda check: check.verdict is Status.PASS),
         "checks_failed": count(lambda check: check.verdict is Status.FAIL),
         "checks_abstained": count(lambda check: check.verdict is Status.ABSTAIN),
         "checks_errored": count(lambda check: check.verdict is Status.ERROR),
         "checks_skipped": count(lambda check: check.execution_state is ExecutionState.SKIPPED),
         "checks_not_applicable": count(lambda check: check.execution_state is ExecutionState.NOT_APPLICABLE),
+        "checks_shortfall": None if shortfalls is None else len(shortfalls),
+        "checks_justified": None if shortfalls is None else sum(1 for item in shortfalls if item.justification),
+        "control_invocations": sum(1 for trace in traces.values() if is_control(trace.check_id)) if known else None,
     }
 
 
@@ -1866,9 +3028,18 @@ def _check_findings(checks: Sequence[CheckResult]) -> list[Finding]:
 
 
 def _contract_findings(
-    counters: Mapping[str, Any], evidence_manifest: Sequence[Mapping[str, Any]] | None
+    counters: Mapping[str, Any],
+    evidence_manifest: Sequence[Mapping[str, Any]] | None,
+    shortfalls: Sequence[_Shortfall] | None,
 ) -> list[Finding]:
-    """The PASS contract's counting rules (section 6), each as its own finding."""
+    """The PASS contract's counting rules (section 6), each as its own finding.
+
+    ``contract:checks_executed`` gives one finding per required check that
+    did not execute (G2): a closed-vocabulary label contributes its row of
+    ``SKIP_JUSTIFICATION_OUTCOMES`` (always ABSTAIN); anything else,
+    including no result at all, is ``UNJUSTIFIED_SHORTFALL_OUTCOME``, FAIL /
+    PARTIAL_EXECUTION (D1).
+    """
     findings: list[Finding] = []
     vacuous = (FailureMode.VACUOUS_PASS,)
 
@@ -1881,43 +3052,75 @@ def _contract_findings(
         abstain("inputs_opened", Reason.INSUFFICIENT_EVIDENCE, vacuous, "no input was opened")
     rows = counters["rows_examined"]
     if rows is None or rows < 1:
-        detail = f"rows_examined is {rows}; a PASS needs at least 1"
+        detail = f"rows_examined={rows} (distinct data rows of declared inputs); a PASS needs at least 1"
         abstain("rows_examined", Reason.INSUFFICIENT_EVIDENCE, vacuous, detail)
     expected, executed = counters["checks_expected"], counters["checks_executed"]
     if expected == 0:
         abstain("checks_expected", Reason.INSUFFICIENT_EVIDENCE, vacuous, "no required check was declared")
-    elif expected is not None and executed != expected:
-        abstain(
-            "checks_executed",
-            Reason.PARTIAL_EXECUTION,
-            (FailureMode.PARTIAL_EXECUTION,),
-            f"checks_executed={executed} of checks_expected={expected}",
-        )
+    for shortfall in shortfalls or ():
+        tally = f"checks_executed={executed} of checks_expected={expected}"
+        if shortfall.justification is not None:
+            status, reason, modes = SKIP_JUSTIFICATION_OUTCOMES[shortfall.justification]
+            detail = f"required check {shortfall.check_id!r} did not execute: {shortfall.why}, justified as "
+            detail += f"{shortfall.justification.value} ({tally})"
+        else:
+            status, reason, modes = UNJUSTIFIED_SHORTFALL_OUTCOME
+            detail = f"required check {shortfall.check_id!r} did not execute: {shortfall.why}, with no "
+            detail += f"closed-vocabulary justification ({tally})"
+        findings.append(Finding(status, reason, modes, "contract:checks_executed", detail))
     if not evidence_manifest:
         abstain("evidence_manifest", Reason.INSUFFICIENT_EVIDENCE, vacuous, "the evidence manifest is empty")
     return findings
 
 
-def _combine(findings: Sequence[Finding]) -> tuple[Status, Reason, tuple[Reason, ...], tuple[FailureMode, ...]]:
-    """Precedence ERROR > FAIL > ABSTAIN > PASS; the first finding at the top level names the reason."""
-    if not findings:
-        return Status.PASS, Reason.VERIFIED, (Reason.VERIFIED,), ()
-    top = max(_RANK[finding.status] for finding in findings)
-    primary = next(finding for finding in findings if _RANK[finding.status] == top)
-    reasons = tuple(dict.fromkeys(finding.reason for finding in findings))
+@dataclass(frozen=True)
+class _Settled:
+    status: Status
+    reason: Reason
+    reasons: tuple[Reason, ...]
+    failure_modes: tuple[FailureMode, ...]
+    transitions: tuple[VerdictTransition, ...]
+
+
+def _settle(checks: Sequence[CheckResult], findings: Sequence[Finding]) -> _Settled:
+    """Join the verdict lattice and choose the primary reason (17.7).
+
+    The status is the join of every required PASS (in check-id order) and
+    every finding (in gathering order). Nothing at all is NONE, which
+    resolves to ``EMPTY_AGGREGATE_OUTCOME``: an empty aggregate never PASSes.
+    The primary reason is the first finding at the top status, except that
+    at FAIL a PARTIAL_EXECUTION finding counts only when no other FAIL
+    finding exists (G3): a content failure names the reason, and an
+    unexplained shortfall names it otherwise.
+    """
+    passing = sorted(check.check_id for check in checks if check.required and check.verdict is Status.PASS)
+    contributions = [(f"check:{check_id}", Status.PASS, Reason.VERIFIED) for check_id in passing]
+    contributions += [(finding.source, finding.status, finding.reason) for finding in findings]
+    level, transitions = fold_verdicts(contributions)
     modes = tuple(sorted({mode for finding in findings for mode in finding.failure_modes}, key=lambda mode: mode.value))
-    return primary.status, primary.reason, reasons, modes
+    if level is VerdictLevel.NONE:
+        status, reason = EMPTY_AGGREGATE_OUTCOME
+        return _Settled(status, reason, (reason,), (*modes, FailureMode.VACUOUS_PASS), transitions)
+    status = Status(level.value)
+    if status is Status.PASS:
+        return _Settled(Status.PASS, Reason.VERIFIED, (Reason.VERIFIED,), (), transitions)
+    top = [finding for finding in findings if finding.status is status]
+    if status is Status.FAIL:
+        top = [finding for finding in top if finding.reason is not Reason.PARTIAL_EXECUTION] or top
+    reasons = tuple(dict.fromkeys(finding.reason for finding in findings))
+    return _Settled(status, top[0].reason, reasons, modes, transitions)
 
 
 def decide(inputs: DecisionInputs) -> Decision:
-    """Apply the PASS contract and the status precedence (section 6).
+    """Apply the PASS contract and the verdict lattice (sections 6 and 17.7).
 
-    Findings are gathered in a fixed order: manifest, inputs, checks,
-    contract counters, then invariants. That order is also the tie-break for
-    the primary reason. The invariants are evaluated *after* a tentative
-    status is known, and with that status as the run's claim, so the
-    ``pass_requires_*`` invariants judge exactly the PASS the run is about to
-    report. Any violation then outranks the tentative PASS.
+    Findings are gathered in a fixed order: manifest, inputs, checks
+    (by id), contract counters, then invariants (in ``INVARIANT_NAMES``
+    order). That order is also the tie-break for the primary reason. The
+    invariants are evaluated *after* a tentative status is known, and with
+    that status as the run's claim, so the ``pass_requires_*`` invariants
+    judge exactly the PASS the run is about to report. Any violation then
+    outranks the tentative PASS.
 
     Only required checks decide FAIL and ABSTAIN. An optional check's
     non-PASS result stays visible in its own record but does not decide the
@@ -1935,8 +3138,9 @@ def decide(inputs: DecisionInputs) -> Decision:
     if not inputs.manifest_issues:
         findings += _input_findings(inputs.accounting)
         findings += _check_findings(inputs.checks)
-        findings += _contract_findings(counters, inputs.evidence_manifest)
-    tentative = _combine(findings)[0]
+        shortfalls = _shortfalls(inputs.checks, inputs.declared_checks, index_invocations(inputs.entries))
+        findings += _contract_findings(counters, inputs.evidence_manifest, shortfalls)
+    tentative = _settle(inputs.checks, findings).status
     invariants = evaluate_invariants(
         InvariantContext(
             entries=inputs.entries,
@@ -1949,6 +3153,10 @@ def decide(inputs: DecisionInputs) -> Decision:
             ledger_length=inputs.ledger_length,
             run_id=inputs.run_id,
             claim_tallies=inputs.claim_tallies,
+            expected_plan=inputs.expected_plan,
+            pins=inputs.pins,
+            controls=inputs.controls,
+            rows_examined=inputs.rows_examined,
         )
     )
     for invariant in invariants:
@@ -1958,8 +3166,105 @@ def decide(inputs: DecisionInputs) -> Decision:
             findings.append(
                 Finding(outcome.status, outcome.reason, (outcome.failure_mode,), source, invariant.detail)
             )
-    status, reason, reasons, modes = _combine(findings)
-    return Decision(status, reason, reasons, modes, tuple(findings), invariants, counters)
+    settled = _settle(inputs.checks, findings)
+    return Decision(
+        settled.status,
+        settled.reason,
+        settled.reasons,
+        settled.failure_modes,
+        tuple(findings),
+        invariants,
+        counters,
+        settled.transitions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run-level controls summary (section 17.8)
+# ---------------------------------------------------------------------------
+
+
+def _min_discrimination(checks: Sequence[CheckResult]) -> dict[str, Any] | None:
+    """The least discriminating PASS, by exact value over results that record ``discrimination_ratio``."""
+    best: tuple[Fraction, CheckResult] | None = None
+    for check in sorted(checks, key=lambda item: item.check_id):
+        ratio = check.evidence.get("discrimination_ratio")
+        if check.verdict is not Status.PASS or not isinstance(ratio, Mapping):
+            continue
+        try:
+            value = Ratio(ratio.get("numerator"), ratio.get("denominator")).value
+        except ValueError:
+            continue
+        if value is not None and (best is None or value < best[0]):
+            best = (value, check)
+    if best is None:
+        return None
+    check = best[1]
+    return {
+        "check_id": check.check_id,
+        "discrimination": check.evidence.get("discrimination"),
+        "ratio": check.evidence["discrimination_ratio"],
+    }
+
+
+def _claim_join_totals(checks: Sequence[CheckResult]) -> dict[str, int] | None:
+    """The outcome counts of every ``claim_join`` result, summed; None when none recorded counts."""
+    totals: dict[str, int] | None = None
+    for check in checks:
+        counts = check.evidence.get("counts")
+        if check.kind != "claim_join" or not isinstance(counts, Mapping):
+            continue
+        totals = totals or {outcome.value: 0 for outcome in AssertionOutcome}
+        for outcome in AssertionOutcome:
+            value = counts.get(outcome.value)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[outcome.value] += value
+    return totals
+
+
+def _run_controls(
+    *,
+    plan: Mapping[str, Any],
+    plan_entry: Mapping[str, Any],
+    checks: Sequence[CheckResult],
+    entries: Sequence[Mapping[str, Any]],
+    canary: Mapping[str, Any],
+    comparator: Mapping[str, Any],
+    pins: Mapping[str, Any],
+) -> dict[str, Any]:
+    """``RunResult.controls`` before the decision adds its transition log."""
+    witnesses: dict[str, Any] = {state.value: [] for state in WitnessState}
+    for check in sorted(checks, key=lambda item: item.check_id):
+        state = check.evidence.get("falsification")
+        if state in witnesses:
+            witnesses[state].append(check.check_id)
+    witnesses["invocations"] = sum(
+        1
+        for trace in index_invocations(entries).values()
+        if trace.check_id is not None and trace.check_id.startswith(_invariants.FALSIFIER_PREFIX)
+    )
+    changed = [item["path"] for item in pins["pinned"] if item["sha256"] != item["sha256_after"]]
+    return {
+        "plan": {
+            "entry_sha256": plan_entry["entry_sha256"],
+            "manifest_sha256": plan["manifest_sha256"],
+            "checks_planned": len(plan["checks"]),
+            "inputs_planned": len(plan["inputs"]),
+            "pins": len(plan["pins"]),
+        },
+        "falsifiers": witnesses,
+        "canary": dict(canary),
+        "comparator_self_test": dict(comparator),
+        "pins": {
+            "pinned": len(pins["pinned"]),
+            "changed": changed,
+            "writes": list(pins["writes"]),
+            "holds": not changed and not pins["writes"] and not pins["hook_errors"],
+        },
+        "min_discrimination": _min_discrimination(checks),
+        "claim_join": _claim_join_totals(checks),
+        "verdict_transitions": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2029,7 +3334,11 @@ def build_evidence_manifest(
 
 @dataclass(frozen=True)
 class VerificationRun:
-    """Everything one ``verify`` produced, ready for :mod:`science_gate.reports`."""
+    """Everything one ``verify`` produced, ready for :mod:`science_gate.reports`.
+
+    ``plan`` is the PLAN body the ledger opens with (None for an invalid
+    manifest); ``controls`` mirrors ``RunResult.controls``.
+    """
 
     result: RunResult
     ledger: Ledger
@@ -2042,6 +3351,8 @@ class VerificationRun:
     documents: tuple[Mapping[str, Any], ...] = ()
     claim_tallies: tuple[tuple[str, ClaimTally], ...] = ()
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
+    plan: Mapping[str, Any] | None = None
+    pins: Mapping[str, Any] | None = None
 
     @property
     def status(self) -> Status:
@@ -2050,6 +3361,10 @@ class VerificationRun:
     @property
     def exit_code(self) -> int:
         return self.result.exit_code
+
+    @property
+    def controls(self) -> Mapping[str, Any]:
+        return self.result.controls
 
 
 def _unavailable_accounting() -> InputAccounting:
@@ -2067,7 +3382,7 @@ def _digest_if_readable(path: Path) -> str | None:
 
 
 def _run_id(material: Mapping[str, Any]) -> str:
-    """``run-`` plus 16 hex of a content hash: never random, stable under a fixed clock."""
+    """``run-`` plus 16 hex of a content hash: never random, stable under a fixed clock (D11)."""
     return "run-" + sha256_canonical(material)[:16]
 
 
@@ -2079,6 +3394,7 @@ def _finish(
     checks: tuple[CheckResult, ...],
     evidence: Mapping[str, Any],
     decision_inputs: DecisionInputs,
+    controls: Mapping[str, Any],
 ) -> tuple[RunResult, Decision]:
     decision = decide(decision_inputs)
     result = RunResult(
@@ -2094,12 +3410,13 @@ def _finish(
         started_at=started_at,
         completed_at=now(),
         counters=decision.counters,
+        controls={**controls, "verdict_transitions": [item.to_dict() for item in decision.transitions]},
     )
     return result, decision
 
 
 def _invalid_manifest_run(path: Path, error: ManifestError, started_at: str, network: NetworkPolicy) -> VerificationRun:
-    """An ERROR run for a manifest that is missing, malformed or unsafe. Nothing else is read."""
+    """An ERROR run for a manifest that is missing, malformed or unsafe. Nothing else is read or planned."""
     digest = _digest_if_readable(path)
     issues = tuple(str(issue) for issue in error.issues)
     run_id = _run_id({"manifest": path.name, "manifest_sha256": digest, "issues": issues, "started_at": started_at})
@@ -2128,6 +3445,7 @@ def _invalid_manifest_run(path: Path, error: ManifestError, started_at: str, net
             rows_examined=0,
             manifest_issues=issues,
         ),
+        controls=empty_controls(),
     )
     return VerificationRun(
         result=result,
@@ -2147,28 +3465,36 @@ def verify(
     live: bool = False,
     network: NetworkPolicy | None = None,
     registry: Mapping[str, str] = REGISTRY,
+    falsifiers: Mapping[str, str] = FALSIFIERS,
 ) -> VerificationRun:
     """Verify the manifest at ``manifest_path`` and return the decided run.
 
     Live network access is enabled by ``live=True`` or the manifest's
     ``citations.live``. An injected ``network`` policy supplies the opener
     and limits, and the two switches can only turn live access on, never off.
-    ``registry`` exists so tests can register extra kinds. It must map every
-    kind a manifest names.
+    ``registry`` and ``falsifiers`` exist so tests can register extra kinds
+    and their negative-control generators. The registry must map every kind
+    a manifest names; a kind without a generator can never PASS.
 
     Exceptions raised by checks are recorded as ERROR results. An exception
     escaping this function is a defect in the engine itself.
     """
     # One run redacts thousands of strings; the environment is read once for all of them.
     with redaction_scope():
-        return _verify(Path(manifest_path), live=live, network=network, registry=registry)
+        return _verify(Path(manifest_path), live=live, network=network, registry=registry, falsifiers=falsifiers)
 
 
 def _verify(
-    path: Path, *, live: bool, network: NetworkPolicy | None, registry: Mapping[str, str]
+    path: Path,
+    *,
+    live: bool,
+    network: NetworkPolicy | None,
+    registry: Mapping[str, str],
+    falsifiers: Mapping[str, str],
 ) -> VerificationRun:
     """The body of :func:`verify`, run inside one redaction scope."""
     started_at = now()
+    _audit.install()
     base_policy = network or NetworkPolicy()
     try:
         manifest = load_manifest(path, registered_kinds=registry)
@@ -2190,8 +3516,18 @@ def _verify(
             "tool": __version__,
         }
     )
+    ctx.bind_run_id(run_id)
+    pins = _harness_pins(manifest, ctx, registry, falsifiers)
+    plan = build_plan(manifest, accounting, [pin.to_dict() for pin in pins], run_id, registry)
     ledger = Ledger(run_id)
-    checks, tallies = run_checks(ctx, manifest.checks, ledger, registry)
+    plan_entry = ledger.plan(plan)
+    watched = _watched(manifest, pins)
+    module_digests = {pin.path: pin.sha256 for pin in pins if pin.role == "check_module"}
+    with _audit.recording(watch=watched) as recorder:
+        checks, tallies = run_checks(ctx, manifest.checks, ledger, registry, falsifiers, module_digests)
+        comparator = _run_comparator_control(ledger)
+        canary = _run_canaries(ctx, ledger)
+    pin_report = _pin_report(manifest, pins, watched, recorder)
     rows = _rows_examined(checks, opened)
     accounting = accounting.with_examined(len(_examined_inputs(checks, opened)))
     documents = ctx.read_log()
@@ -2204,6 +3540,15 @@ def _verify(
         checks=checks,
         ledger_bytes=ledger.to_jsonl(),
         ledger_length=seal["ledger_length"],
+    )
+    controls = _run_controls(
+        plan=plan,
+        plan_entry=plan_entry,
+        checks=checks,
+        entries=ledger.entries,
+        canary=canary,
+        comparator=comparator,
+        pins=pin_report,
     )
     result, decision = _finish(
         run_id=run_id,
@@ -2222,7 +3567,11 @@ def _verify(
             evidence_manifest=evidence["entries"],
             rows_examined=rows,
             claim_tallies=tuple(tally for _, tally in tallies),
+            expected_plan=plan,
+            pins=pin_report,
+            controls=controls,
         ),
+        controls=controls,
     )
     return VerificationRun(
         result=result,
@@ -2235,4 +3584,6 @@ def _verify(
         documents=documents,
         claim_tallies=tallies,
         network=policy,
+        plan=plan,
+        pins=pin_report,
     )

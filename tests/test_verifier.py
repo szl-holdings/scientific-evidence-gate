@@ -1,8 +1,9 @@
-"""The engine: registry, built-in checks, run engine and the PASS decision (sections 5 and 6)."""
+"""The engine: registry, built-in checks, run engine and the PASS decision (sections 5, 6 and 17)."""
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
 import shutil
 import unittest
@@ -25,16 +26,23 @@ from science_gate.discovery import discover
 from science_gate.invariants import ClaimTally
 from science_gate.ledger import index_invocations
 from science_gate.manifests import load_manifest
+from science_gate.invariants import is_control
 from science_gate.models import (
     BUILTIN_CHECK_KINDS,
+    SKIP_JUSTIFICATION_KEY,
     ExecutionState,
     FailureMode,
+    FalsifierCase,
+    InputOverride,
     InputState,
     InvocationResult,
     Reason,
+    SkipJustification,
     Status,
+    WitnessState,
 )
 from science_gate.verifier import (
+    FALSIFIERS,
     REGISTRY,
     SUMMARY_SCHEMA,
     CheckContext,
@@ -42,6 +50,7 @@ from science_gate.verifier import (
     CheckUnavailable,
     DecisionInputs,
     NetworkPolicy,
+    VerificationRun,
     build_snapshot,
     decide,
     ledger_evidence,
@@ -70,24 +79,56 @@ def skipping_check(ctx: CheckContext, spec: Any) -> CheckOutcome:
     )
 
 
+def labelled_skipping_check(ctx: CheckContext, spec: Any) -> CheckOutcome:
+    """The same skip, justified in the closed vocabulary (extension #24)."""
+    evidence = {"note": "no", SKIP_JUSTIFICATION_KEY: SkipJustification.EMPTY_POPULATION.value}
+    return CheckOutcome(
+        ExecutionState.SKIPPED, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE, rows_examined=0, evidence=evidence
+    )
+
+
+def free_text_skipping_check(ctx: CheckContext, spec: Any) -> CheckOutcome:
+    """A skip "justified" only in prose: free text never justifies a skip."""
+    evidence = {"note": "not needed here", SKIP_JUSTIFICATION_KEY: "BECAUSE_I_SAID_SO"}
+    return CheckOutcome(
+        ExecutionState.SKIPPED, Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE, rows_examined=0, evidence=evidence
+    )
+
+
 def narrating_check(ctx: CheckContext, spec: Any) -> CheckOutcome:
-    """Claims eight verifications that no invocation record backs."""
+    """Examines the rows honestly, but also claims eight verifications that no invocation record backs."""
+    rows = ctx.inputs["measurements"].rows or ()
+    if len(rows) < 6:
+        return CheckOutcome(
+            ExecutionState.CHECKED, Status.FAIL, Reason.SOURCE_MISMATCH, rows_examined=len(rows), evidence={"rows": len(rows)}
+        )
     return CheckOutcome(
         ExecutionState.CHECKED,
         Status.PASS,
         Reason.VERIFIED,
-        rows_examined=6,
+        rows_examined=len(rows),
         evidence={"claimed_verified": 8, "invocation_records": 0},
         claim_tallies=(ClaimTally("citations claimed as verified", 8, 0),),
     )
+
+
+def falsify_narrating(ctx: CheckContext, spec: Any, result: Any) -> tuple[FalsifierCase, ...]:
+    """The narrating check does reject a short input, so its PASS is witnessed."""
+    opened = ctx.inputs["measurements"]
+    rows = tuple(dict(row.values) for row in opened.rows[:-1])
+    override = InputOverride(rows, opened.columns)
+    return (FalsifierCase("short", "one row fewer", Status.FAIL, Reason.SOURCE_MISMATCH, inputs={"measurements": override}),)
 
 
 #: Kinds owned by specialist modules, which later stages implement.
 SPECIALIST_KINDS = (
     "citation_metadata",
     "citation_resolver",
+    "claim_join",
     "claim_registry",
     "dependency_currency",
+    "editorial_status",
+    "mutation_accounting",
     "verification_log",
 )
 
@@ -97,8 +138,20 @@ TEST_REGISTRY = {
     "returns_non_outcome": f"{__name__}:non_outcome_check",
     "vacuous_pass": f"{__name__}:vacuous_pass_check",
     "skips": f"{__name__}:skipping_check",
+    "skips_with_label": f"{__name__}:labelled_skipping_check",
+    "skips_with_prose": f"{__name__}:free_text_skipping_check",
     "narrates": f"{__name__}:narrating_check",
     "missing_function": f"{__name__}:no_such_function",
+}
+TEST_FALSIFIERS = {**FALSIFIERS, "narrates": f"{__name__}:falsify_narrating"}
+
+#: Who delivers each specialist generator (section 17.1).
+GENERATOR_OWNERS = {
+    "science_gate.citations": "citations",
+    "science_gate.claims": "numeric",
+    "science_gate.dependencies": "dependencies",
+    "science_gate.assertions": "assertions",
+    "science_gate.mutations": "mutations",
 }
 
 
@@ -112,6 +165,28 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(REGISTRY["citation_metadata"], "science_gate.citations:check_metadata")
         self.assertEqual(REGISTRY["claim_registry"], "science_gate.claims:check_claim_registry")
         self.assertEqual(REGISTRY["dependency_currency"], "science_gate.dependencies:check_dependency_currency")
+        # Section 17.16.
+        self.assertEqual(REGISTRY["claim_join"], "science_gate.assertions:check_claim_join")
+        self.assertEqual(REGISTRY["editorial_status"], "science_gate.citations:check_editorial_status")
+        self.assertEqual(REGISTRY["mutation_accounting"], "science_gate.mutations:check_mutation_accounting")
+
+    def test_every_kind_names_a_negative_control_generator(self) -> None:
+        # Section 17.5: a kind without a generator can never PASS, so every built-in kind has one.
+        self.assertEqual(set(FALSIFIERS), set(BUILTIN_CHECK_KINDS))
+        for kind, target in FALSIFIERS.items():
+            with self.subTest(kind=kind):
+                owner = REGISTRY[kind].partition(":")[0]
+                self.assertEqual(target.partition(":")[0], owner, "a generator lives beside its checker")
+                self.assertTrue(target.partition(":")[2].startswith("falsify_"))
+
+    def test_every_generator_resolves(self) -> None:
+        for kind, target in sorted(FALSIFIERS.items()):
+            with self.subTest(kind=kind):
+                module_name, _, name = target.partition(":")
+                if module_name != "science_gate.verifier" and not hasattr(importlib.import_module(module_name), name):
+                    # Visible, never silent: until the owner delivers it, that kind ends NO_GENERATOR, never PASS.
+                    self.skipTest(f"{target} is not delivered yet by the {GENERATOR_OWNERS[module_name]} builder")
+                self.assertTrue(callable(resolve_check(target)))
 
     def test_only_specialist_kinds_live_outside_the_verifier(self) -> None:
         outside = sorted(kind for kind, target in REGISTRY.items() if not target.startswith("science_gate.verifier:"))
@@ -145,6 +220,7 @@ class FixtureTests(unittest.TestCase):
                 self.assertGreater(result.rows_examined, 0)
                 self.assertTrue(result.evidence)
                 self.assertIsNotNone(result.invocation_id)
+                self.assertEqual(result.evidence["falsification"], WitnessState.WITNESSED.value)
         counters = run.result.counters
         self.assertEqual(counters["checks_executed"], counters["checks_expected"])
         self.assertEqual((counters["inputs_opened"], counters["rows_examined"]), (1, 6))
@@ -470,7 +546,11 @@ class EngineTests(ProjectTestCase):
         # Requirements 21 and 22, over a run mixing PASS, ERROR and ABSTAIN.
         run = self.verify_with(check("rows", "row_count"), check("boom", "raises"), check("skip", "skips"))
         traces = index_invocations(run.ledger.entries)
-        self.assertEqual(len(traces), 3)
+        subjects = [trace for trace in traces.values() if not is_control(trace.check_id)]
+        self.assertEqual(len(subjects), 3)
+        # The controls: one falsifier for the PASS, the comparator and the two canaries; each terminal too.
+        self.assertEqual(len(traces) - len(subjects), 4)
+        self.assertTrue(all(trace.terminal for trace in traces.values()))
         for result in run.result.checks:
             with self.subTest(check=result.check_id):
                 trace = traces[result.invocation_id]
@@ -511,16 +591,30 @@ class EngineTests(ProjectTestCase):
         self.assertEqual(run.status, Status.ABSTAIN)
 
     def test_a_required_check_that_did_not_run_blocks_pass(self) -> None:
-        # Requirement 4.
+        # Requirement 4, under D1: an unjustified shortfall on a required check is FAIL / PARTIAL_EXECUTION.
         run = self.verify_with(check("rows", "row_count"), check("skip", "skips"))
-        self.assertEqual(run.status, Status.ABSTAIN)
+        self.assertEqual((run.status, run.result.reason), (Status.FAIL, Reason.PARTIAL_EXECUTION))
         counters = run.result.counters
         self.assertEqual((counters["checks_executed"], counters["checks_expected"]), (1, 2))
+        self.assertEqual((counters["checks_shortfall"], counters["checks_justified"]), (1, 0))
         self.assertIn("contract:checks_executed", [finding.source for finding in run.findings])
+
+    def test_a_justified_skip_abstains_and_free_text_does_not_justify(self) -> None:
+        # Extension #24: only a closed-vocabulary label justifies a skip, and then it abstains.
+        labelled = self.verify_with(check("rows", "row_count"), check("skip", "skips_with_label"))
+        self.assertEqual((labelled.status, labelled.result.reason), (Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE))
+        self.assertNotIn(FailureMode.PARTIAL_EXECUTION, labelled.result.failure_modes)
+        self.assertEqual(labelled.result.counters["checks_justified"], 1)
+        prose = self.verify_with(check("rows", "row_count"), check("skip", "skips_with_prose"))
+        skipped = self.result_of(prose, "skip")
+        self.assertEqual(skipped.verdict, Status.ERROR, "an unknown label is an invalid outcome, never a justification")
+        self.assertIn("INVALID_OUTCOME", skipped.diagnostics[0])
 
     def test_narrated_verification_becomes_unverified(self) -> None:
         # Requirement 5: claims without invocations break checked_claims_le_invocations.
-        run = self.verify_with(check("rows", "row_count"), check("log", "narrates"))
+        self.set_checks(check("rows", "row_count"), check("log", "narrates"))
+        run = self.run_verify(registry=TEST_REGISTRY, falsifiers=TEST_FALSIFIERS)
+        self.assertEqual(self.result_of(run, "log").evidence["falsification"], WitnessState.WITNESSED.value)
         self.assertEqual((run.status, run.result.reason), (Status.ABSTAIN, Reason.UNVERIFIED))
         self.assertIn(FailureMode.NARRATED_VERIFICATION, run.result.failure_modes)
         (violated,) = [item for item in run.result.invariants if item.violated]
@@ -673,42 +767,78 @@ class PreloadTests(TempDirTestCase):
         self.assertEqual(result.evidence["blind_spots"], {"inputs": [], "documents": NODE_DOCUMENTS})
 
 
-class DecideTests(TempDirTestCase):
-    """``decide`` over facts assembled by hand: precedence and the PASS contract."""
+def replay_inputs(run: VerificationRun, **overrides: Any) -> DecisionInputs:
+    """The decision inputs of a sealed run, replayed: the facts ``verify`` handed to ``decide``."""
+    assert run.manifest is not None
+    seal = run.ledger.seal()
+    values: dict[str, Any] = {
+        "accounting": run.result.accounting,
+        "checks": run.result.checks,
+        "declared_checks": {spec.check_id: spec.required for spec in run.manifest.checks},
+        "entries": run.ledger.entries,
+        "ledger_head_sha256": seal["ledger_head_sha256"],
+        "ledger_length": seal["ledger_length"],
+        "run_id": run.result.run_id,
+        "evidence_manifest": run.evidence_manifest["entries"],
+        "rows_examined": run.result.counters["rows_examined"],
+        "claim_tallies": tuple(tally for _, tally in run.claim_tallies),
+        "expected_plan": run.plan,
+        "pins": run.pins,
+        "controls": run.result.controls,
+    }
+    values.update(overrides)
+    return DecisionInputs(**values)
+
+
+class DecideTests(ProjectTestCase):
+    """``decide`` over the replayed facts of a sealed PASS run: precedence and the PASS contract."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.scenario = build_scenario(self)
+        self.run = self.run_verify()
 
     def inputs(self, **overrides: Any) -> DecisionInputs:
-        seal = self.scenario.ledger.seal()
-        values: dict[str, Any] = {
-            "accounting": self.scenario.accounting,
-            "checks": self.scenario.checks,
-            "declared_checks": {"rows": True},
-            "entries": self.scenario.ledger.entries,
-            "ledger_head_sha256": seal["ledger_head_sha256"],
-            "ledger_length": seal["ledger_length"],
-            "run_id": self.scenario.ledger.run_id,
-            "evidence_manifest": self.scenario.evidence_manifest,
-            "rows_examined": 3,
-        }
-        values.update(overrides)
-        return DecisionInputs(**values)
+        return replay_inputs(self.run, **overrides)
 
     def test_complete_evidence_passes(self) -> None:
         decision = decide(self.inputs())
         self.assertEqual((decision.status, decision.reason, decision.findings), (Status.PASS, Reason.VERIFIED, ()))
+        self.assertEqual(decision.status, self.run.status, "a replay decides exactly what the run decided")
+
+    def test_hand_assembled_facts_without_a_plan_or_witnesses_never_pass(self) -> None:
+        # The section 4 scenario has PASS results but no PLAN and no falsifier invocations.
+        scenario = build_scenario(self)
+        seal = scenario.ledger.seal()
+        decision = decide(
+            DecisionInputs(
+                accounting=scenario.accounting,
+                checks=scenario.checks,
+                declared_checks={"rows": True},
+                entries=scenario.ledger.entries,
+                ledger_head_sha256=seal["ledger_head_sha256"],
+                ledger_length=seal["ledger_length"],
+                run_id=scenario.ledger.run_id,
+                evidence_manifest=scenario.evidence_manifest,
+                rows_examined=3,
+            )
+        )
+        self.assertEqual((decision.status, decision.reason), (Status.FAIL, Reason.PARTIAL_EXECUTION))
+        violated = {item.name for item in decision.invariants if item.violated}
+        self.assertEqual(violated, {"plan_closure", "pass_requires_falsifier_witness"})
 
     def test_zero_rows_blocks_pass(self) -> None:
         decision = decide(self.inputs(rows_examined=0))
         self.assertEqual((decision.status, decision.reason), (Status.ABSTAIN, Reason.INSUFFICIENT_EVIDENCE))
 
     def test_a_declared_required_check_without_a_result_blocks_pass(self) -> None:
-        decision = decide(self.inputs(declared_checks={"rows": True, "never_ran": True}))
-        self.assertEqual(decision.status, Status.ABSTAIN)
+        # D1: "no result at all" is an unjustified shortfall, FAIL / PARTIAL_EXECUTION.
+        declared = {**self.inputs().declared_checks, "never_ran": True}
+        decision = decide(self.inputs(declared_checks=declared))
+        self.assertEqual((decision.status, decision.reason), (Status.FAIL, Reason.PARTIAL_EXECUTION))
         violated = {item.name for item in decision.invariants if item.violated}
         self.assertIn("every_required_check_has_terminal_state", violated)
+        (shortfall,) = [item for item in decision.findings if item.source == "contract:checks_executed"]
+        self.assertIn("'never_ran' did not execute: it has no result", shortfall.detail)
 
     def test_empty_evidence_manifest_blocks_pass(self) -> None:
         decision = decide(self.inputs(evidence_manifest=[]))
@@ -716,21 +846,31 @@ class DecideTests(TempDirTestCase):
         self.assertIn("contract:evidence_manifest", [finding.source for finding in decision.findings])
 
     def test_truncated_ledger_fails_against_its_seal(self) -> None:
-        decision = decide(self.inputs(entries=self.scenario.ledger.entries[:-1]))
+        decision = decide(self.inputs(entries=self.run.ledger.entries[:-1]))
         self.assertEqual((decision.status, decision.reason), (Status.FAIL, Reason.PROTOCOL_BROKEN))
 
     def test_precedence_is_error_then_fail_then_abstain(self) -> None:
-        failing = dataclasses.replace(self.scenario.checks[0], verdict=Status.FAIL, reason=Reason.SOURCE_MISMATCH)
+        failing = dataclasses.replace(self.run.result.checks[0], verdict=Status.FAIL, reason=Reason.SOURCE_MISMATCH)
         both = decide(self.inputs(checks=(failing,), rows_examined=0))
+        # G3: the content failure names the reason, ahead of the unexplained shortfalls (no results).
         self.assertEqual((both.status, both.reason), (Status.FAIL, Reason.SOURCE_MISMATCH))
         self.assertIn(Reason.INSUFFICIENT_EVIDENCE, both.reasons)
+        self.assertIn(Reason.PARTIAL_EXECUTION, both.reasons)
         errored = decide(self.inputs(checks=(failing,), manifest_issues=("SCHEMA_MISMATCH at /schema: synthetic",)))
         self.assertEqual((errored.status, errored.reason), (Status.ERROR, Reason.PROTOCOL_BROKEN))
 
     def test_counters_are_unknown_when_nothing_was_declared(self) -> None:
         counters = decide(self.inputs(declared_checks=None)).counters
-        self.assertIsNone(counters["checks_expected"])
-        self.assertIsNone(counters["checks_executed"])
+        for name in ("checks_expected", "checks_executed", "checks_shortfall", "checks_justified", "control_invocations"):
+            with self.subTest(counter=name):
+                self.assertIsNone(counters[name])
+
+    def test_counters_count_controls_and_shortfalls(self) -> None:
+        counters = decide(self.inputs()).counters
+        # Six falsifiers (one per PASS), the comparator and the two canaries.
+        self.assertEqual(
+            (counters["control_invocations"], counters["checks_shortfall"], counters["checks_justified"]), (9, 0, 0)
+        )
 
 
 class EvidenceManifestTests(ProjectTestCase):
