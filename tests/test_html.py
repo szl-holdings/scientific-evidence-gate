@@ -152,6 +152,8 @@ class Page(HTMLParser):
 
     Text is captured for every element with an ``id`` (key ``#id``) and every
     ``data-visual`` or ``data-equivalent-of`` element (key ``name=value``).
+    Pieces of text join with a space, except that punctuation opening a piece
+    attaches to the word before it, as a reader sees ``<code>inv-1</code>, derived``.
     """
 
     VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"})
@@ -189,7 +191,8 @@ class Page(HTMLParser):
                 self.captured.setdefault(key, []).append(data)
 
     def text(self, key: str) -> str:
-        return " ".join(" ".join(self.captured.get(key, [])).split())
+        joined = "".join(piece if piece[:1] in ",;:.)" else " " + piece for piece in self.captured.get(key, []))
+        return " ".join(joined.split())
 
     def tags(self, name: str) -> list[dict[str, str | None]]:
         return [attributes for tag, attributes in self.elements if tag == name]
