@@ -3681,7 +3681,7 @@ def _resolver_table(doc: Mapping[str, Any]) -> str:
                 outcome = _canary_outcome(record)
                 rows.append(
                     [
-                        _code(check.get("check_id")) + _sub(_e(source)),
+                        _code(check.get("check_id")) + _sub(_e(f"prefix {_plain(prefix)} ({source})")),
                         _code(prefix),
                         _hash(record.get("doi")),
                         _e(record.get("state")) + _sub(f"body code {_e(record.get('handle_response_code'))}"),
