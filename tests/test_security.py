@@ -13,11 +13,12 @@ import contextlib
 import io
 import json
 import os
+import unicodedata
 import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from _helpers import try_symlink
+from _helpers import REPO_ROOT, try_symlink
 from _project import ProjectTestCase
 
 from science_gate import cli
@@ -369,3 +370,37 @@ class OutputConfinementTests(SecurityTestCase):
             build_package(self.manifest_path, self.project / "package", environ={})
         self.assertEqual(raised.exception.code, OUTPUT_INSIDE_INPUT_DIRECTORY)
         self.assertEqual(tree_snapshot(self.project), before)
+
+
+class SourceTextTests(unittest.TestCase):
+    """No invisible character hides in the package or test source (the "Trojan Source" class of attack).
+
+    A bidirectional control, a zero-width character or a look-alike space
+    can make code read differently from how it runs. Where a literal needs
+    one (a byte-order mark, a no-break space used as a thousands separator),
+    the source writes it as an escape, so a reviewer sees it.
+    """
+
+    @staticmethod
+    def hidden(text: str) -> list[str]:
+        """``U+XXXX NAME`` for every character a reader could not see or would mistake for another."""
+        return [
+            f"U+{ord(char):04X} {unicodedata.name(char, '?')}"
+            for char in text
+            if char not in "\t\n "
+            and unicodedata.category(char) in {"Cc", "Cf", "Co", "Cs", "Zl", "Zp", "Zs"}
+        ]
+
+    def test_python_sources_are_lf_only_and_free_of_invisible_characters(self) -> None:
+        sources = sorted(path for base in ("src", "tests") for path in (REPO_ROOT / base).rglob("*.py"))
+        self.assertGreater(len(sources), 40)
+        for path in sources:
+            with self.subTest(path=path.relative_to(REPO_ROOT).as_posix()):
+                self.assertEqual(self.hidden(path.read_bytes().decode("utf-8")), [])
+
+    def test_the_scan_sees_what_it_is_meant_to_refuse(self) -> None:
+        """The guard could fail: each class of hidden character, a carriage return included, is reported."""
+        for code in (0x202E, 0x200B, 0xFEFF, 0x00A0, 0x2009, 0x2028, 0x0007, 0x000D):
+            with self.subTest(code=f"U+{code:04X}"):
+                self.assertEqual(len(self.hidden(f"x = 'a{chr(code)}b'")), 1)
+        self.assertEqual(self.hidden("plain\ttext\n with spaces and a visible \u00b7 dot"), [])

@@ -166,7 +166,7 @@ class StrictLoadsTests(unittest.TestCase):
 
     def test_byte_order_mark_is_accepted(self) -> None:
         self.assertEqual(strict_loads(b'\xef\xbb\xbf{"a": 1}'), {"a": 1})
-        self.assertEqual(strict_loads('﻿{"a": 1}'), {"a": 1})
+        self.assertEqual(strict_loads('\ufeff{"a": 1}'), {"a": 1})
 
 
 class HashSeedDeterminismTests(unittest.TestCase):

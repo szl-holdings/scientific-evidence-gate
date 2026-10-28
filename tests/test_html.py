@@ -36,14 +36,18 @@ from _helpers import FIXED_TIME, REPO_ROOT, SRC_DIR
 from science_gate import _html
 from science_gate._html import NO_SENSITIVITY_SENTENCE, VALIDITY_LABEL, render
 from science_gate.cli import scaffold_project
-from science_gate.invariants import INVARIANT_NAMES
+from science_gate.invariants import INVARIANT_NAMES, PLANNED_CONTROLS
 from science_gate.mutations import OPERATOR_IDS, mutate
 from science_gate.receipts import build_run_receipt
 from science_gate.reports import REPORT_HTML, REPORT_MD, RUN_JSON, report_run_dir, run_document, write_run
 from science_gate.verifier import VerificationRun, verify
 
 EMPTY_MANIFEST = REPO_ROOT / "fixtures" / "core" / "empty" / "manifest.json"
-VISUALS = {"hologram", "accounting", "lattice", "invariants", "ledger"}
+#: Synthetic fixtures whose runs carry the frontier evidence: a claim join, a resolving resolver canary, a GRIM test.
+CLAIM_JOIN_MANIFEST = REPO_ROOT / "fixtures" / "assertions" / "five-cases" / "manifest.json"
+CANARY_MANIFEST = REPO_ROOT / "fixtures" / "citations" / "canary-resolved" / "manifest.json"
+GRIM_MANIFEST = REPO_ROOT / "fixtures" / "numeric" / "grim-inconsistent" / "manifest.json"
+VISUALS = {"hologram", "accounting", "lattice", "controls", "discrimination", "plan", "invariants", "ledger"}
 
 #: Markup that would run code, load a resource or break out of an attribute if it were not escaped.
 HOSTILE = '<script>alert(1)</script><img src=x onerror=alert(1)>"\' onmouseover="alert(1)" &amp; </svg></table>'
@@ -118,6 +122,10 @@ def setUpModule() -> None:
     broken = project("error")
     (broken / "manifest.json").write_text('{"schema": "not-a-science-gate-manifest/v0"}', encoding="utf-8")
     RUNS["error"] = verify(broken / "manifest.json")
+
+    RUNS["claim_join"] = verify(CLAIM_JOIN_MANIFEST)
+    RUNS["canary"] = verify(CANARY_MANIFEST)
+    RUNS["grim"] = verify(GRIM_MANIFEST)
 
     DOCS.update({name: _document(run) for name, run in RUNS.items()})
 
@@ -372,6 +380,8 @@ class HologramTests(unittest.TestCase):
             {
                 "Input digests": "LIT",
                 "Declared digests": "LIT",
+                "Harness pins": "LIT",
+                "Plan committed": "LIT",
                 "Ledger sealed": "LIT",
                 "Hash chain": "LIT",
                 "Execution trace": "LIT",
@@ -810,7 +820,8 @@ class MutationConstellationTests(unittest.TestCase):
         self.assertEqual(view.tallies["detected_mutations"], 2)
         self.assertEqual(view.tallies["executed_mutations"], 3)
         source = render(DOCS["pass"], mutation_report(records))
-        self.assertIn("NOT EXECUTED \u00b7 3", svg_of(source, "mutations"))
+        self.assertIn("SKIPPED OR N/A \u00b7 3", svg_of(source, "mutations"))
+        self.assertIn("NEVER EXECUTED \u00b7 0", svg_of(source, "mutations"))
         table = Page(source).text("data-equivalent-of=mutations")
         self.assertEqual(table.count("it is not counted as a detection"), 2)
 
@@ -839,7 +850,11 @@ class MutationConstellationTests(unittest.TestCase):
         (error,) = [item for item in view.mutations if item.short == "M10"]
         self.assertIn("VERIFIER_ERROR", error.note)
         source = render(DOCS["pass"], report)
-        self.assertIn("NOT EXECUTED \u00b7 5", svg_of(source, "mutations"))
+        stars = svg_of(source, "mutations")
+        self.assertIn("NEVER EXECUTED \u00b7 4", stars)
+        self.assertIn("SKIPPED OR N/A \u00b7 1", stars)
+        # The cluster names the statuses it holds, so a no-op is never read as a skip.
+        self.assertIn("CANONICALLY_EQUIVALENT 1, DUPLICATE_M", stars)
 
     def test_an_invalid_baseline_shows_no_sensitivity_figure(self) -> None:
         """Requirement 26: even a figure and counts carried by the report are withheld."""
@@ -941,10 +956,24 @@ class MutationEvidenceTests(unittest.TestCase):
         text = Page(render(DOCS["pass"], report)).text("#mutations")
         selected = f"{len(OPERATOR_IDS)} of {len(OPERATOR_IDS)} operators selected"
         for expected in (report["report_id"], report["message"], selected, "Applicable",
+                         "Forced detection (M00)", "detected by invariant:ledger_chain_intact", "Conservation",
                          report["sensitivity"]["decimal_rounding"], "What this mutation report does not prove",
                          report["not_proven"][0]):
             self.assertIn(expected, text)
         self.assertNotIn("inconsistent with its own records", text)
+
+    def test_harness_controls_are_shown_as_recorded_and_never_assumed(self) -> None:
+        """M00 and the conservation identities (17.12): shown as the report states them, absent as not recorded."""
+        report = copy.deepcopy(REPORTS["valid"])
+        self.assertEqual(_html._harness_controls(report), ("detected by invariant:ledger_chain_intact", "holds"))
+        report["forced_detection"]["detected"] = False
+        report["conservation"]["holds"] = False
+        forced, conservation = _html._harness_controls(report)
+        self.assertTrue(forced.startswith("NOT detected"), forced)
+        self.assertEqual(conservation, "does NOT hold")
+        for key in ("forced_detection", "conservation"):
+            del report[key]
+        self.assertEqual(_html._harness_controls(report), ("not recorded", "not recorded"))
 
     def test_a_real_invalid_baseline_report_shows_no_figure_and_no_counts(self) -> None:
         """Requirement 26 with the report ``mutate`` actually writes: no counts, no records, no figure."""
@@ -996,6 +1025,17 @@ class MutationEvidenceTests(unittest.TestCase):
         self.assertEqual((item.group, item.firing), ("BLIND_SPOT", "FIRED"))
         self.assertIn("it stays a blind spot", item.note)
 
+    def test_a_blind_spot_names_where_the_defect_stopped_mattering(self) -> None:
+        """The v2 PIE stage (17.12) is shown as recorded; a record without one shows no stage."""
+        record = mutation_record("M05_duplicate_reviewer_verdict", detected=False)
+        record["pie_stage"] = "PROPAGATED_NOT_CHECKED"
+        (item,) = _html._mutation_view(mutation_report([record])).mutations
+        self.assertEqual(item.group, "BLIND_SPOT")
+        self.assertIn("stopped mattering at PROPAGATED_NOT_CHECKED", item.note)
+        del record["pie_stage"]
+        (item,) = _html._mutation_view(mutation_report([record])).mutations
+        self.assertNotIn("stopped mattering", item.note or "")
+
     def test_an_executed_mutation_without_a_detection_result_is_unresolved(self) -> None:
         """Neither a detection nor a blind spot can be assumed when the record does not say which it was."""
         (item,) = _html._mutation_view(mutation_report([mutation_record("M07_changed_source_hash",
@@ -1043,6 +1083,429 @@ class MutationEvidenceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Checker controls: falsifier witnesses, the run canary, the comparator, resolver canaries
+# ---------------------------------------------------------------------------
+
+
+def check_of(document: dict[str, Any], kind: str) -> dict[str, Any]:
+    """The document's first check result of ``kind`` (editable when ``document`` is a private copy)."""
+    return next(check for check in document["checks"] if check["kind"] == kind)
+
+
+def facet(plane: Any, name: str) -> Any:
+    (found,) = [item for item in plane.facets if item.name == name]
+    return found
+
+
+class WitnessTests(unittest.TestCase):
+    """Extension #1 as the page shows it: every PASS carries the known-bad case it rejected."""
+
+    def test_every_pass_shows_the_known_bad_case_it_rejected(self) -> None:
+        page = Page(page_source("pass"))
+        table = page.text("data-equivalent-of=controls")
+        for check in DOCS["pass"]["checks"]:
+            (case,) = check["evidence"]["falsifiers"]
+            for fact in (check["check_id"], case["case_id"], case["description"]):
+                self.assertIn(fact, table)
+            self.assertIn(_html._breakable(case["control_id"]), page.source)
+        self.assertEqual({row.witness.label for row in _html._lattice_rows(doc())}, {"WITNESSED"})
+        self.assertIn(">6 could fail<", svg_of(page.source, "lattice"))
+        self.assertIn('<div class="stat-value">6 / 6</div>', page.source)
+        self.assertEqual(states(planes(doc())[1])["Falsifier witnesses"], "LIT")
+        self.assertEqual({row.outcome for row in _html._falsifier_rows(doc())}, {"REJECTED"})
+
+    def test_falsifier_invocations_are_placed_where_the_ledger_ran_them(self) -> None:
+        """Requirement 21 for controls: each witness points to the invocation the ledger recorded for it."""
+        started = {
+            entry["check_id"]: entry["invocation_id"] for entry in RUNS["pass"].ledger.entries
+            if entry["result"] == "STARTED"
+        }
+        view = _html._ledger_view(doc())
+        self.assertTrue(view.complete, view.note)
+        for position, check in enumerate(DOCS["pass"]["checks"]):
+            for number, case in enumerate(check["evidence"]["falsifiers"]):
+                self.assertEqual(view.falsifier_invocations[(position, number)], started[case["control_id"]])
+        text = Page(page_source("pass")).text("#controls")
+        for invocation in view.falsifier_invocations.values():
+            self.assertIn(f"invocation {invocation}, derived from its ledger position", text)
+
+    def test_a_refuted_witness_is_a_proven_miss(self) -> None:
+        document = doc()
+        check = document["checks"][0]
+        check["evidence"]["falsifiers"][0].update(
+            outcome="ACCEPTED", actual={"verdict": "PASS", "reason": "VERIFIED", "execution_state": "CHECKED"}
+        )
+        check["evidence"]["falsification"] = "REFUTED"
+        check.update(verdict="FAIL", reason="BLIND_SPOT")
+        self.assertEqual(states(planes(document)[1])["Falsifier witnesses"], "BROKEN")
+        witness = {row.check_id: row.witness.label for row in _html._lattice_rows(document)}
+        self.assertEqual(witness[check["check_id"]], "REFUTED")
+        (row,) = [item for item in _html._falsifier_rows(document) if item.label == check["check_id"]]
+        self.assertEqual(row.outcome, "ACCEPTED")
+        self.assertIn('class="dumbbell t-critical missed"', svg_of(render(document), "controls"))
+
+    def test_a_relabelled_case_is_not_a_witness(self) -> None:
+        """A case that still says REJECTED although it recorded PASS is shown as what its results give."""
+        document = doc()
+        check = document["checks"][0]
+        check["evidence"]["falsifiers"][0]["actual"] = {"verdict": "PASS", "reason": "VERIFIED",
+                                                         "execution_state": "CHECKED"}
+        self.assertFalse(_html._witnessed(check))
+        self.assertIn(
+            f"required check {check['check_id']} is PASS without a falsifier witness (falsification WITNESSED)",
+            gaps(document),
+        )
+        source = render(document)
+        self.assertIn("the case records REJECTED", source)
+        self.assertIn('id="contradiction-heading"', source)
+        self.assertEqual(states(planes(document)[1])["Falsifier witnesses"], "PARTIAL")
+        witness = {row.check_id: row.witness.label for row in _html._lattice_rows(document)}
+        self.assertEqual(witness[check["check_id"]], "NO REJECTED CASE")
+
+    def test_a_pass_without_a_witness_record_is_unsupported(self) -> None:
+        document = doc()
+        check = document["checks"][0]
+        del check["evidence"]["falsification"], check["evidence"]["falsifiers"]
+        witness = {row.check_id: row.witness.label for row in _html._lattice_rows(document)}
+        self.assertEqual(witness[check["check_id"]], "NOT RECORDED")
+        self.assertIn(
+            f"required check {check['check_id']} is PASS without a falsifier witness (falsification not recorded)",
+            gaps(document),
+        )
+        self.assertIn('<div class="stat-value">5 / 6</div>', render(document))
+
+    def test_a_case_run_by_another_checker_is_flagged(self) -> None:
+        document = doc()
+        document["checks"][0]["evidence"]["falsifiers"][0]["checker_sha256"] = "0" * 64
+        text = Page(render(document)).text("data-equivalent-of=controls")
+        self.assertIn("NO: checker_sha256 differs or is missing", text)
+
+    def test_a_check_with_no_case_says_why(self) -> None:
+        document = doc()
+        check = document["checks"][0]
+        check["evidence"].update(falsification="NO_GENERATOR", falsifiers=[])
+        check.update(verdict="ABSTAIN", reason="BLIND_SPOT")
+        self.assertIn("no negative-control generator exists for this kind",
+                      Page(render(document)).text("data-equivalent-of=controls"))
+        witness = {row.check_id: row.witness.label for row in _html._lattice_rows(document)}
+        self.assertEqual(witness[check["check_id"]], "NO_GENERATOR")
+
+    def test_a_witness_summary_that_disagrees_with_the_checks_is_reported(self) -> None:
+        document = doc()
+        document["controls"]["falsifiers"]["WITNESSED"] = []
+        self.assertIn("The run's witness summary disagrees with its checks", render(document))
+        self.assertNotIn("witness summary disagrees", page_source("pass"))
+
+
+class RunControlsTests(unittest.TestCase):
+    """The run-level controls (17.5, 17.6, 17.14), judged by what they had to do, never assumed."""
+
+    def test_the_canary_twins_and_the_comparator_show_their_invocations(self) -> None:
+        controls = DOCS["pass"]["controls"]
+        text = Page(page_source("pass")).text("#controls")
+        for twin in ("must_fail", "must_pass"):
+            self.assertIn(controls["canary"][twin]["invocation_id"], text)
+        self.assertIn(controls["comparator_self_test"]["invocation_id"], text)
+        rows = _html._canary_rows(controls) + _html._comparator_rows(controls)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({row.outcome for row in rows}, {"AS REQUIRED"})
+        performance = states(planes(doc())[1])
+        self.assertEqual((performance["Run canary"], performance["Comparator self-test"]), ("LIT", "LIT"))
+
+    def test_a_canary_that_passed_its_planted_duplicate_is_a_proven_miss(self) -> None:
+        document = doc()
+        canary = document["controls"]["canary"]
+        canary["must_fail"].update(verdict="PASS", reason="VERIFIED")
+        canary["holds"] = False
+        self.assertEqual(_html._canary_rows(document["controls"])[0].outcome, "NOT AS REQUIRED")
+        self.assertEqual(states(planes(document)[1])["Run canary"], "BROKEN")
+        self.assertIn("the run canary records holds false, not true (controls.canary)", gaps(document))
+
+    def test_the_comparator_is_judged_against_the_contract_not_its_own_record(self) -> None:
+        document = doc()
+        pairs = document["controls"]["comparator_self_test"]["pairs"]
+        (pair,) = [item for item in pairs if item["claim"] == "0.15"]
+        pair.update(expected="EXACT", actual="EXACT")
+
+        def row() -> Any:
+            (found,) = [item for item in _html._comparator_rows(document["controls"])
+                        if item.label == "claim 0.15 vs stored 0.14"]
+            return found
+
+        self.assertEqual(row().outcome, "NOT AS REQUIRED")
+        self.assertIn("the contract requires DISAGREES", row().note)
+        pairs.remove(pair)
+        self.assertEqual(row().outcome, "NOT RECORDED")
+
+    def test_missing_controls_stay_dark_and_a_pass_without_them_is_unsupported(self) -> None:
+        document = doc()
+        document["controls"] = None
+        integrity, performance = planes(document)
+        self.assertEqual((states(integrity)["Plan committed"], states(integrity)["Harness pins"]), ("DARK", "DARK"))
+        self.assertEqual((states(performance)["Run canary"], states(performance)["Comparator self-test"]),
+                         ("DARK", "DARK"))
+        found = gaps(document)
+        for gap in ("no PLAN is recorded in controls.plan", "the run canary is not recorded (controls.canary)",
+                    "the comparator self-test is not recorded (controls.comparator_self_test)",
+                    "the harness pins is not recorded (controls.pins)"):
+            self.assertIn(gap, found)
+        self.assertIn(">NOT RECORDED<", svg_of(render(document), "controls"))
+
+    def test_resolver_canaries_are_shown_per_prefix(self) -> None:
+        source = page_source("canary")
+        evidence = check_of(DOCS["canary"], "citation_resolver")["evidence"]
+        (prefix,) = evidence["canaries"]
+        canary = evidence["canaries"][prefix]
+        rows = _html._resolver_rows(DOCS["canary"])
+        self.assertEqual([row.outcome for row in rows], ["RESOLVED"])
+        text = Page(source).text("data-equivalent-of=controls")
+        for fact in (canary["doi"], canary["detail"], f"prefix {prefix} (frozen)", "distrusted prefix"):
+            self.assertIn(fact, text)
+        self.assertIn('class="dumbbell t-critical missed"', svg_of(source, "controls"))
+        self.assertNotIn("://", source, "a provenance URL is never echoed into the page")
+        self.assertEqual(_html._resolver_rows(DOCS["pass"]), [])
+
+    def test_a_relabelled_resolver_canary_still_resolves(self) -> None:
+        document = doc("canary")
+        evidence = check_of(document, "citation_resolver")["evidence"]
+        for record in evidence["canaries"].values():
+            record["holds"] = True
+        self.assertEqual({row.outcome for row in _html._resolver_rows(document)}, {"RESOLVED"})
+
+
+class DiscriminationTests(unittest.TestCase):
+    """Extension #3 as the page shows it: how much of a nearby grid each numeric check would reject."""
+
+    def numeric(self, document: dict[str, Any]) -> list[dict[str, Any]]:
+        return [check for check in document["checks"] if "discrimination_ratio" in check["evidence"]]
+
+    def test_each_numeric_check_shows_how_much_of_its_grid_it_rejects(self) -> None:
+        source = page_source("pass")
+        numeric = self.numeric(DOCS["pass"])
+        self.assertEqual(len(numeric), 2)
+        bars = svg_of(source, "discrimination")
+        lattice = Page(source).text("data-equivalent-of=lattice")
+        for check in numeric:
+            ratio = check["evidence"]["discrimination_ratio"]
+            self.assertIn(f"{ratio['fraction']} = {ratio['decimal']}", bars)
+            self.assertIn(f"discrimination {ratio['fraction']} = {ratio['decimal']}", lattice)
+        weakest = DOCS["pass"]["controls"]["min_discrimination"]["check_id"]
+        self.assertEqual(_html._weakest(_html._discriminations(doc())), weakest)
+        self.assertEqual(bars.count("weakest PASS"), 1)
+        self.assertNotIn('data-visual="discrimination"', page_source("empty"))
+
+    def test_a_ratio_without_a_value_is_never_a_percentage(self) -> None:
+        """Extension #23: a zero denominator has no value, so it is drawn empty and never read as 0% or 100%."""
+        document = doc()
+        check = self.numeric(document)[0]
+        check["evidence"]["discrimination_ratio"] = {"numerator": 0, "denominator": 0, "state": "ZERO_DENOMINATOR",
+                                                     "fraction": "0/0", "decimal": None, "exact": None}
+        view = _html._ratio_view(check["evidence"]["discrimination_ratio"])
+        self.assertFalse(view.defined)
+        self.assertEqual(view.text(), "no value (ZERO_DENOMINATOR, 0/0 as counted)")
+        bars = svg_of(render(document), "discrimination")
+        self.assertIn('class="track undefined"', bars)
+        self.assertNotIn("%", bars)
+
+    def test_a_ratio_whose_record_disagrees_with_its_counts_is_not_drawn(self) -> None:
+        view = _html._ratio_view({"numerator": 20, "denominator": 21, "state": "DEFINED", "fraction": "20/21",
+                                  "decimal": "0.5", "exact": False})
+        self.assertFalse(view.defined)
+        self.assertIn("the record's own decimal disagree with its counts", view.text())
+        self.assertIsNone(_html._ratio_view({"numerator": 5, "denominator": 3}).ratio)
+        self.assertEqual(_html._ratio_view(None).text(), "not recorded")
+
+    def test_a_recorded_weakest_pass_that_the_checks_contradict_is_reported(self) -> None:
+        document = doc()
+        weakest = document["controls"]["min_discrimination"]["check_id"]
+        other = next(check["check_id"] for check in self.numeric(document) if check["check_id"] != weakest)
+        document["controls"]["min_discrimination"]["check_id"] = other
+        self.assertIn(f"run.json records the weakest PASS as {other}, but its checks give {weakest}",
+                      Page(render(document)).text("#discrimination"))
+
+    def test_a_consistency_test_shows_its_grid(self) -> None:
+        text = Page(page_source("grim")).text("data-equivalent-of=discrimination")
+        test = check_of(DOCS["grim"], "claim_registry")["evidence"]["consistency"]["tests"][0]
+        ratio = test["discrimination_ratio"]
+        self.assertIn(f"{ratio['fraction']} = {ratio['decimal']}", text)
+        self.assertIn(f"{test['claim_id']} {test['test']}: {test['outcome']}", text)
+        self.assertIn(test["evidence"]["grid"], text)
+
+
+class PlanTests(unittest.TestCase):
+    """Extension #2 as the page shows it: the PLAN, and every planned item closed by what ran."""
+
+    def test_every_planned_item_is_closed_by_a_recorded_invocation(self) -> None:
+        items = _html._plan_items(doc())
+        declared = [spec["id"] for spec in DOCS["pass"]["declared"]["checks"]]
+        self.assertEqual([item.item_id for item in items], declared + list(PLANNED_CONTROLS))
+        self.assertTrue(all(item.closed for item in items))
+        page = Page(page_source("pass"))
+        facts = page.text("data-equivalent-of=plan")
+        self.assertIn(DOCS["pass"]["controls"]["plan"]["entry_sha256"], facts)
+        self.assertIn("the manifest this run read", facts)
+        self.assertIn(f"{len(items)} of {len(items)} planned item(s) closed", svg_of(page.source, "plan"))
+        self.assertEqual(states(planes(doc())[0])["Plan committed"], "LIT")
+
+    def test_an_unexecuted_planned_check_is_named(self) -> None:
+        document = doc()
+        document["checks"] = [check for check in document["checks"] if check["check_id"] != "snapshot"]
+        text = Page(render(document)).text("#plan")
+        self.assertIn("Planned but not closed by a terminal invocation in run.json", text)
+        self.assertIn("snapshot (check): no result recorded", text)
+        self.assertIn("OPEN", text)
+
+    def test_a_violated_plan_closure_breaks_the_plan_and_names_its_gap(self) -> None:
+        document = doc()
+        (closure,) = [item for item in document["invariants"] if item["name"] == "plan_closure"]
+        detail = "planned 'snapshot' has 0 invocation(s) and 0 terminal result(s); exactly one of each is required"
+        closure.update(holds=False, detail=detail)
+        plan = facet(planes(document)[0], "Plan committed")
+        self.assertEqual(plan.state, "BROKEN")
+        self.assertIn(detail, plan.detail)
+        self.assertIn(detail, Page(render(document)).text("#plan"))
+
+    def test_a_missing_plan_is_dark_and_unsupported(self) -> None:
+        document = doc()
+        document["controls"]["plan"] = None
+        self.assertEqual(states(planes(document)[0])["Plan committed"], "DARK")
+        self.assertIn("not recorded: nothing shows what the run committed to before its checks ran",
+                      Page(render(document)).text("#plan"))
+        self.assertIn("no PLAN is recorded in controls.plan", gaps(document))
+
+    def test_a_plan_summary_that_disagrees_with_the_manifest_is_reported(self) -> None:
+        document = doc()
+        document["controls"]["plan"]["checks_planned"] = 5
+        self.assertIn("the PLAN records checks_planned 5, but run.json declares 6 checks",
+                      Page(render(document)).text("#plan"))
+
+
+class ClaimJoinTests(unittest.TestCase):
+    """Extension #6 as the page shows it: asserted actions joined to the sealed run they cite."""
+
+    def test_the_four_outcomes_are_drawn_and_listed(self) -> None:
+        source = page_source("claim_join")
+        evidence = check_of(DOCS["claim_join"], "claim_join")["evidence"]
+        figure = svg_of(source, "claim-join")
+        for outcome in ("BACKED", "NARRATED", "CONTRADICTED", "ORPHANED"):
+            self.assertIn(f"{outcome} \u00b7 {evidence['counts'][outcome]}", figure)
+        text = Page(source).text("data-equivalent-of=claim-join")
+        for assertion in evidence["assertions"]:
+            self.assertIn(assertion["claim_id"], text)
+            self.assertIn(assertion["detail"], text)
+        for orphan in evidence["buckets"]["ORPHANED"]:
+            self.assertIn(orphan, text)
+        self.assertNotIn("disagree with its own records", source)
+        self.assertNotIn('id="claims"', page_source("pass"))
+
+    def test_counts_that_disagree_with_the_buckets_or_controls_are_reported(self) -> None:
+        document = doc("claim_join")
+        check_of(document, "claim_join")["evidence"]["counts"]["BACKED"] = 2
+        text = Page(render(document)).text("#claims")
+        self.assertIn("counts BACKED 2, but its bucket lists 1", text)
+        self.assertIn("controls.claim_join records", text)
+
+    def test_a_join_without_counts_reads_unknown_not_zero(self) -> None:
+        document = doc("claim_join")
+        del check_of(document, "claim_join")["evidence"]["counts"]
+        self.assertIn("unknown: no counts recorded", Page(render(document)).text("#claims"))
+
+
+class LedgerMapTests(unittest.TestCase):
+    """Every ledger entry identified from run.json, and only when the identification tiles the seal."""
+
+    def test_every_entry_is_identified_as_the_ledger_records_it(self) -> None:
+        view = _html._ledger_view(doc())
+        entries = RUNS["pass"].ledger.entries
+        self.assertTrue(view.complete, view.note)
+        self.assertEqual(list(view.entries), [entry["seq"] for entry in entries])
+        unverdicted = set()
+        for entry in entries:
+            shown = view.entries[entry["seq"]]
+            if entry["result"] == "PLAN":
+                self.assertEqual((shown.phase, shown.family, entry["seq"]), ("PLAN", "plan", 1))
+                continue
+            self.assertEqual((shown.owner, shown.invocation), (entry["check_id"], entry["invocation_id"]))
+            self.assertEqual(shown.phase == "STARTED", entry["result"] == "STARTED")
+            if shown.phase == "TERMINAL" and shown.verdict is None:
+                unverdicted.add(shown.owner)
+            elif shown.phase == "TERMINAL":
+                self.assertEqual(shown.verdict, entry["verdict"])
+        self.assertEqual(unverdicted, {"control:comparator"}, "only the comparator records no verdict word")
+        strip = svg_of(page_source("pass"), "ledger")
+        self.assertIn('class="link-plan"', strip)
+        self.assertEqual(strip.count('class="link-falsifier"'), 12)
+
+    def test_a_derivation_that_does_not_tile_the_seal_is_not_used(self) -> None:
+        document = doc()
+        document["checks"][0]["evidence"]["falsifiers"] = []  # the ledger still holds that case's two entries
+        view = _html._ledger_view(document)
+        self.assertFalse(view.complete)
+        self.assertIn("not the 31 sealed", view.note)
+        self.assertEqual(view.falsifier_invocations, {})
+        self.assertEqual({entry.phase for entry in view.entries.values()}, {"STARTED"})
+        source = render(document)
+        self.assertIn("invocation not derivable from run.json", Page(source).text("#controls"))
+        self.assertNotIn('class="link-falsifier"', svg_of(source, "ledger"))
+
+
+class MutationV2Tests(unittest.TestCase):
+    """Report v2 (17.12): conservation recomputed from the buckets, M00 apart, blind spots by PIE stage."""
+
+    def test_conservation_is_recomputed_from_the_buckets(self) -> None:
+        report = REPORTS["valid"]
+        conservation = _html._mutation_view(report).conservation
+        self.assertIs(conservation.holds, True)
+        self.assertEqual((conservation.generated, conservation.executed),
+                         (report["generated_mutations"], report["executed_mutations"]))
+        page = Page(render(DOCS["pass"], report))
+        text = page.text("data-equivalent-of=conservation")
+        self.assertIn(f"{report['generated_mutations']} = executed {report['executed_mutations']}", text)
+        self.assertIn("holds (recomputed); the report records holds", text)
+        self.assertIn("conservation", {attributes.get("data-visual") for _, attributes in page.elements})
+
+    def test_a_bucket_that_lost_a_mutant_breaks_conservation_whatever_the_report_says(self) -> None:
+        report = copy.deepcopy(REPORTS["valid"])
+        lost = report["buckets"]["DETECTED"].pop()
+        view = _html._mutation_view(report)
+        self.assertIs(view.conservation.holds, False)
+        self.assertTrue(any("records conservation holds, but its buckets do not" in text
+                            for text in view.discrepancies))
+        self.assertIn(f"{lost} records status DETECTED, but bucket DETECTED does not list it",
+                      view.conservation.problems)
+
+    def test_m00_is_shown_apart_and_never_counted(self) -> None:
+        report = copy.deepcopy(REPORTS["valid"])
+        source = render(DOCS["pass"], report)
+        self.assertIn("M00 forced detection", svg_of(source, "conservation"))
+        self.assertNotIn("M00", svg_of(source, "mutations"))
+        self.assertIn(report["forced_detection"]["target"], Page(source).text("data-equivalent-of=conservation"))
+        report["forced_detection"]["detected"] = False
+        self.assertIn("NOT detected", svg_of(render(DOCS["pass"], report), "conservation"))
+
+    def test_a_report_without_buckets_shows_no_identity(self) -> None:
+        source = render(DOCS["pass"], mutation_report(detected_records()))
+        self.assertIn("records no buckets and no forced detection", source)
+        self.assertNotIn('data-visual="conservation"', source)
+
+    def test_blind_spots_sit_on_the_pie_stage_they_reached(self) -> None:
+        records = []
+        for number, stage in enumerate(("NOT_READ", "PROPAGATED_NOT_CHECKED", "PROPAGATED_NOT_CHECKED"), start=1):
+            record = mutation_record(f"M{number:02}_synthetic_blind_spot", detected=False)
+            record["pie_stage"] = stage
+            records.append(record)
+        records.append(mutation_record("M09_synthetic_escape", detected=False))
+        source = render(DOCS["pass"], mutation_report(records))
+        stars = svg_of(source, "mutations")
+        for label in ("NOT_READ \u00b7 1", "READ_NOT_INFECTED \u00b7 0", "PROPAGATED_NOT_CHECKED \u00b7 2",
+                      "NO STAGE RECORDED \u00b7 1"):
+            self.assertIn(label, stars)
+        table = Page(source).text("data-equivalent-of=mutations")
+        self.assertIn("PROPAGATED_NOT_CHECKED a check saw the change and still passed "
+                      "M02_synthetic_blind_spot, M03_synthetic_blind_spot", table)
+
+
+# ---------------------------------------------------------------------------
 # Escaping, invisible characters and secrets
 # ---------------------------------------------------------------------------
 
@@ -1080,7 +1543,90 @@ def poisoned(value: str) -> dict[str, Any]:
     return document
 
 
+def frontier_poisoned() -> tuple[dict[str, Any], list[str]]:
+    """A PASS document with a distinct hostile value in every frontier field the page shows in full.
+
+    Returns the document and the values, so a test can check that each one
+    reached the page, and reached it escaped. Tags avoid ``_`` and ``:``,
+    the characters after which identifiers get a line-break opportunity.
+    """
+    shown: list[str] = []
+
+    def hostile(tag: str) -> str:
+        shown.append(f"{HOSTILE}#{tag}")
+        return shown[-1]
+
+    document = doc()
+    controls = document["controls"]
+    controls["plan"].update(entry_sha256=hostile("planentry"), manifest_sha256=hostile("planmanifest"))
+    controls["canary"]["must_fail"].update(invocation_id=hostile("canaryinvocation"), verdict=hostile("canaryverdict"),
+                                           reason=hostile("canaryreason"))
+    controls["comparator_self_test"]["invocation_id"] = hostile("comparatorinvocation")
+    controls["comparator_self_test"]["pairs"][0]["actual"] = hostile("comparatoractual")
+    controls["pins"].update(changed=[hostile("pinchanged")],
+                            writes=[{"path": hostile("pinwrite"), "action": "write", "event": "open"}])
+    controls["min_discrimination"]["check_id"] = hostile("weakest")
+    controls["verdict_transitions"] = [{"step": 1, "source": hostile("source"), "before": hostile("before"),
+                                        "after": hostile("after"), "reason": hostile("transitionreason")}]
+    witnessed = document["checks"][0]
+    witnessed["evidence"]["falsifiers"][0].update(
+        case_id=hostile("caseid"), description=hostile("description"), control_id=hostile("controlid"),
+        expected={"verdict": hostile("expectedverdict"), "reason": hostile("expectedreason")},
+    )
+    numeric = next(check for check in document["checks"] if "discrimination_ratio" in check["evidence"])
+    numeric["evidence"]["discrimination_ratio"]["state"] = hostile("ratiostate")
+    numeric["evidence"]["comparisons"][0]["key"] = hostile("comparisonkey")
+    skipped = document["checks"][1]
+    skipped.update(execution_state="SKIPPED", verdict="ABSTAIN", reason="INSUFFICIENT_EVIDENCE")
+    skipped["evidence"]["skip_justification"] = hostile("skiplabel")
+    extra = {"version": "1", "required": False, "execution_state": "CHECKED", "verdict": "ABSTAIN",
+             "reason": "UNVERIFIED", "failure_modes": [], "rows_examined": 1, "inputs": [], "diagnostics": [],
+             "invocation_id": None}
+    document["checks"].append({**extra, "check_id": "synthetic-join", "kind": "claim_join", "evidence": {
+        "assertions": [{"claim_id": hostile("claimid"), "kind": hostile("claimkind"), "cites": hostile("cites"),
+                        "outcome": hostile("outcome"), "detail": hostile("claimdetail")}],
+        "buckets": {"ORPHANED": [hostile("orphan")]},
+        "counts": {"ORPHANED": 1},
+        "chain": {"intact": True, "problems": [hostile("chainproblem")]},
+        "sealed_run": {"path": "sealed", "seal": {"run_id": hostile("sealedrun")}},
+    }})
+    document["checks"].append({**extra, "check_id": "synthetic-resolver", "kind": "citation_resolver", "evidence": {
+        "canaries": {hostile("prefix"): {"doi": hostile("doi"), "state": "DOI_NOT_RESOLVED_AT_CAPTURE", "holds": True,
+                                         "detail": hostile("canarydetail"),
+                                         "provenance": {"retrieved_at": hostile("retrieved")}}},
+        "distrusted_prefixes": [hostile("distrusted")],
+    }})
+    return document, shown
+
+
 class EscapingTests(unittest.TestCase):
+    def assert_shown_escaped(self, source: str, values: list[str]) -> None:
+        self.assert_inert(source)
+        for value in values:
+            self.assertIn(html.escape(value, quote=True), source, value[len(HOSTILE):])
+
+    def test_every_frontier_value_is_shown_escaped(self) -> None:
+        document, values = frontier_poisoned()
+        self.assert_shown_escaped(render(document), values)
+
+    def test_every_mutation_report_v2_value_is_shown_escaped(self) -> None:
+        values: list[str] = []
+
+        def hostile(tag: str) -> str:
+            values.append(f"{HOSTILE}#{tag}")
+            return values[-1]
+
+        report = copy.deepcopy(REPORTS["valid"])
+        report["forced_detection"].update(target=hostile("target"), detector=hostile("detector"),
+                                          fired=[{"detector": hostile("fired"), "status": "FAIL"}])
+        report["buckets"]["DETECTED"].append(hostile("bucketmember"))
+        report["buckets"][hostile("bucketname")] = []
+        report["conservation"]["disjoint"] = hostile("disjoint")
+        record = mutation_record("M01_synthetic_blind_spot", detected=False)
+        record.update(status=hostile("status"), pie_stage=hostile("stage"))
+        report["mutations"].append(record)
+        self.assert_shown_escaped(render(DOCS["pass"], report), values)
+
     def assert_inert(self, source: str) -> None:
         page = Page(source)
         self.assertEqual(page.problems, [])

@@ -121,7 +121,7 @@ METRICS: tuple[str, ...] = (
 
 #: Marks that group digits somewhere in the world, and the two decimal marks.
 #: :func:`candidate_readings` tries each pairing when the declared one fails.
-GROUPING_MARKS: tuple[str, ...] = (",", ".", "'", "_", " ", " ", " ", "’")
+GROUPING_MARKS: tuple[str, ...] = (",", ".", "'", "_", "\u00a0", "\u2009", "\u202f", "’")
 DECIMAL_MARKS: tuple[str, ...] = (".", ",")
 
 _PLAIN = re.compile(r"(-?)([0-9]+)(?:\.([0-9]+))?")

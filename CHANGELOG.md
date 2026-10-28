@@ -36,8 +36,9 @@ First version. Everything below is new.
   data.
 - The self-checking `demo` command, the `examples/field-survey` project, and
   bundled fixtures and schemas as package data.
-- Tests for the 28 numbered requirements, security (section 15) and
-  determinism (section 16).
+- Tests for the 28 numbered requirements, security (section 15, including
+  a guard against hidden characters in the source) and determinism
+  (section 16).
 
 ### Added: frontier extensions (ARCHITECTURE.md section 17)
 

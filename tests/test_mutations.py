@@ -911,8 +911,8 @@ class RecordFileTests(unittest.TestCase):
         self.assertEqual(changed, text.replace("B,plain", 'B,"x,y"'))
 
     def test_a_byte_order_mark_and_blank_lines_are_kept(self) -> None:
-        records = self.load("csv", "﻿id,v\n\nA,1\n")
-        self.assertEqual(records.with_copy_of(records.records[0]).decode("utf-8"), "﻿id,v\n\nA,1\nA,1\n")
+        records = self.load("csv", "\ufeffid,v\n\nA,1\n")
+        self.assertEqual(records.with_copy_of(records.records[0]).decode("utf-8"), "\ufeffid,v\n\nA,1\nA,1\n")
 
     def test_jsonl_and_json_arrays(self) -> None:
         lines = self.load("jsonl", '{"id": "A", "v": "1"}\n{"id": "B", "v": 2.50}\n')

@@ -46,14 +46,22 @@ import json
 import math
 import re
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ._canonical import CanonicalizationError, sha256_canonical
-from ._redact import redact_text
+from ._redact import redact_text, redaction_scope
 from ._validators import ROWS_EXAMINED_MEANING
-from .invariants import INVARIANT_NAMES
+from .invariants import (
+    CANARY_MUST_FAIL,
+    CANARY_MUST_PASS,
+    COMPARATOR_CONTROL,
+    COMPARATOR_PAIRS,
+    INVARIANT_NAMES,
+    PLANNED_CONTROLS,
+)
 from .ledger import invocation_id_for
+from .models import EXECUTED_MUTATION_STATUSES, AssertionOutcome, MutationStatus, PieStage, Ratio, WitnessState
 
 __all__ = [
     "render",
@@ -108,15 +116,23 @@ _INVARIANT_STYLE = {
     NOT_RECORDED: ("warning", "question"),
 }
 
-#: Invariants about *what was executed* belong to the Integrity plane; the
-#: rest judge the declared evaluation and belong to the Performance plane.
+#: Invariants about *what was executed*, as planned, from pinned files,
+#: belong to the Integrity plane. Invariants about whether the checkers could
+#: have failed are the Performance plane's CHECKER part (D4); the rest judge
+#: the declared evaluation, its RUN part.
 _TRACE_INVARIANTS = (
     "checked_claims_le_invocations",
     "every_invocation_has_terminal_result",
     "every_verdict_has_invocation",
 )
-_INTEGRITY_INVARIANTS = frozenset(("ledger_chain_intact", *_TRACE_INVARIANTS))
-_EVALUATION_INVARIANTS = tuple(name for name in INVARIANT_NAMES if name not in _INTEGRITY_INVARIANTS)
+_PLAN_INVARIANTS = ("plan_closure", "plan_matches_manifest")
+_INTEGRITY_INVARIANTS = frozenset(("ledger_chain_intact", *_TRACE_INVARIANTS, *_PLAN_INVARIANTS, "harness_pins_intact"))
+_CHECKER_INVARIANTS = frozenset(("comparator_self_test", "canary_controls_hold", "pass_requires_falsifier_witness"))
+_EVALUATION_INVARIANTS = tuple(
+    name for name in INVARIANT_NAMES if name not in _INTEGRITY_INVARIANTS and name not in _CHECKER_INVARIANTS
+)
+#: The tag an invariant carries in the ring's list: its plane, and for Performance its D4 part.
+_INVARIANT_TAGS = {"integrity": "integrity", "checker": "performance: checker", "run": "performance: run"}
 
 _STATUS_STYLE = {
     "PASS": ("good", "check"),
@@ -141,7 +157,9 @@ _MUTATION_STYLE = {
     UNRESOLVED: ("warning", "question"),
     SKIPPED: ("muted", "dash"),
     NOT_APPLICABLE_MUTATION: ("muted", "dash"),
-    NOT_EXECUTED_MUTATION: ("muted", "dash"),
+    # A mutant built but never executed (a no-op, a duplicate, one nothing read)
+    # points at the harness or the operator, so it is marked, not greyed out.
+    NOT_EXECUTED_MUTATION: ("warning", "dash"),
 }
 #: Report v2 statuses (ARCHITECTURE.md 17.12) of mutants that were built or
 #: considered but never executed. They are neither skipped operators nor
@@ -165,6 +183,90 @@ _MUTATION_COUNTS = (
     ("not_applicable_mutations", "Not applicable"),
 )
 _MUTATION_COUNT_KEYS = tuple(key for key, _ in _MUTATION_COUNTS)
+#: The conservation identities of report v2 (17.12), as ordered partitions:
+#: generated = executed + these, and executed = these.
+_UNEXECUTED_PARTITION = tuple(
+    status.value
+    for status in (
+        MutationStatus.NOT_APPLICABLE,
+        MutationStatus.SUPPRESSED,
+        MutationStatus.NOOP_MUTATION,
+        MutationStatus.CANONICALLY_EQUIVALENT,
+        MutationStatus.DUPLICATE_MUTANT,
+        MutationStatus.SKIPPED,
+        MutationStatus.NOT_ACTIVATED,
+    )
+)
+_EXECUTED_PARTITION = tuple(status.value for status in MutationStatus if status in EXECUTED_MUTATION_STATUSES)
+_BUCKET_TONE = {
+    MutationStatus.DETECTED.value: "good",
+    MutationStatus.BLIND_SPOT.value: "critical",
+    MutationStatus.VERIFIER_ERROR.value: "serious",
+    MutationStatus.TIMED_OUT.value: "serious",
+    MutationStatus.FLAKY.value: "serious",
+    MutationStatus.NOT_APPLICABLE.value: "muted",
+    MutationStatus.SKIPPED.value: "muted",
+    MutationStatus.SUPPRESSED.value: "warning",
+    MutationStatus.NOOP_MUTATION.value: "warning",
+    MutationStatus.CANONICALLY_EQUIVALENT.value: "warning",
+    MutationStatus.DUPLICATE_MUTANT.value: "warning",
+    MutationStatus.NOT_ACTIVATED.value: "warning",
+}
+#: Where an undetected defect stopped mattering (17.12), in the order a defect travels.
+_PIE_STAGES = tuple(stage.value for stage in PieStage)
+_PIE_MEANING = {
+    PieStage.NOT_READ.value: "the mutated file was never read",
+    PieStage.READ_NOT_INFECTED.value: "read, but parsed values were unchanged",
+    PieStage.INFECTED_NOT_PROPAGATED.value: "the changed value reached no check",
+    PieStage.PROPAGATED_NOT_CHECKED.value: "a check saw the change and still passed",
+}
+_NO_STAGE = "NO STAGE RECORDED"
+
+#: Falsifier witness states (17.5). Only WITNESSED shows that a PASS could
+#: have failed; REFUTED proves a miss; the others leave coverage unknown.
+_WITNESS_STYLE = {
+    WitnessState.WITNESSED.value: ("good", "check"),
+    WitnessState.REFUTED.value: ("critical", "cross"),
+    WitnessState.UNWITNESSED.value: ("warning", "question"),
+    WitnessState.NO_CASE.value: ("warning", "question"),
+    WitnessState.NO_GENERATOR.value: ("warning", "question"),
+}
+_WITNESS_MEANING = {
+    WitnessState.WITNESSED.value: "a known-bad case of its own input was rejected as expected",
+    WitnessState.REFUTED.value: "a known-bad case was accepted as PASS: the checker cannot reject it",
+    WitnessState.UNWITNESSED.value: "no known-bad case produced its expected rejection",
+    WitnessState.NO_CASE.value: "the generator found no known-bad case for this instance",
+    WitnessState.NO_GENERATOR.value: "no negative-control generator exists for this kind",
+}
+#: How one negative control compared with what it had to do. A falsifier
+#: records its own outcome word; the other controls are judged here, by
+#: equality of the recorded expected and actual values, and never assumed.
+_CONTROL_STYLE = {
+    "REJECTED": ("good", "check"),
+    "ACCEPTED": ("critical", "cross"),
+    "INCONCLUSIVE": ("warning", "question"),
+    "AS REQUIRED": ("good", "check"),
+    "NOT AS REQUIRED": ("critical", "cross"),
+    "HOLDS": ("good", "check"),
+    "DOES NOT HOLD": ("critical", "cross"),
+    "RESOLVED": ("critical", "cross"),
+    "NOT HELD": ("warning", "question"),
+    "NOT RECORDED": ("warning", "question"),
+    **{state: style for state, style in _WITNESS_STYLE.items() if state != WitnessState.WITNESSED.value},
+}
+_JOIN_OUTCOMES = tuple(outcome.value for outcome in AssertionOutcome)
+_JOIN_STYLE = {
+    AssertionOutcome.BACKED.value: ("good", "check"),
+    AssertionOutcome.NARRATED.value: ("warning", "question"),
+    AssertionOutcome.CONTRADICTED.value: ("critical", "cross"),
+    AssertionOutcome.ORPHANED.value: ("serious", "bang"),
+}
+_JOIN_MEANING = {
+    AssertionOutcome.BACKED.value: "a terminal invocation backs the claim",
+    AssertionOutcome.NARRATED.value: "nothing in the sealed run backs it",
+    AssertionOutcome.CONTRADICTED.value: "the invocation recorded otherwise",
+    AssertionOutcome.ORPHANED.value: "a failure no assertion mentions",
+}
 
 _FUNNEL = ("expected", "discovered", "opened", "parsed", "examined")
 _DISPOSITIONS = ("admitted", "excluded", "deferred", "unresolved", "failed")
@@ -196,6 +298,10 @@ _MAX_INPUT_ROWS = 40
 _MAX_RING_SEGMENTS = 60
 _MAX_CHAIN_LINKS = 40
 _MAX_STARS_PER_GROUP = 150
+_MAX_CONTROL_ROWS = 60
+_MAX_DISCRIMINATION_ROWS = 40
+_MAX_PLAN_CELLS = 60
+_MAX_JOIN_PER_BUCKET = 24
 #: The masthead names at most this many decisive findings; the Findings section lists all of them.
 _WHY_LIMIT = 3
 #: invocation positions are derived by hashing every seq up to ledger_length.
@@ -271,6 +377,101 @@ def _short_hash(value: Any) -> str:
     return text if len(text) <= 18 else f"{text[:10]}\u2026{text[-6:]}"
 
 
+def _controls(doc: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The run's checker controls (17.8); an absent or malformed block holds nothing."""
+    return _dict(doc.get("controls"))
+
+
+def _evidence(check: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _dict(check.get("evidence"))
+
+
+def _verdict_text(value: Any) -> str:
+    """``VERDICT / REASON`` from a recorded ``{verdict, reason}`` object, as recorded."""
+    record = _dict(value)
+    if not record:
+        return "not recorded"
+    return f"{_plain(record.get('verdict'))} / {_plain(record.get('reason'))}"
+
+
+def _cases(check: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The falsifier cases a check's evidence records, in the order they ran (17.5)."""
+    return _dicts(_evidence(check).get("falsifiers"))
+
+
+def _witnessed(check: Mapping[str, Any]) -> bool:
+    """True only when the check records WITNESSED *and* at least one case that was REJECTED.
+
+    The state word alone is not enough: section 17.5 makes the rejected case
+    the witness, so a WITNESSED label over no rejected case is not one. A
+    case counts as rejected only when its recorded outcome says so *and* its
+    own required and recorded results agree (:func:`_case_outcome`).
+    """
+    return _is(_evidence(check).get("falsification"), WitnessState.WITNESSED.value) and any(
+        _rejected(case) for case in _cases(check)
+    )
+
+
+def _rejected(case: Mapping[str, Any]) -> bool:
+    """A falsifier case that both records REJECTED and whose own results give REJECTED."""
+    return _is(case.get("outcome"), "REJECTED") and _case_outcome(case) == "REJECTED"
+
+
+def _witness_counts(doc: Mapping[str, Any]) -> tuple[int, int]:
+    """``(witnessed, passed)`` over the run's check results."""
+    passed = [check for check in _dicts(doc.get("checks")) if _is(check.get("verdict"), "PASS")]
+    return sum(1 for check in passed if _witnessed(check)), len(passed)
+
+
+@dataclass(frozen=True)
+class _RatioView:
+    """A recorded ratio (17.3), rebuilt from its own counts rather than trusted.
+
+    ``ratio`` is the :class:`~science_gate.models.Ratio` the counts define, or
+    None when the counts cannot define one (missing, negative, or a part
+    larger than its whole). ``problem`` says when the record disagrees with
+    its own counts. A ratio without a value is never drawn or read as 0% or
+    100% (extension #23).
+    """
+
+    ratio: Ratio | None
+    problem: str | None
+
+    @property
+    def defined(self) -> bool:
+        return self.ratio is not None and self.ratio.value is not None and self.problem is None
+
+    def text(self) -> str:
+        if self.ratio is None:
+            base = "no value" if self.problem else "not recorded"
+        elif self.ratio.value is None:
+            counted = f", {self.ratio.fraction} as counted" if self.ratio.fraction else ""
+            base = f"no value ({self.ratio.state.value}{counted})"
+        else:
+            base = f"{self.ratio.fraction} = {self.ratio.decimal}"
+        return f"{base}: {self.problem}" if self.problem else base
+
+
+def _ratio_view(value: Any) -> _RatioView:
+    record = _dict(value)
+    if not record:
+        return _RatioView(None, None)
+    try:
+        ratio = Ratio(_int(record.get("numerator")), _int(record.get("denominator")))
+    except (TypeError, ValueError) as exc:
+        return _RatioView(None, f"its counts define no ratio: {exc}")
+    differing = sorted(
+        key for key, rebuilt in ratio.to_dict().items() if key in record and not _same(record.get(key), rebuilt)
+    )
+    problem = f"the record's own {', '.join(differing)} disagree with its counts" if differing else None
+    return _RatioView(ratio, problem)
+
+
+def _same(recorded: Any, rebuilt: Any) -> bool:
+    """Exact JSON equality that never treats ``True`` as ``1``."""
+    return type(recorded) is type(rebuilt) and recorded == rebuilt
+
+
 # ---------------------------------------------------------------------------
 # Text safety
 # ---------------------------------------------------------------------------
@@ -338,12 +539,25 @@ class _Facet:
 
 
 @dataclass(frozen=True)
+class _FacetGroup:
+    """Facets that answer one part of a plane's question; Performance has D4's CHECKER and RUN parts."""
+
+    name: str
+    question: str
+    facets: tuple[_Facet, ...]
+
+
+@dataclass(frozen=True)
 class _Plane:
     key: str
     title: str
     question: str
-    facets: tuple[_Facet, ...]
+    groups: tuple[_FacetGroup, ...]
     boundary: Any
+
+    @property
+    def facets(self) -> tuple[_Facet, ...]:
+        return tuple(facet for group in self.groups for facet in group.facets)
 
     def count(self, state: str) -> int:
         return sum(1 for facet in self.facets if facet.state == state)
@@ -372,9 +586,12 @@ class _InvariantRow:
 
     @property
     def plane(self) -> str:
+        """``integrity``, ``checker`` or ``run`` (the two D4 parts of Performance), or ``unregistered``."""
         if not isinstance(self.name, str) or self.name not in INVARIANT_NAMES:
             return "unregistered"
-        return "integrity" if self.name in _INTEGRITY_INVARIANTS else "performance"
+        if self.name in _INTEGRITY_INVARIANTS:
+            return "integrity"
+        return "checker" if self.name in _CHECKER_INVARIANTS else "run"
 
 
 @dataclass(frozen=True)
@@ -429,6 +646,27 @@ class _LatticeRow:
     @property
     def is_terminal(self) -> bool:
         return self.result is not None and _str(self.result.get("invocation_id")) is not None
+
+    @property
+    def witness(self) -> _Cell:
+        """Whether this result shows that its checker could have failed (17.5).
+
+        Only a would-be PASS is falsified, so a result that never reached one
+        is NOT FALSIFIED, which is not a defect. A PASS with no witness record
+        is NOT RECORDED, and a WITNESSED label without a rejected case is not
+        drawn as witnessed.
+        """
+        if self.result is None:
+            return _Cell("NO RESULT", "warning", "question", False)
+        state = _evidence(self.result).get("falsification")
+        if state is None:
+            if _is(self.result.get("verdict"), "PASS"):
+                return _Cell("NOT RECORDED", "warning", "question", False)
+            return _Cell("NOT FALSIFIED", "muted", "dash", False)
+        if _is(state, WitnessState.WITNESSED.value) and not _witnessed(self.result):
+            return _Cell("NO REJECTED CASE", "warning", "question", False)
+        tone, glyph = _style(_WITNESS_STYLE, state)
+        return _Cell(_plain(state), tone, glyph, _is(state, WitnessState.WITNESSED.value) or _is(state, "REFUTED"))
 
 
 def _accounting_inputs(doc: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -505,6 +743,115 @@ def _invariant_group_facet(
     return _Facet(name, DARK, f"none of the {len(members)} {what} invariants was applicable and holding")
 
 
+def _invariant_states(invariants: Sequence[_InvariantRow], name: str) -> tuple[list[str], list[str]]:
+    """``(states, details of violations)`` recorded for one invariant name."""
+    rows = [row for row in invariants if row.name == name]
+    return [row.state for row in rows], [_plain(row.detail) for row in rows if row.state == VIOLATED]
+
+
+def _control_facet(
+    name: str,
+    control: Any,
+    invariant: str,
+    invariants: Sequence[_InvariantRow],
+    describe: Callable[[Mapping[str, Any]], str],
+    missing: str,
+) -> _Facet:
+    """A facet lit by one recorded run control (17.8) together with the invariant that judges it.
+
+    LIT needs both: the control records ``holds: true`` and its invariant is
+    recorded as holding. Either one saying otherwise breaks the facet. A
+    control that is not recorded leaves the facet dark, never lit, whatever
+    the invariant says. ``describe`` turns the control into plain text.
+    """
+    states, violations = _invariant_states(invariants, invariant)
+    violated = f"{invariant} violated: {'; '.join(violations)}" if violations else ""
+    if not isinstance(control, dict):
+        return _Facet(name, BROKEN, f"{missing}; {violated}") if violated else _Facet(name, DARK, missing)
+    text = describe(control)
+    holds = control.get("holds")
+    if holds is False or violated:
+        return _Facet(name, BROKEN, "; ".join(part for part in (text, violated) if part))
+    if holds is True and states and all(state == HOLDS for state in states):
+        return _Facet(name, LIT, f"{text}; {invariant} holds")
+    return _Facet(name, PARTIAL, f"{text}; recorded holds {_plain(holds)}, {invariant} {'/'.join(states)}")
+
+
+def _canary_text(control: Mapping[str, Any]) -> str:
+    return ", ".join(
+        f"{twin} gave {_verdict_text(control.get(twin))} (required {required})"
+        for twin, required in (("must_fail", "FAIL"), ("must_pass", "PASS"))
+    )
+
+
+def _comparator_text(control: Mapping[str, Any]) -> str:
+    pairs = _dicts(control.get("pairs"))
+    as_expected = sum(1 for pair in pairs if _str(pair.get("actual")) and pair.get("actual") == pair.get("expected"))
+    return f"{as_expected} of {len(pairs)} known pair(s) compared as expected"
+
+
+def _pins_text(control: Mapping[str, Any]) -> str:
+    changed = _strs(control.get("changed"))
+    writes = [_plain(_dict(item).get("path")) for item in _dicts(control.get("writes"))]
+    return (
+        f"{_count(control.get('pinned'))} file(s) pinned before the PLAN; changed: {', '.join(changed) or 'none'}; "
+        f"written during the run: {', '.join(writes) or 'none'}"
+    )
+
+
+def _plan_facet(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow]) -> _Facet:
+    """The PLAN (17.4): recorded at ledger entry 1, equal to the manifest, and closed by what ran."""
+    name = "Plan committed"
+    plan = _controls(doc).get("plan")
+    states = {member: _invariant_states(invariants, member) for member in _PLAN_INVARIANTS}
+    violations = [f"{member} violated: {'; '.join(states[member][1])}" for member in _PLAN_INVARIANTS if states[member][1]]
+    if violations:
+        return _Facet(name, BROKEN, "; ".join(violations))
+    if not isinstance(plan, dict):
+        return _Facet(name, DARK, "no PLAN is recorded, so nothing shows what the run committed to before it ran")
+    head = (
+        f"PLAN at ledger entry 1 committed {_count(plan.get('checks_planned'))} check(s), "
+        f"{_count(plan.get('inputs_planned'))} input(s) and {_count(plan.get('pins'))} pin(s)"
+    )
+    holding = [member for member in _PLAN_INVARIANTS if all(state == HOLDS for state in states[member][0])]
+    if len(holding) == len(_PLAN_INVARIANTS):
+        return _Facet(name, LIT, f"{head}; plan_closure and plan_matches_manifest hold")
+    rest = ", ".join(f"{member} {'/'.join(states[member][0])}" for member in _PLAN_INVARIANTS if member not in holding)
+    return _Facet(name, PARTIAL, f"{head}; {rest}")
+
+
+def _witness_facet(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow]) -> _Facet:
+    """Every PASS carries a falsifier witness (17.5): its checker rejected a known-bad case of its own input."""
+    name = "Falsifier witnesses"
+    checks = _dicts(doc.get("checks"))
+    states, violations = _invariant_states(invariants, "pass_requires_falsifier_witness")
+    refuted = [_plain(check.get("check_id")) for check in checks if _is(_evidence(check).get("falsification"), "REFUTED")]
+    if refuted or violations:
+        parts = [f"REFUTED (a known-bad case passed): {', '.join(refuted)}"] if refuted else []
+        parts += [f"pass_requires_falsifier_witness violated: {'; '.join(violations)}"] if violations else []
+        return _Facet(name, BROKEN, "; ".join(parts))
+    witnessed, passed = _witness_counts(doc)
+    lacking = [
+        f"{_plain(check.get('check_id'))} {_plain(_evidence(check).get('falsification'))}"
+        for check in checks
+        if _evidence(check).get("falsification") is not None and not _witnessed(check)
+    ]
+    lacking += [
+        f"{_plain(check.get('check_id'))} PASS without a witness record"
+        for check in checks
+        if _is(check.get("verdict"), "PASS") and _evidence(check).get("falsification") is None
+    ]
+    ratio = f"{witnessed} of {passed} PASS result(s) witnessed"
+    invariant_note = [] if all(state == HOLDS for state in states) else [
+        f"pass_requires_falsifier_witness {'/'.join(states)}"
+    ]
+    if not passed and not lacking:
+        return _Facet(name, DARK, "no check reached PASS, so no checker had a PASS to witness")
+    if passed and witnessed == passed and not lacking and not invariant_note:
+        return _Facet(name, LIT, f"{ratio}: each checker rejected a known-bad case of its own input")
+    return _Facet(name, PARTIAL if witnessed else DARK, "; ".join([ratio, *lacking, *invariant_note]))
+
+
 def _digest_outcome(item: Mapping[str, Any]) -> str:
     """``match``, ``mismatch`` or ``not compared`` for an input that declares a digest."""
     computed = _str(item.get("sha256"))
@@ -513,10 +860,25 @@ def _digest_outcome(item: Mapping[str, Any]) -> str:
     return "match" if computed is not None else "not compared"
 
 
-def _integrity_facets(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow]) -> tuple[_Facet, ...]:
-    """Was this the exact artifact, input, execution and version claimed?"""
+def _integrity_groups(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow]) -> tuple[_FacetGroup, ...]:
+    """Was this the exact artifact, input, execution and version claimed?
+
+    Three parts: the artifact (the bytes read, and the harness that read
+    them), the execution (planned, then sealed in the ledger), and the
+    attestation (the receipt and any re-check of it).
+    """
     inputs = _accounting_inputs(doc)
-    facets = []
+    facets = [
+        _plan_facet(doc, invariants),
+        _control_facet(
+            "Harness pins",
+            _controls(doc).get("pins"),
+            "harness_pins_intact",
+            invariants,
+            _pins_text,
+            "harness pins are not recorded, so nothing shows the checked files and checkers were left alone",
+        ),
+    ]
 
     hashed = sum(1 for item in inputs if _str(item.get("sha256")))
     if not inputs:
@@ -617,13 +979,69 @@ def _integrity_facets(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow
     else:
         problems = _strs(reverification.get("problems"))
         facets.append(_Facet("Re-verification", BROKEN, f"re-verification failed with {len(problems)} problem(s)"))
-    return tuple(facets)
+    return _grouped(
+        facets,
+        (
+            ("Artifact", "the exact inputs, and the harness that read them",
+             ("Input digests", "Declared digests", "Harness pins", "Evidence manifest")),
+            ("Execution", "planned before it ran, then sealed",
+             ("Plan committed", "Ledger sealed", "Hash chain", "Execution trace")),
+            ("Attestation", "the receipt, and any re-check of it", ("Receipt", "Signature", "Re-verification")),
+        ),
+    )
 
 
-def _performance_facets(
+def _grouped(
+    facets: Sequence[_Facet], layout: Sequence[tuple[str, str, Sequence[str]]]
+) -> tuple[_FacetGroup, ...]:
+    """Arrange facets into named groups by facet name. Every facet is built exactly once, so none can be lost."""
+    by_name = {facet.name: facet for facet in facets}
+    groups = tuple(
+        _FacetGroup(name, question, tuple(by_name.pop(member) for member in members))
+        for name, question, members in layout
+    )
+    if by_name:
+        raise AssertionError(f"facets without a group: {sorted(by_name)}")
+    return groups
+
+
+def _performance_groups(
+    doc: Mapping[str, Any], invariants: Sequence[_InvariantRow], lattice: Sequence[_LatticeRow]
+) -> tuple[_FacetGroup, ...]:
+    """How did the fixed system behave on the declared evaluation?
+
+    Two labelled parts, as in the receipt's performance statement (D4):
+    CHECKER (could the checks have failed?) and RUN (what they concluded).
+    """
+    controls = _controls(doc)
+    checker = (
+        _witness_facet(doc, invariants),
+        _control_facet(
+            "Run canary",
+            controls.get("canary"),
+            "canary_controls_hold",
+            invariants,
+            _canary_text,
+            "the must-fail canary and its must-pass twin are not recorded",
+        ),
+        _control_facet(
+            "Comparator self-test",
+            controls.get("comparator_self_test"),
+            "comparator_self_test",
+            invariants,
+            _comparator_text,
+            "the comparator self-test is not recorded",
+        ),
+    )
+    return (
+        _FacetGroup("Checker", "could the checks have failed?", checker),
+        _FacetGroup("Run", "what the declared checks concluded", _run_facets(doc, invariants, lattice)),
+    )
+
+
+def _run_facets(
     doc: Mapping[str, Any], invariants: Sequence[_InvariantRow], lattice: Sequence[_LatticeRow]
 ) -> tuple[_Facet, ...]:
-    """How did the fixed system behave on the declared evaluation?"""
     facets = []
 
     opened, expected = _int(doc.get("inputs_opened")), _int(doc.get("expected_inputs"))
@@ -724,14 +1142,14 @@ def _planes(
             "integrity",
             "Integrity",
             "Was this the exact artifact, input, execution and version claimed?",
-            _integrity_facets(doc, invariants),
+            _integrity_groups(doc, invariants),
             boundary.get("integrity"),
         ),
         _Plane(
             "performance",
             "Performance",
             "How did the fixed system behave on the declared evaluation?",
-            _performance_facets(doc, invariants, lattice),
+            _performance_groups(doc, invariants, lattice),
             boundary.get("performance"),
         ),
     )
@@ -779,17 +1197,61 @@ def _pass_contract_gaps(
             gaps.append(f"required check {name} is {state} {verdict}, not CHECKED PASS")
         elif not row.is_terminal:
             gaps.append(f"required check {name} has no invocation")
+        elif not _witnessed(row.result):
+            state = _plain(_evidence(row.result).get("falsification") or "not recorded")
+            gaps.append(f"required check {name} is PASS without a falsifier witness (falsification {state})")
     for row in invariants:
         if row.state in (VIOLATED, UNDETERMINED, NOT_RECORDED):
             gaps.append(f"invariant {_plain(row.name)} is {row.state}")
     if not _str(doc.get("evidence_manifest_sha256")):
         gaps.append("no evidence manifest digest is recorded")
+    controls = _controls(doc)
+    if not isinstance(controls.get("plan"), dict):
+        gaps.append("no PLAN is recorded in controls.plan")
+    for key, label in (("canary", "the run canary"), ("comparator_self_test", "the comparator self-test"),
+                       ("pins", "the harness pins")):
+        control = controls.get(key)
+        if not isinstance(control, dict):
+            gaps.append(f"{label} is not recorded (controls.{key})")
+        elif control.get("holds") is not True:
+            gaps.append(f"{label} records holds {_plain(control.get('holds'))}, not true (controls.{key})")
     return gaps
+
+
+PLAN_ENTRY, STARTED_ENTRY, TERMINAL_ENTRY = "PLAN", "STARTED", "TERMINAL"
+
+
+@dataclass(frozen=True)
+class _LedgerEntry:
+    """One ledger entry as run.json lets the page identify it.
+
+    ``family`` is ``plan``, ``check``, ``falsifier`` or ``control``.
+    ``owner`` is the check or control id the entry belongs to, and ``span``
+    the invocation it sits inside: a falsifier's entries sit inside its
+    subject check's span. ``outcome`` is what a terminal entry recorded, as
+    run.json records it, and ``verdict`` its verdict word, when it has one.
+    """
+
+    seq: int
+    phase: str
+    family: str
+    owner: Any
+    span: Any
+    invocation: str | None
+    outcome: str | None
+    verdict: Any = None
 
 
 @dataclass(frozen=True)
 class _LedgerView:
-    """The sealed chain as far as run.json shows it: its length, its head, and where invocations start."""
+    """The sealed chain as far as run.json shows it.
+
+    ``starts`` places each check result's STARTED entry exactly. ``entries``
+    holds every entry when ``complete``, and otherwise only the entries
+    placed exactly from a recorded invocation id. ``falsifier_invocations``
+    maps ``(check position, case position)`` to a falsifier's invocation id,
+    and is empty unless ``complete``.
+    """
 
     length: int | None
     head: str | None
@@ -797,33 +1259,123 @@ class _LedgerView:
     unplaced: tuple[Mapping[str, Any], ...]
     without_invocation: tuple[Mapping[str, Any], ...]
     derived: bool
+    entries: Mapping[int, _LedgerEntry]
+    complete: bool
+    note: str
+    falsifier_invocations: Mapping[tuple[int, int], str]
+
+
+def _control_records(doc: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any], str]]:
+    """The planned controls in ledger order (17.6), each with its record and the outcome it records."""
+    controls = _controls(doc)
+    comparator, canary = _dict(controls.get("comparator_self_test")), _dict(controls.get("canary"))
+    return [
+        (COMPARATOR_CONTROL, comparator, f"holds {_plain(comparator.get('holds'))}" if comparator else "not recorded"),
+        (CANARY_MUST_FAIL, _dict(canary.get("must_fail")), _verdict_text(canary.get("must_fail"))),
+        (CANARY_MUST_PASS, _dict(canary.get("must_pass")), _verdict_text(canary.get("must_pass"))),
+    ]
 
 
 def _ledger_view(doc: Mapping[str, Any]) -> _LedgerView:
-    """Place each check's invocation on the chain.
+    """Identify the ledger's entries from run.json, and say how far that identification goes.
 
     run.json carries the seal (length and head), not the entries. An
     invocation id is ``inv-`` plus 12 hex of ``sha256(run_id:seq)``, where
-    seq is the 1-based position of its STARTED entry (section 4). So the
-    position of every STARTED entry can be derived exactly, and an id that
-    matches no position up to ``ledger_length`` stands out. Terminal entries
-    are not identifiable from run.json and are not guessed.
+    seq is the 1-based position of its STARTED entry (section 4). So every
+    STARTED entry of a check or control with a recorded id is placed
+    exactly, and an id that matches no position up to ``ledger_length``
+    stands out.
+
+    The rest follows the ledger order of section 17.5: the PLAN is entry 1;
+    a check's falsifiers run between its STARTED and terminal entries, two
+    entries each, in the order its evidence lists them. Those positions are
+    a prediction, so they are accepted only when the predicted entries tile
+    the sealed length exactly, with no entry claimed twice and none left
+    over. Otherwise only the exact placements are shown, and nothing is
+    guessed.
     """
     length, head, run_id = _int(doc.get("ledger_length")), _str(doc.get("ledger_head_sha256")), _str(doc.get("run_id"))
     derived = run_id is not None and length is not None and 0 <= length <= _MAX_DERIVED_SEQ
-    index = {invocation_id_for(run_id, seq): seq for seq in range(1, length + 1)} if derived else {}
+    index = {invocation_id_for(run_id, seq): seq for seq in range(1, length + 1)} if derived and run_id else {}
     starts: dict[int, list[Mapping[str, Any]]] = {}
     unplaced, without = [], []
-    for check in _dicts(doc.get("checks")):
+    exact: list[_LedgerEntry] = []
+    predicted: list[_LedgerEntry] = []
+    falsifier_seqs: dict[tuple[int, int], int] = {}
+    for position, check in enumerate(_dicts(doc.get("checks"))):
         invocation = _str(check.get("invocation_id"))
         if invocation is None:
             without.append(check)
-        elif derived:
-            seq = index.get(invocation)
-            if seq is None:
+            continue
+        seq = index.get(invocation)
+        if seq is None:
+            if derived:
                 unplaced.append(check)
-            else:
-                starts.setdefault(seq, []).append(check)
+            continue
+        starts.setdefault(seq, []).append(check)
+        owner = check.get("check_id")
+        exact.append(_LedgerEntry(seq, STARTED_ENTRY, "check", owner, owner, invocation, None))
+        cases = _cases(check)
+        for number, case in enumerate(cases):
+            at = seq + 1 + 2 * number
+            falsifier_seqs[(position, number)] = at
+            control = case.get("control_id")
+            actual = _dict(case.get("actual"))
+            predicted.append(_LedgerEntry(at, STARTED_ENTRY, "falsifier", control, owner, None, None))
+            predicted.append(
+                _LedgerEntry(
+                    at + 1, TERMINAL_ENTRY, "falsifier", control, owner, None, _verdict_text(actual),
+                    actual.get("verdict"),
+                )
+            )
+        end = seq + 1 + 2 * len(cases)
+        predicted.append(
+            _LedgerEntry(
+                end, TERMINAL_ENTRY, "check", owner, owner, invocation, _verdict_text(check), check.get("verdict")
+            )
+        )
+    unplaced_controls = []
+    for control_id, record, outcome in _control_records(doc):
+        invocation = _str(record.get("invocation_id"))
+        seq = index.get(invocation) if invocation is not None else None
+        if seq is None:
+            unplaced_controls.append(control_id)
+            continue
+        exact.append(_LedgerEntry(seq, STARTED_ENTRY, "control", control_id, control_id, invocation, None))
+        predicted.append(
+            _LedgerEntry(
+                seq + 1, TERMINAL_ENTRY, "control", control_id, control_id, invocation, outcome, record.get("verdict")
+            )
+        )
+    if isinstance(_controls(doc).get("plan"), dict):
+        predicted.append(_LedgerEntry(1, PLAN_ENTRY, "plan", "PLAN", "PLAN", None, None))
+    every = exact + predicted
+    seqs = [entry.seq for entry in every]
+    problems = []
+    if not derived:
+        problems.append("positions not derived: the run id or ledger length is missing or too large")
+    if unplaced or without or unplaced_controls:
+        problems.append("some recorded invocations could not be placed")
+    if len(set(seqs)) != len(seqs):
+        problems.append("two predicted entries claim the same position")
+    if derived and sorted(set(seqs)) != list(range(1, (length or 0) + 1)):
+        problems.append(f"the predicted entries cover {len(set(seqs))} position(s), not the {length} sealed")
+    complete = not problems and length is not None and length > 0
+    if complete and run_id is not None:
+        entries = {entry.seq: _with_invocation(entry, run_id) for entry in every}
+        falsifiers = {key: invocation_id_for(run_id, seq) for key, seq in falsifier_seqs.items()}
+        note = (
+            f"all {length} entries identified from run.json: their positions follow the ledger order of "
+            "ARCHITECTURE.md 17.5 and tile the sealed length exactly"
+        )
+    else:
+        entries = {entry.seq: entry for entry in sorted(exact, key=lambda item: item.seq)}
+        falsifiers = {}
+        note = (
+            "only invocation starts with a recorded id are placed: " + "; ".join(problems)
+            if problems
+            else "the ledger is empty"
+        )
     return _LedgerView(
         length,
         head,
@@ -831,7 +1383,19 @@ def _ledger_view(doc: Mapping[str, Any]) -> _LedgerView:
         tuple(unplaced),
         tuple(without),
         derived,
+        dict(sorted(entries.items())),
+        complete,
+        note,
+        falsifiers,
     )
+
+
+def _with_invocation(entry: _LedgerEntry, run_id: str) -> _LedgerEntry:
+    """A falsifier entry with its invocation id, derived from its STARTED position once the tiling holds."""
+    if entry.family != "falsifier" or entry.invocation is not None:
+        return entry
+    started = entry.seq if entry.phase == STARTED_ENTRY else entry.seq - 1
+    return replace(entry, invocation=invocation_id_for(run_id, started))
 
 
 FIRED, NOT_FIRED, FIRING_NOT_RECORDED, NOT_EXECUTED = "FIRED", "NOT FIRED", "NOT RECORDED", "NOT EXECUTED"
@@ -922,6 +1486,12 @@ class _Mutation:
         match = re.match(r"M\d+", text)
         return match.group(0) if match else text[:6]
 
+    @property
+    def stage(self) -> str:
+        """The PIE stage (17.12) a blind spot records, or :data:`_NO_STAGE` when it records none the page knows."""
+        stage = self.record.get("pie_stage")
+        return stage if isinstance(stage, str) and stage in _PIE_STAGES else _NO_STAGE
+
 
 def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str | None]:
     """Group one mutation record. A detection counts only when the record's own evidence supports it.
@@ -938,8 +1508,10 @@ def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str
     state, detected, blind = record.get("execution_state"), record.get("detected"), record.get("blind_spot")
     status = record.get("status")
     claims = " but the record says detected=true; it is not counted as a detection" if detected is True else ""
-    if status in _UNEXECUTED_V2_STATUSES and not _is(state, "CHECKED"):
-        return NOT_EXECUTED_MUTATION, f"status {status}: never executed, so never counted" + claims
+    if isinstance(status, str) and status in _UNEXECUTED_V2_STATUSES and not _is(state, "CHECKED"):
+        duplicate = record.get("duplicate_of")
+        of = f" (a duplicate of {_plain(duplicate)})" if duplicate is not None else ""
+        return NOT_EXECUTED_MUTATION, f"status {status}{of}: never executed, so never counted" + claims
     if record.get("applicable") is False or _is(state, "NOT_APPLICABLE"):
         return NOT_APPLICABLE_MUTATION, ("not applicable" + claims) if claims else None
     if _is(state, "SKIPPED"):
@@ -956,9 +1528,12 @@ def _classify_mutation(record: Mapping[str, Any], firing: str) -> tuple[str, str
             return UNRESOLVED, "no fired detector is recorded" + claims
         return DETECTED, "the record also says blind_spot=true" if blind is True else None
     if detected is False:
-        if status in _ESCAPED_V2_STATUSES:
+        if isinstance(status, str) and status in _ESCAPED_V2_STATUSES:
             return BLIND_SPOT, f"status {status}: executed and not detected, so it counts as escaped"
-        notes = ["the record says blind_spot=false although nothing detected it"] if blind is False else []
+        stage = record.get("pie_stage")
+        notes = [f"stopped mattering at {stage}"] if isinstance(stage, str) else []
+        if blind is False:
+            notes.append("the record says blind_spot=false although nothing detected it")
         if firing == FIRED and actual is not None and actual != "PASS":
             notes.append(
                 "its recorded evidence shows the expected detector firing on a non-PASS result; it stays a blind spot"
@@ -974,6 +1549,99 @@ def _mutation(record: Mapping[str, Any]) -> _Mutation:
 
 
 @dataclass(frozen=True)
+class _Conservation:
+    """The two identities of report v2 (17.12), recomputed from the recorded buckets.
+
+    generated = executed + NOT_APPLICABLE + SUPPRESSED + NOOP_MUTATION +
+    CANONICALLY_EQUIVALENT + DUPLICATE_MUTANT + SKIPPED + NOT_ACTIVATED, and
+    executed = DETECTED + BLIND_SPOT + VERIFIER_ERROR + TIMED_OUT + FLAKY,
+    each over disjoint id lists. ``sizes`` holds each bucket's size, or None
+    when the report records no usable list for it. Each identity is None
+    when there are no buckets to recompute it from, so an identity that was
+    never recorded can never read as holding.
+    """
+
+    recorded: Mapping[str, Any]
+    sizes: Mapping[str, int | None]
+    members: Mapping[str, tuple[str, ...]]
+    generated: int
+    executed: int | None
+    generated_holds: bool | None
+    executed_holds: bool | None
+    disjoint: bool | None
+    problems: tuple[str, ...]
+
+    @property
+    def available(self) -> bool:
+        return self.generated_holds is not None
+
+    @property
+    def holds(self) -> bool | None:
+        checks = (self.generated_holds, self.executed_holds, self.disjoint)
+        if None in checks:
+            return None
+        return all(checks)
+
+
+def _conservation(report: Mapping[str, Any], records: Sequence[Mapping[str, Any]]) -> _Conservation:
+    """Recompute both identities from ``buckets``, against the records the report lists.
+
+    The generated side is the report's own list of records (every generated
+    mutant has one), and the recorded ``conservation.generated`` and
+    ``conservation.executed`` lists when present. A bucket that is missing,
+    not a list of ids, or named outside the vocabulary breaks the identity
+    it belongs to, because a mutant in it is unaccounted for.
+    """
+    recorded = _dict(report.get("conservation"))
+    buckets = report.get("buckets")
+    record_ids = sorted(_plain(record.get("mutation_id")) for record in records)
+    if not isinstance(buckets, dict):
+        return _Conservation(recorded, {}, {}, len(record_ids), None, None, None, None, ())
+    statuses = (*_EXECUTED_PARTITION, *_UNEXECUTED_PARTITION)
+    problems = []
+    members: dict[str, tuple[str, ...]] = {}
+    sizes: dict[str, int | None] = {}
+    for status in statuses:
+        value = buckets.get(status)
+        ids = _strs(value)
+        if not isinstance(value, list) or len(ids) != len(value):
+            problems.append(f"bucket {status} is not a list of mutation ids")
+            sizes[status] = None
+        else:
+            sizes[status] = len(ids)
+        members[status] = tuple(ids)
+    unknown = sorted(_plain(key) for key in buckets if not (isinstance(key, str) and key in statuses))
+    if unknown:
+        problems.append(f"bucket(s) outside the vocabulary: {', '.join(unknown)}")
+    every = [identifier for status in statuses for identifier in members[status]]
+    disjoint = len(every) == len(set(every))
+    if not disjoint:
+        problems.append("a mutation id appears in more than one bucket, or twice in one")
+    executed_ids = sorted(identifier for status in _EXECUTED_PARTITION for identifier in members[status])
+    generated_lists = [record_ids] + ([sorted(_strs(recorded["generated"]))] if "generated" in recorded else [])
+    generated_holds = not unknown and None not in sizes.values() and all(sorted(every) == ids for ids in generated_lists)
+    if not generated_holds:
+        problems.append("the buckets do not add up to the generated mutants")
+    executed_lists = [
+        sorted(_plain(record.get("mutation_id")) for record in records
+               if isinstance(record.get("status"), str) and record["status"] in _EXECUTED_PARTITION)
+    ] + ([sorted(_strs(recorded["executed"]))] if "executed" in recorded else [])
+    executed_holds = all(sizes[status] is not None for status in _EXECUTED_PARTITION) and all(
+        executed_ids == ids for ids in executed_lists
+    )
+    if not executed_holds:
+        problems.append("the executed buckets do not add up to the executed mutants")
+    for record in records:
+        identifier, status = record.get("mutation_id"), record.get("status")
+        if isinstance(status, str) and status in members and _plain(identifier) not in members[status]:
+            problems.append(f"{_plain(identifier)} records status {status}, but bucket {status} does not list it")
+    return _Conservation(
+        recorded, sizes, members, len(record_ids), len(executed_ids), generated_holds, executed_holds, disjoint,
+        tuple(problems),
+    )
+
+
+@dataclass(frozen=True)
 class _MutationView:
     mutations: tuple[_Mutation, ...]
     baseline_status: Any
@@ -983,6 +1651,9 @@ class _MutationView:
     #: ``(fraction, decimal, rounding)`` as the report states them, shown only when the records agree.
     sensitivity: tuple[Any, Any, Any] | None
     discrepancies: tuple[str, ...]
+    conservation: _Conservation
+    #: ``forced_detection`` as recorded: the harness control M00, never counted (17.12).
+    forced: Mapping[str, Any]
 
     def group(self, name: str) -> list[_Mutation]:
         return [item for item in self.mutations if item.group == name]
@@ -1068,7 +1739,27 @@ def _mutation_view(report: Mapping[str, Any]) -> _MutationView:
         )
         if carries_figure:
             discrepancies.append("the report carries a sensitivity figure although its baseline is invalid; not shown")
-    return _MutationView(mutations, status, valid, counts, tallies, sensitivity, tuple(discrepancies))
+    conservation = _conservation(report, _dicts(report.get("mutations")))
+    recorded_holds = conservation.recorded.get("holds")
+    if conservation.available and recorded_holds is True and conservation.holds is not True:
+        discrepancies.append(
+            "the report records conservation holds, but its buckets do not: " + "; ".join(conservation.problems)
+        )
+    elif conservation.holds is True and recorded_holds is False:
+        discrepancies.append("the report records conservation failing, but its buckets add up")
+    elif not conservation.available and recorded_holds is True:
+        discrepancies.append("the report records conservation holds, but it records no buckets to show it")
+    return _MutationView(
+        mutations,
+        status,
+        valid,
+        counts,
+        tallies,
+        sensitivity,
+        tuple(discrepancies),
+        conservation,
+        _dict(report.get("forced_detection")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1891,19 @@ def _plane_grid(cy: float, css: str) -> str:
     return "".join(lines)
 
 
+_TILES_PER_ROW = 4
+
+
+def _tile_rows(plane: _Plane) -> list[tuple[_Facet, ...]]:
+    """Each facet group on rows of its own, at most :data:`_TILES_PER_ROW` tiles wide, so a group reads as a band."""
+    rows = [
+        group.facets[start : start + _TILES_PER_ROW]
+        for group in plane.groups
+        for start in range(0, len(group.facets), _TILES_PER_ROW)
+    ]
+    return rows or [()]
+
+
 def _lit_plane(plane: _Plane, cy: float) -> str:
     """A translucent plane whose brightness is the mean light of its facets, one tile per facet."""
     light = plane.light
@@ -1217,13 +1921,17 @@ def _lit_plane(plane: _Plane, cy: float) -> str:
     parts.append(
         f'<polygon class="{edge}" stroke-opacity="{_n(0.4 + 0.5 * light)}" points="{_plane_quad(cy, 0, 1, 0, 1)}"/>'
     )
-    count = len(plane.facets)
-    rows = 1 if count <= 5 else 2
-    cols = max(1, math.ceil(count / rows))
-    du, dv = 0.4 / cols, 0.13
-    for index, facet in enumerate(plane.facets):
-        row, col = divmod(index, cols)
-        uc, vc = (col + 0.5) / cols, 0.5 + (row - (rows - 1) / 2) * 0.36
+    rows = _tile_rows(plane)
+    cols = max(1, *(len(row) for row in rows))
+    spacing = min(0.36, 0.9 / len(rows))
+    du, dv = 0.4 / cols, min(0.13, spacing * 0.38)
+    placed = [
+        (facet, (cols - len(row)) / 2 + col, row_index)
+        for row_index, row in enumerate(rows)
+        for col, facet in enumerate(row)
+    ]
+    for facet, col, row in placed:
+        uc, vc = (col + 0.5) / cols, 0.5 + (row - (len(rows) - 1) / 2) * spacing
         quad = _plane_quad(cy, uc - du, uc + du, vc - dv, vc + dv)
         tip = _tip(_e(f"{plane.title} \u00b7 {facet.name}: {facet.state}, {facet.detail}"))
         parts.append(f'<g class="tile tile-{facet.state.lower()}">{tip}')
@@ -1442,18 +2150,20 @@ def _cell(cell: _Cell, cx: float, cy: float, tip: str) -> str:
 
 
 def _lattice_svg(rows: Sequence[_LatticeRow]) -> str:
-    columns = (300.0, 386.0, 472.0)
-    width, top, step = 590.0, 78.0, 36.0
+    columns = (290.0, 372.0, 454.0, 536.0)
+    width, top, step = 660.0, 78.0, 36.0
     shown = rows[:_MAX_LATTICE_ROWS]
     required = sum(1 for row in rows if row.declared and row.required is not False)
     optional = sum(1 for row in rows if row.declared and row.required is False)
     checked = sum(1 for row in rows if row.executed.label == "CHECKED")
     terminal = sum(1 for row in rows if row.is_terminal)
+    witnessed = sum(1 for row in rows if row.witness.label == WitnessState.WITNESSED.value)
     parts = []
     headers = (
         ("EXPECTED", f"{required} required" + (f" + {optional}" if optional else "")),
         ("EXECUTED", f"{checked} checked"),
         ("TERMINAL", f"{terminal} with invocation"),
+        ("WITNESS", f"{witnessed} could fail"),
     )
     for x, (title, count) in zip(columns, headers):
         parts.append(_text(x, 24, title, "sv-caps", "middle"))
@@ -1464,12 +2174,14 @@ def _lattice_svg(rows: Sequence[_LatticeRow]) -> str:
         y = top + index * step
         parts.append(_text(16, y - 2, _clip(row.check_id, 26), "sv-label"))
         parts.append(_text(16, y + 12, _clip(row.kind, 34), "sv-small"))
-        cells = (row.expected, row.executed, row.terminal)
-        flows = (row.result is not None, row.is_terminal)
+        cells = (row.expected, row.executed, row.terminal, row.witness)
+        # A witness flows from a terminal verdict only when the result records a falsification.
+        falsified = row.result is not None and _evidence(row.result).get("falsification") is not None
+        flows = (row.result is not None, row.is_terminal, row.is_terminal and falsified)
         for (x1, x2), flows_on in zip(zip(columns, columns[1:]), flows):
             if flows_on:
                 parts.append(f'<line class="flow" x1="{_n(x1 + 12)}" y1="{_n(y)}" x2="{_n(x2 - 12)}" y2="{_n(y)}"/>')
-        for x, cell, stage in zip(columns, cells, ("expected", "executed", "terminal")):
+        for x, cell, stage in zip(columns, cells, ("expected", "executed", "terminal", "witness")):
             parts.append(_cell(cell, x, y, _tip(_e(f"{_plain(row.check_id)} {stage}: {cell.label}"))))
         examined = row.result.get("rows_examined") if row.result is not None else None
         parts.append(_text(width - 12, y + 4, _e(_count(examined)), "sv-value", "end"))
@@ -1481,7 +2193,7 @@ def _lattice_svg(rows: Sequence[_LatticeRow]) -> str:
         height += step
     desc = (
         f"{len(rows)} check(s): {required} required and {optional} optional expected, {checked} executed "
-        f"(CHECKED), {terminal} terminal with an invocation."
+        f"(CHECKED), {terminal} terminal with an invocation, {witnessed} witnessed as able to fail."
     )
     return _svg("lattice", width, height, "Check lattice", desc, parts, "panel-svg")
 
@@ -1546,86 +2258,159 @@ def _ring_svg(rows: Sequence[_InvariantRow]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_CHAIN_PER_ROW, _CHAIN_SLOT, _CHAIN_LINK_W, _CHAIN_LINK_H, _CHAIN_ROW_STEP = 16, 44.0, 36.0, 26.0, 80.0
+_CHAIN_LEFT, _CHAIN_TOP, _CHAIN_HEAD_X = 16.0, 34.0, 760.0
+
+
+def _chain_slots(length: int) -> list[int | None]:
+    """The seqs the strip draws: all of them, or the first and last halves around one elision marker (None)."""
+    if length <= _MAX_CHAIN_LINKS:
+        return list(range(1, length + 1))
+    half = _MAX_CHAIN_LINKS // 2
+    return [*range(1, half + 1), None, *range(length - half + 1, length + 1)]
+
+
+def _link_style(entry: _LedgerEntry | None) -> tuple[str, str, str]:
+    """``(tone attribute, rect class, label class)`` for one link, from its role alone (never document text)."""
+    if entry is None:
+        return "", "link", "link-seq"
+    if entry.family == "plan":
+        return "", "link-plan", "link-seq"
+    if entry.family == "falsifier":
+        return "", "link-falsifier", "link-seq"
+    if entry.family == "control":
+        return "", "link-control", "link-seq"
+    if entry.phase == STARTED_ENTRY:
+        return "", "link-start", "link-seq-on"
+    tone, _ = _style(_STATUS_STYLE, entry.verdict)
+    return f' class="t-{tone}"', "fill-tone", "link-seq-tone"
+
+
+def _link_tip(seq: int, entry: _LedgerEntry | None) -> str:
+    if entry is None:
+        return _tip(_e(f"entry {seq}: not identified from run.json"))
+    words = f"entry {seq}: {entry.phase} of {entry.family} {_plain(entry.owner)}"
+    if entry.invocation is not None:
+        words += f", invocation {entry.invocation}"
+    if entry.outcome is not None:
+        words += f", recorded {entry.outcome}"
+    return _tip(_e(words))
+
+
+def _span_brackets(row: Sequence[int | None], ledger: _LedgerView, y: float, seen: set[str]) -> list[str]:
+    """A bracket under each run of links that belong to one invocation, labelled once per invocation.
+
+    An invocation that wraps onto the next row gets a bracket on each row,
+    and its label only on the first. ``seen`` carries the labelled spans
+    across rows.
+    """
+    runs: list[tuple[str, Any, int, int]] = []
+    for column, seq in enumerate(row):
+        entry = ledger.entries.get(seq) if seq is not None else None
+        if entry is None:
+            continue
+        key = _plain(entry.span)
+        if runs and runs[-1][0] == key and runs[-1][3] == column - 1:
+            runs[-1] = (key, runs[-1][1], runs[-1][2], column)
+        else:
+            runs.append((key, entry.span, column, column))
+    parts: list[str] = []
+    top, low = y + _CHAIN_LINK_H + 5, y + _CHAIN_LINK_H + 10
+    for key, span, first, last in runs:
+        x0 = _CHAIN_LEFT + first * _CHAIN_SLOT + 2
+        x1 = _CHAIN_LEFT + last * _CHAIN_SLOT + _CHAIN_LINK_W - 2
+        parts.append(f'<path class="bracket" d="M{_n(x0)} {_n(top)}V{_n(low)}H{_n(x1)}V{_n(top)}"/>')
+        if key not in seen:
+            seen.add(key)
+            label = _clip(_short_id(span), max(4, int((x1 - x0) / 6.4)))
+            parts.append(_text((x0 + x1) / 2, low + 13, label, "sv-small", "middle"))
+    return parts
+
+
 def _chain_svg(ledger: _LedgerView) -> str:
-    width, height, left, area_end, link_y, link_h = 960.0, 132.0, 16.0, 736.0, 40.0, 30.0
-    parts = []
+    """The sealed chain, wrapped into rows: one link per entry, styled by its role, then the head.
+
+    Links are drawn in the role run.json identifies (the PLAN, a check's
+    STARTED and terminal entries, falsifier and control entries); an entry
+    it cannot identify is drawn plain. A bracket under the links groups each
+    invocation, with its falsifiers inside it.
+    """
+    width, left, top = 960.0, _CHAIN_LEFT, _CHAIN_TOP
+    parts: list[str] = []
     length = ledger.length
     if length is None or length <= 0:
         label = "length not recorded" if length is None else "empty ledger" if length == 0 else "invalid length"
         parts.append(
-            f'<rect class="link-empty" x="{_n(left)}" y="{_n(link_y)}" width="200" height="{_n(link_h)}" rx="7"/>'
+            f'<rect class="link-empty" x="{_n(left)}" y="{_n(top)}" width="200" height="{_n(_CHAIN_LINK_H)}" rx="7"/>'
         )
-        parts.append(_text(left + 100, link_y + 19, label, "sv-small", "middle"))
-        last_x = left + 200
+        parts.append(_text(left + 100, top + 17, label, "sv-small", "middle"))
+        rows_drawn, end = 1, (left + 200, top + _CHAIN_LINK_H / 2)
     else:
-        if length <= _MAX_CHAIN_LINKS:
-            slots: list[int | None] = list(range(1, length + 1))
-        else:
-            half = _MAX_CHAIN_LINKS // 2
-            slots = [*range(1, half + 1), None, *range(length - half + 1, length + 1)]
-        slot_w = (area_end - left) / len(slots)
-        link_w = min(58.0, slot_w - 6)
-        previous_end = None
-        for index, seq in enumerate(slots):
-            x = left + index * slot_w + (slot_w - link_w) / 2
-            if seq is None:
-                hidden = length - _MAX_CHAIN_LINKS
-                parts.append(_text(x + link_w / 2, link_y + 19, f"\u22ef {hidden} \u22ef", "sv-small", "middle"))
-                previous_end = None
-                continue
-            if previous_end is not None:
-                parts.append(_line("chain-link", previous_end, link_y + link_h / 2, x, link_y + link_h / 2))
-            checks = ledger.starts.get(seq, ())
-            names = ", ".join(_plain(check.get("check_id")) for check in checks)
-            if checks:
-                tip = _tip(_e(f"entry {seq}: STARTED record of {names}"))
-                css, label_css = "link-start", "link-seq-on"
-            else:
-                tip = _tip(_e(f"entry {seq}"))
-                css, label_css = "link", "link-seq"
-            parts.append(
-                f'<g>{tip}<rect class="{css}" x="{_n(x)}" y="{_n(link_y)}" width="{_n(link_w)}" '
-                f'height="{_n(link_h)}" rx="7"/>'
-            )
-            if link_w >= 18:
-                parts.append(_text(x + link_w / 2, link_y + 19, str(seq), label_css, "middle"))
-            parts.append("</g>")
-            if checks and link_w >= 30:
-                label = _clip(names, max(3, int(link_w / 6.2)))
-                parts.append(_text(x + link_w / 2, link_y + link_h + 16, label, "sv-small", "middle"))
-            previous_end = x + link_w
-        last_x = previous_end if previous_end is not None else area_end
-    head_x = 760.0
+        slots = _chain_slots(length)
+        rows = [slots[start : start + _CHAIN_PER_ROW] for start in range(0, len(slots), _CHAIN_PER_ROW)]
+        previous: tuple[float, float] | None = None
+        seen: set[str] = set()
+        for row_index, row in enumerate(rows):
+            y = top + row_index * _CHAIN_ROW_STEP
+            mid = y + _CHAIN_LINK_H / 2
+            for column, seq in enumerate(row):
+                x = left + column * _CHAIN_SLOT
+                if seq is None:
+                    hidden = length - _MAX_CHAIN_LINKS
+                    parts.append(_text(x + _CHAIN_LINK_W / 2, y + 17, f"\u22ef {hidden} \u22ef", "sv-small", "middle"))
+                    previous = None
+                    continue
+                if previous is not None and column == 0:
+                    # The chain wraps: down from the last row's end, back along the gutter, into this row.
+                    turn = previous[1] + _CHAIN_ROW_STEP - _CHAIN_LINK_H / 2 - 12
+                    parts.append(
+                        f'<path class="chain-link wrap" d="M{_n(previous[0])} {_n(previous[1])}'
+                        f'H{_n(previous[0] + 5)}V{_n(turn)}H{_n(left - 9)}V{_n(mid)}H{_n(x)}"/>'
+                    )
+                elif previous is not None:
+                    parts.append(_line("chain-link", previous[0], mid, x, mid))
+                entry = ledger.entries.get(seq)
+                tone, rect, label_css = _link_style(entry)
+                parts.append(
+                    f'<g{tone}>{_link_tip(seq, entry)}<rect class="{rect}" x="{_n(x)}" y="{_n(y)}" '
+                    f'width="{_n(_CHAIN_LINK_W)}" height="{_n(_CHAIN_LINK_H)}" rx="6"/>'
+                    + _text(x + _CHAIN_LINK_W / 2, y + 17, str(seq), label_css, "middle")
+                    + "</g>"
+                )
+                previous = (x + _CHAIN_LINK_W, mid)
+            parts.extend(_span_brackets(row, ledger, y, seen))
+        rows_drawn = len(rows)
+        last_mid = top + (rows_drawn - 1) * _CHAIN_ROW_STEP + _CHAIN_LINK_H / 2
+        end = previous if previous is not None else (left + len(rows[-1]) * _CHAIN_SLOT, last_mid)
+    head_x, (end_x, end_y) = _CHAIN_HEAD_X, end
     parts.append(
-        f'<line class="chain-link head-arrow" x1="{_n(last_x)}" y1="{_n(link_y + link_h / 2)}" '
-        f'x2="{_n(head_x - 6)}" y2="{_n(link_y + link_h / 2)}"/>'
-        f'<path class="arrow-tip" d="M{_n(head_x - 12)} {_n(link_y + link_h / 2 - 5)}L{_n(head_x - 3)} '
-        f'{_n(link_y + link_h / 2)}L{_n(head_x - 12)} {_n(link_y + link_h / 2 + 5)}Z"/>'
+        f'<line class="chain-link head-arrow" x1="{_n(end_x)}" y1="{_n(end_y)}" x2="{_n(head_x - 6)}" '
+        f'y2="{_n(end_y)}"/><path class="arrow-tip" d="M{_n(head_x - 12)} {_n(end_y - 5)}L{_n(head_x - 3)} '
+        f'{_n(end_y)}L{_n(head_x - 12)} {_n(end_y + 5)}Z"/>'
     )
     parts.append(
         f'<g><title>{_e("head " + _plain(ledger.head))}</title>'
-        f'<rect class="head" x="{_n(head_x)}" y="{_n(link_y - 8)}" width="184" height="{_n(link_h + 16)}" rx="10"/>'
-        + _text(head_x + 14, link_y + 8, "HEAD", "sv-caps")
-        + _text(head_x + 14, link_y + 27, _e(_short_hash(ledger.head)), "sv-mono")
+        f'<rect class="head" x="{_n(head_x)}" y="{_n(end_y - 22)}" width="184" height="44" rx="10"/>'
+        + _text(head_x + 14, end_y - 4, "HEAD", "sv-caps")
+        + _text(head_x + 14, end_y + 14, _e(_short_hash(ledger.head)), "sv-mono")
         + "</g>"
     )
+    height = top + rows_drawn * _CHAIN_ROW_STEP + 14
     placed = sum(len(items) for items in ledger.starts.values())
+    identified = "every entry identified" if ledger.complete else f"{placed} check start(s) placed from their ids"
     parts.append(
         _text(
             left,
-            height - 12,
+            height - 10,
             _e(
-                f"{_count(length)} entries \u00b7 {placed} invocation start(s) placed from their ids"
+                f"{_count(length)} entries \u00b7 {identified}"
                 + (f" \u00b7 {len(ledger.unplaced)} not placeable" if ledger.unplaced else "")
                 + (f" \u00b7 {len(ledger.without_invocation)} without invocation" if ledger.without_invocation else "")
             ),
             "sv-sub",
         )
     )
-    desc = (
-        f"Ledger chain of {_count(length)} entries sealed under head {_plain(ledger.head)}; "
-        f"{placed} invocation start(s) placed."
-    )
+    desc = f"Ledger chain of {_count(length)} entries sealed under head {_plain(ledger.head)}; {ledger.note}."
     return _svg("ledger", width, height, "Ledger chain strip", desc, parts, "wide-svg")
 
 
@@ -1656,32 +2441,53 @@ def _constellation_edges(
     return edges
 
 
+def _cluster_caption(members: Sequence[_Mutation], fallback: str) -> str:
+    """The recorded statuses inside one cluster, counted (``NOOP_MUTATION 2, SKIPPED 1``), or ``fallback``."""
+    counts: dict[str, int] = {}
+    for item in members:
+        status = item.record.get("status")
+        # A record before v2 has no status word; the group the page placed it in names it instead.
+        word = status if isinstance(status, str) else item.group
+        counts[word] = counts.get(word, 0) + 1
+    return ", ".join(f"{word} {counts[word]}" for word in sorted(counts)) or fallback
+
+
 def _constellation_svg(view: _MutationView) -> str:
+    """Clusters of stars, one per outcome group, and under them where each blind spot stopped mattering.
+
+    Mutants that were built or considered but never executed (17.12) have a
+    cluster of their own, apart from skipped and inapplicable operators, so
+    neither can be read as the other or as a detection.
+    """
     groups = [
-        ("Detected", DETECTED, view.group(DETECTED)),
-        ("Blind spots", BLIND_SPOT, view.group(BLIND_SPOT)),
+        ("Detected", DETECTED, view.group(DETECTED), "the expected detector fired"),
+        ("Blind spots", BLIND_SPOT, view.group(BLIND_SPOT), "executed, and nothing caught it"),
+        ("Never executed", NOT_EXECUTED_MUTATION, view.group(NOT_EXECUTED_MUTATION), "no unactivated, no-op or duplicate"),
         (
-            "Not executed",
+            "Skipped or N/A",
             SKIPPED,
-            view.group(SKIPPED) + view.group(NOT_APPLICABLE_MUTATION) + view.group(NOT_EXECUTED_MUTATION),
+            view.group(SKIPPED) + view.group(NOT_APPLICABLE_MUTATION),
+            "no skipped or inapplicable operator",
         ),
     ]
     if view.group(UNRESOLVED):
-        groups.insert(2, ("Unresolved", UNRESOLVED, view.group(UNRESOLVED)))
+        groups.insert(2, ("Unresolved", UNRESOLVED, view.group(UNRESOLVED), "the record contradicts itself"))
     width = 960.0
     slot = width / len(groups)
     radius_cap = min(slot / 2 - 30, 112.0)
     # Stars sit on a spiral whose radius grows with the square root of the
     # count, so the field is only as tall as its largest cluster needs.
-    counts = [len(members[:_MAX_STARS_PER_GROUP]) for *_, members in groups]
+    counts = [len(members[:_MAX_STARS_PER_GROUP]) for _, _, members, _ in groups]
     spacings = [min(26.0, radius_cap / math.sqrt(max(count, 1))) for count in counts]
     reach = max(spacing * math.sqrt(max(count - 0.5, 0.5)) for spacing, count in zip(spacings, counts))
-    cy = 64 + reach
+    cy = 80 + reach
     height = cy + reach + 44
     parts = []
-    for index, ((title, group, members), spacing) in enumerate(zip(groups, spacings)):
+    for index, ((title, group, members, quiet), spacing) in enumerate(zip(groups, spacings)):
         cx = slot * index + slot / 2
         parts.append(_text(cx, 28, _e(f"{title.upper()} \u00b7 {len(members)}"), "sv-caps", "middle"))
+        caption = _cluster_caption(members, quiet) if group in (NOT_EXECUTED_MUTATION, SKIPPED) else quiet
+        parts.append(_text(cx, 44, _clip(caption, int(slot / 6.2)), "sv-small", "middle"))
         shown = members[:_MAX_STARS_PER_GROUP]
         positions = [
             (cx + spacing * math.sqrt(k + 0.5) * math.cos(k * _GOLDEN_ANGLE),
@@ -1694,24 +2500,211 @@ def _constellation_svg(view: _MutationView) -> str:
                 f'<line class="star-line t-{tone}" x1="{_n(x1)}" y1="{_n(y1)}" x2="{_n(x2)}" y2="{_n(y2)}"/>'
             )
         for item, (x, y) in zip(shown, positions):
-            star_tone, glyph = _MUTATION_STYLE[item.group]
-            executed = item.group in (DETECTED, BLIND_SPOT)
-            radius = 9.0 if item.group in (DETECTED, BLIND_SPOT, UNRESOLVED) else 6.0
-            tip = _tip(_e(f"{_plain(item.mutation_id)}: {item.group}" + (f" ({item.note})" if item.note else "")))
-            halo = (
-                f'<circle class="star-halo t-{star_tone}" cx="{_n(x)}" cy="{_n(y)}" r="{_n(radius + 5)}"/>'
-                if item.group == BLIND_SPOT
-                else ""
-            )
-            parts.append(f"<g>{tip}{halo}{_marker(star_tone, glyph, x, y, radius, filled=executed)}</g>")
+            parts.append(_star(item, x, y))
             if len(shown) <= 30:
+                radius = 9.0 if item.group in (DETECTED, BLIND_SPOT, UNRESOLVED) else 6.0
                 parts.append(_text(x, y + radius + 12, _clip(item.short, 6), "sv-small", "middle"))
         if not members:
             parts.append(_text(cx, cy + 4, "none", "sv-sub", "middle"))
         elif len(members) > len(shown):
             parts.append(_text(cx, height - 10, f"{len(members) - len(shown)} more in the table", "sv-small", "middle"))
-    desc = "; ".join(f"{title}: {len(members)}" for title, _, members in groups) + "."
-    return _svg("mutations", width, height, "Mutation constellation", desc, parts, "wide-svg")
+    ladder, ladder_height = _pie_ladder(view.group(BLIND_SPOT), height + 6, width)
+    parts.extend(ladder)
+    desc = "; ".join(f"{title}: {len(members)}" for title, _, members, _ in groups) + "."
+    if view.group(BLIND_SPOT):
+        desc += " Blind spots by PIE stage: " + "; ".join(
+            f"{stage} {sum(1 for item in view.group(BLIND_SPOT) if item.stage == stage)}"
+            for stage in (*_PIE_STAGES, _NO_STAGE)
+        ) + "."
+    return _svg("mutations", width, height + ladder_height, "Mutation constellation", desc, parts, "wide-svg")
+
+
+def _star(item: _Mutation, x: float, y: float) -> str:
+    """One mutation's star: filled only when it executed, ringed when it is a blind spot."""
+    tone, glyph = _MUTATION_STYLE[item.group]
+    executed = item.group in (DETECTED, BLIND_SPOT)
+    radius = 9.0 if item.group in (DETECTED, BLIND_SPOT, UNRESOLVED) else 6.0
+    status = item.record.get("status")
+    words = f"{_plain(item.mutation_id)}: {item.group}" + (f", status {status}" if isinstance(status, str) else "")
+    tip = _tip(_e(words + (f" ({item.note})" if item.note else "")))
+    halo = (
+        f'<circle class="star-halo t-{tone}" cx="{_n(x)}" cy="{_n(y)}" r="{_n(radius + 5)}"/>'
+        if item.group == BLIND_SPOT
+        else ""
+    )
+    return f"<g>{tip}{halo}{_marker(tone, glyph, x, y, radius, filled=executed)}</g>"
+
+
+_LADDER_PER_COLUMN = 10
+#: Below a stage header and its two-line meaning, where the first blind spot of the column sits.
+_LADDER_FIRST_ROW = 52
+
+
+def _wrapped(text: str, limit: int) -> list[str]:
+    """``text`` (a constant of this module) broken at spaces into lines of at most ``limit`` characters, at most two.
+
+    SVG text does not wrap by itself. A second line that would still be too
+    long is cut with an ellipsis.
+    """
+    lines: list[str] = []
+    for word in text.split():
+        if lines and len(lines[-1]) + 1 + len(word) <= limit:
+            lines[-1] += " " + word
+        else:
+            lines.append(word)
+    if len(lines) > 2:
+        lines = [lines[0], " ".join(lines[1:])]
+    return [line if len(line) <= limit else line[: max(limit - 1, 1)] + "\u2026" for line in lines]
+
+
+def _pie_ladder(blind: Sequence[_Mutation], top: float, width: float) -> tuple[list[str], float]:
+    """Blind spots placed on the PIE stages (17.12), in the order a defect travels: read, infect, propagate, check.
+
+    A blind spot with no recorded stage (a record before v2, or an escape
+    such as VERIFIER_ERROR that has none) gets a column of its own rather
+    than a guessed stage. Returns the parts and the height they take.
+    """
+    if not blind:
+        return [], 0.0
+    stages = list(_PIE_STAGES) + ([_NO_STAGE] if any(item.stage == _NO_STAGE for item in blind) else [])
+    column = width / len(stages)
+    parts = [
+        f'<line class="sv-grid" x1="12" y1="{_n(top)}" x2="{_n(width - 12)}" y2="{_n(top)}"/>',
+        _text(16, top + 22, "BLIND SPOTS BY PIE STAGE: where each undetected defect stopped mattering", "sv-caps"),
+    ]
+    head_y = top + 48
+    deepest = 0
+    for index, stage in enumerate(stages):
+        x0 = index * column + 16
+        members = [item for item in blind if item.stage == stage]
+        parts.append(_text(x0, head_y, _e(f"{stage} \u00b7 {len(members)}"), "sv-label"))
+        meaning = _PIE_MEANING.get(stage, "the record names no stage")
+        for line, words in enumerate(_wrapped(meaning, int((column - 20) / 5.6))):
+            parts.append(_text(x0, head_y + 15 + line * 13, _e(words), "sv-small"))
+        if index < len(_PIE_STAGES) - 1:
+            ax = (index + 1) * column - 4
+            parts.append(
+                f'<path class="arrow-tip" d="M{_n(ax - 8)} {_n(head_y - 9)}L{_n(ax)} {_n(head_y - 4)}'
+                f'L{_n(ax - 8)} {_n(head_y + 1)}Z"/>'
+            )
+        shown = members[:_LADDER_PER_COLUMN]
+        for row, item in enumerate(shown):
+            y = head_y + _LADDER_FIRST_ROW + row * 24
+            parts.append(_star(item, x0 + 9, y))
+            parts.append(_text(x0 + 26, y + 4, _clip(item.mutation_id, int((column - 40) / 6.2)), "sv-small"))
+        hidden = len(members) - len(shown)
+        if hidden:
+            y = head_y + _LADDER_FIRST_ROW + len(shown) * 24
+            parts.append(_text(x0, y + 4, f"{hidden} more in the table", "sv-small"))
+        deepest = max(deepest, len(shown) + (1 if hidden else 0))
+    return parts, 48 + _LADDER_FIRST_ROW + max(deepest, 1) * 24 + 10
+
+
+_CONSERVATION_BAR_X, _CONSERVATION_BAR_W = 156.0, 500.0
+#: The top bar's first segment: every executed mutant, which the second bar splits by outcome.
+_EXECUTED_SEGMENT = "EXECUTED"
+
+
+def _segments(
+    sizes: Mapping[str, int | None], order: Sequence[str], x: float, scale: float, y: float, height: float
+) -> tuple[list[str], float]:
+    """Stacked bucket segments with 2px gaps; a segment wide enough carries its count. Returns the end x."""
+    parts, cursor = [], x
+    for status in order:
+        size = sizes.get(status)
+        if not size:
+            continue
+        wide = size * scale
+        drawn = max(1.0, wide - 2)
+        tone = "accent" if status == _EXECUTED_SEGMENT else _BUCKET_TONE.get(status, "muted")
+        tip = _tip(_e(f"{status}: {size}"))
+        label = (
+            _text(cursor + drawn / 2, y + height / 2 + 4, str(size), "sv-on", "middle") if drawn >= 22 else ""
+        )
+        parts.append(f'<g class="t-{tone}">{tip}{_bar(cursor, y, drawn, height, "fill-tone", rounded=False)}{label}</g>')
+        cursor += wide
+    return parts, cursor
+
+
+def _conservation_svg(view: _MutationView) -> str:
+    """Both conservation identities (17.12) as two linked bars, with the harness control M00 beside them.
+
+    The top bar is every generated mutant split into the executed ones and
+    each never-executed bucket; its executed segment opens into the second
+    bar, the executed mutants split by outcome. A bucket with no members is
+    named under its bar instead of being drawn as a sliver.
+    """
+    cons = view.conservation
+    width, top, bar_h = 960.0, 46.0, 22.0
+    x, w = _CONSERVATION_BAR_X, _CONSERVATION_BAR_W
+    parts = [_text(16, 22, "CONSERVATION: every generated mutant lands in exactly one bucket", "sv-caps")]
+    generated = cons.generated
+    executed = cons.executed or 0
+    scale = w / generated if generated else 0.0
+    second = top + 92
+    rows = (
+        ("generated", generated, top, (_EXECUTED_SEGMENT, *_UNEXECUTED_PARTITION)),
+        ("executed", executed, second, _EXECUTED_PARTITION),
+    )
+    sizes = {**cons.sizes, _EXECUTED_SEGMENT: executed}
+    for label, total, y, order in rows:
+        parts.append(_text(16, y + 15, _e(label), "sv-label"))
+        parts.append(_text(x - 10, y + 15, _e(str(total)), "sv-value", "end"))
+        drawn, end = _segments(sizes, order, x, scale, y, bar_h)
+        parts.extend(drawn)
+        empty = [status for status in order if sizes.get(status) == 0]
+        unknown = [status for status in order if sizes.get(status) is None]
+        notes = ([f"0 in {', '.join(empty)}"] if empty else []) + (
+            [f"not recorded: {', '.join(unknown)}"] if unknown else []
+        )
+        if notes:
+            parts.append(_text(x, y + bar_h + 16, _clip("; ".join(notes), 110), "sv-small"))
+    if generated and executed:
+        right = x + executed * scale
+        parts.append(
+            f'<path class="fan" d="M{_n(x)} {_n(top + bar_h)}L{_n(x)} {_n(second)}'
+            f'L{_n(right)} {_n(second)}L{_n(right)} {_n(top + bar_h)}Z"/>'
+        )
+    parts.extend(_forced_detection_box(view.forced, 690.0, 34.0))
+    holds = {True: "holds", False: "does NOT hold", None: "not recomputable"}
+    desc = (
+        f"generated {generated} = executed {executed} + "
+        + " + ".join(f"{status} {_count(cons.sizes.get(status))}" for status in _UNEXECUTED_PARTITION)
+        + f"; executed {executed} = "
+        + " + ".join(f"{status} {_count(cons.sizes.get(status))}" for status in _EXECUTED_PARTITION)
+        + f". Recomputed from the buckets: {holds[cons.holds]}. M00: {_forced_words(view.forced)}."
+    )
+    return _svg("conservation", width, second + bar_h + 34, "Conservation identities", desc, parts, "wide-svg")
+
+
+def _forced_words(forced: Mapping[str, Any]) -> str:
+    """M00 as recorded: detected by its detector, not detected, or not recorded. Never assumed to have held."""
+    detected = forced.get("detected")
+    if detected is True:
+        return f"detected by {_plain(forced.get('detector'))}"
+    if detected is False:
+        return "NOT detected: the harness did not see its own planted defect"
+    return "not recorded"
+
+
+def _forced_detection_box(forced: Mapping[str, Any], x: float, y: float) -> list[str]:
+    detected = forced.get("detected")
+    tone, glyph = ("good", "check") if detected is True else ("critical", "cross") if detected is False else (
+        "warning", "question"
+    )
+    tip = _tip(_e(f"M00_forced_detection: {_forced_words(forced)}; {_plain(forced.get('target'))}"))
+    # Detected: "detected by" over the detector's name. Otherwise the outcome alone, on two lines if it is long.
+    words = ("detected by", _plain(forced.get("detector"))) if detected is True else (_forced_words(forced), "")
+    return [
+        f'<g>{tip}<rect class="control-box" x="{_n(x)}" y="{_n(y)}" width="254" height="112" rx="12"/>',
+        _text(x + 14, y + 22, "HARNESS CONTROL", "sv-caps"),
+        _marker(tone, glyph, x + 26, y + 50, 12),
+        _text(x + 48, y + 46, "M00 forced detection", "sv-label"),
+        _text(x + 48, y + 62, _clip(words[0], 32), "sv-small"),
+        _text(x + 48, y + 76, _clip(words[1], 32), "sv-small"),
+        _text(x + 14, y + 100, "planted first; never counted", "sv-small"),
+        "</g>",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1929,8 +2922,15 @@ def _masthead(
     rows = doc.get("rows_examined")
     applicable = [row for row in invariants if row.state in (HOLDS, VIOLATED, UNDETERMINED)]
     holding = sum(1 for row in invariants if row.state == HOLDS)
+    witnessed, passed = _witness_counts(doc)
+    witness_note = (
+        "each checker rejected a known-bad case of its own input"
+        if passed
+        else "no check reached PASS, so none needed a witness"
+    )
     stats = "".join(
         (
+            _stat("PASS results witnessed", f"{witnessed} / {passed}", witness_note, known=passed > 0),
             _stat(
                 "Required checks executed",
                 _ratio(executed, expected),
@@ -2015,13 +3015,19 @@ def _toc(entries: Sequence[tuple[str, str]]) -> str:
 
 
 def _facet_list(plane: _Plane) -> str:
+    """The plane's facets under their group headings, in the order the plane draws them, back row first."""
     items = []
-    for facet in plane.facets:
-        tone, glyph = _FACET_STYLE[facet.state]
+    for group in plane.groups:
         items.append(
-            f'<li>{_pill(facet.state, tone, glyph)}<span class="facet-name">{_e(facet.name)}</span>'
-            f'<span class="facet-detail">{_e(facet.detail)}</span></li>'
+            f'<li class="facet-group"><span class="group-name">{html.escape(group.name)}</span>'
+            f'<span class="group-question">{html.escape(group.question)}</span></li>'
         )
+        for facet in group.facets:
+            tone, glyph = _FACET_STYLE[facet.state]
+            items.append(
+                f'<li>{_pill(facet.state, tone, glyph)}<span class="facet-name">{_e(facet.name)}</span>'
+                f'<span class="facet-detail">{_e(facet.detail)}</span></li>'
+            )
     return f'<ul class="facets">{"".join(items)}</ul>'
 
 
@@ -2126,6 +3132,26 @@ def _evidence_digest(check: Mapping[str, Any]) -> str:
     return f"{len(evidence)} field(s), sha256 {_short_hash(digest)}"
 
 
+def _skip_line(result: Mapping[str, Any]) -> str:
+    """Why a required check did not execute, as its evidence labels it (#24); an unlabelled skip says so (D1)."""
+    if not (_is(result.get("execution_state"), "SKIPPED") or _is(result.get("execution_state"), "NOT_APPLICABLE")):
+        return ""
+    label = _evidence(result).get("skip_justification")
+    if label is None:
+        return _sub("<strong>no justification recorded</strong>")
+    return _sub(f"justified: {_wbr(label, '_')}", words=True)
+
+
+def _witness_line(row: _LatticeRow) -> str:
+    """The witness cell in words: its state and how many known-bad cases were rejected as expected."""
+    cell = row.witness
+    cases = _cases(row.result) if row.result is not None else []
+    if not cases:
+        return f"witness {cell.label}"
+    rejected = sum(1 for case in cases if _rejected(case))
+    return f"witness {cell.label}: {rejected} of {len(cases)} case(s) rejected"
+
+
 def _check_cells(row: _LatticeRow) -> list[str]:
     """One row of the lattice's table. A declared check with no result keeps its row, with empty details.
 
@@ -2142,12 +3168,15 @@ def _check_cells(row: _LatticeRow) -> list[str]:
     if row.result is None:
         return [check, expected, executed, terminal, "", "", ""]
     result = row.result
+    evidence = _evidence(result)
+    if "discrimination_ratio" in evidence:
+        check += _sub(f"discrimination {_e(_ratio_view(evidence.get('discrimination_ratio')).text())}", words=True)
     diagnostics = result.get("diagnostics")
     return [
         check,
         expected,
-        executed,
-        terminal + _sub(_wbr(result.get("reason"), "_"), words=True),
+        executed + _skip_line(result),
+        terminal + _sub(_wbr(result.get("reason"), "_"), words=True) + _sub(_e(_witness_line(row)), words=True),
         _e(_count(result.get("rows_examined"))),
         _code(result.get("invocation_id")) + _sub(_e(_evidence_digest(result)), words=True),
         _chips(result.get("failure_modes"))
@@ -2159,8 +3188,9 @@ def _lattice_section(doc: Mapping[str, Any], lattice: Sequence[_LatticeRow]) -> 
     figure = _figure(
         "lattice",
         _lattice_svg(lattice),
-        "Each row is a check: declared (expected), examined its inputs (executed), and closed by a ledger "
-        "invocation with a verdict (terminal). A missing flow line marks where a check stopped.",
+        "Each row is a check: declared (expected), examined its inputs (executed), closed by a ledger invocation "
+        "with a verdict (terminal), and, for a PASS, shown able to fail by rejecting a known-bad case of its own "
+        "input (witness). A missing flow line marks where a check stopped.",
         "scroll-panel",
     )
     counters = _dict(doc.get("counters"))
@@ -2176,24 +3206,30 @@ def _lattice_section(doc: Mapping[str, Any], lattice: Sequence[_LatticeRow]) -> 
             "checks_errored",
             "checks_skipped",
             "checks_not_applicable",
+            "checks_justified",
+            "checks_shortfall",
+            "control_invocations",
         )
     ]
     counter_html = "".join(f"<div><dt>{name}</dt><dd>{_e(_count(value))}</dd></div>" for name, value in recorded)
     side = (
         '<div class="side"><h3>Recorded counters</h3>'
         '<p class="muted small">checks_expected and checks_executed count required checks only; executed means '
-        "CHECKED with a terminal invocation.</p>"
+        "CHECKED with a terminal invocation. A shortfall is a required check that did not execute; it is "
+        "justified only by a closed-vocabulary label. Control invocations (falsifiers, canary, comparator) are "
+        "never counted as checks.</p>"
         f'<dl class="counter-list" data-equivalent-of="lattice">{counter_html}</dl></div>'
     )
     legend = _legend(
         [
             ("accent", "fill", "expected and required, or executed (CHECKED)"),
             ("accent", "hollow", "optional"),
-            ("good", "fill", "PASS"),
-            ("critical", "fill", "FAIL"),
+            ("good", "fill", "PASS, or witnessed: a known-bad case was rejected"),
+            ("critical", "fill", "FAIL, or refuted: a known-bad case passed"),
             ("warning", "fill", "ABSTAIN"),
+            ("warning", "hollow", "witness missing or not recorded"),
             ("serious", "fill", "ERROR"),
-            ("muted", "hollow", "not applicable, skipped or missing"),
+            ("muted", "hollow", "not applicable, skipped, or not falsified"),
         ]
     )
     table = _table(
@@ -2225,8 +3261,1011 @@ def _lattice_section(doc: Mapping[str, Any], lattice: Sequence[_LatticeRow]) -> 
     return _section(
         "lattice",
         "Check lattice",
-        "expected vs executed vs terminal",
+        "expected vs executed vs terminal vs witnessed",
         f'<div class="split"><div>{figure}{legend}</div>{side}</div>{table}{tally_table}',
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checker controls: could the checks have failed? (17.5, 17.6, 17.14)
+# ---------------------------------------------------------------------------
+
+#: Resolver states that count as a resolution, so a canary in one of them is a proven miss (17.14).
+_RESOLVING_STATES = ("DOI_RESOLVED", "DOI_TARGET_MISMATCH")
+
+#: The families of negative control, in the order the figure stacks them: ``(key, title, what it must show)``.
+_CONTROL_FAMILIES = (
+    ("falsifier", "Falsifier witnesses", "each PASS re-run on a known-bad case of its own input"),
+    ("canary", "Run canary", "a planted duplicate must FAIL; its twin must PASS"),
+    ("comparator", "Comparator self-test", "three known pairs through the live comparator"),
+    ("resolver", "Resolver canaries", "a DOI that cannot exist must not resolve"),
+    ("pins", "Harness pins", "pinned files unchanged and never written"),
+)
+#: The canary twins' fixed inputs (17.5). They are part of the contract, not of the run, and are labelled so.
+_CANARY_TWINS = (
+    (CANARY_MUST_FAIL, "must_fail", "FAIL", "an in-memory CSV holding one row twice"),
+    (CANARY_MUST_PASS, "must_pass", "PASS", "an in-memory CSV holding two distinct rows"),
+)
+
+
+def _case_outcome(case: Mapping[str, Any]) -> str:
+    """A falsifier case's outcome, recomputed from its own required and recorded results (17.5, step 3).
+
+    REJECTED when the recorded verdict and reason equal the required ones,
+    ACCEPTED when the recorded verdict is PASS, INCONCLUSIVE otherwise, and
+    NOT RECORDED without a recorded verdict. The page shows this rather than
+    the case's own outcome word, and notes any disagreement, so a relabelled
+    case cannot look like a witness.
+    """
+    expected, actual = _dict(case.get("expected")), _dict(case.get("actual"))
+    verdict = actual.get("verdict")
+    if not isinstance(verdict, str):
+        return "NOT RECORDED"
+    if verdict == "PASS":
+        return "ACCEPTED"
+    same_reason = _str(actual.get("reason")) is not None and _is(expected.get("reason"), actual.get("reason"))
+    return "REJECTED" if _is(expected.get("verdict"), verdict) and same_reason else "INCONCLUSIVE"
+
+
+@dataclass(frozen=True)
+class _ControlRow:
+    """One negative control: what it had to do, and what the run recorded it doing.
+
+    ``family`` and ``outcome`` are words of this module; ``label``,
+    ``detail``, ``required`` and ``recorded`` are document text, escaped on
+    output. ``note`` records a disagreement inside the record itself.
+    """
+
+    family: str
+    label: Any
+    detail: Any
+    required: Any
+    recorded: Any
+    outcome: str
+    note: str | None = None
+
+    @property
+    def style(self) -> tuple[str, str]:
+        return _style(_CONTROL_STYLE, self.outcome)
+
+
+def _falsifier_rows(doc: Mapping[str, Any]) -> list[_ControlRow]:
+    rows = []
+    for check in _dicts(doc.get("checks")):
+        state, cases, owner = _evidence(check).get("falsification"), _cases(check), check.get("check_id")
+        for case in cases:
+            outcome = _case_outcome(case)
+            recorded = case.get("outcome")
+            note = None if _is(recorded, outcome) else f"the case records {_plain(recorded)}; its own results give {outcome}"
+            rows.append(
+                _ControlRow(
+                    "falsifier",
+                    owner,
+                    f"{_plain(case.get('case_id'))}: {_plain(case.get('description'))}",
+                    _verdict_text(case.get("expected")),
+                    _verdict_text(case.get("actual")),
+                    outcome,
+                    note,
+                )
+            )
+        if state is not None and not cases:
+            meaning = _WITNESS_MEANING.get(state, "") if isinstance(state, str) else ""
+            rows.append(
+                _ControlRow("falsifier", owner, meaning or "no case ran", "a known-bad case", "none ran", _plain(state))
+            )
+        elif state is None and _is(check.get("verdict"), "PASS"):
+            rows.append(
+                _ControlRow("falsifier", owner, "no witness record", "a known-bad case", "nothing recorded",
+                            "NOT RECORDED")
+            )
+    return rows
+
+
+def _canary_rows(controls: Mapping[str, Any]) -> list[_ControlRow]:
+    canary = _dict(controls.get("canary"))
+    rows = []
+    for control_id, twin, required, fixed in _CANARY_TWINS:
+        record = _dict(canary.get(twin))
+        verdict = record.get("verdict")
+        outcome = (
+            "NOT RECORDED" if not isinstance(verdict, str) else "AS REQUIRED" if verdict == required else "NOT AS REQUIRED"
+        )
+        rows.append(_ControlRow("canary", control_id, f"duplicate_rows over {fixed}", required,
+                                _verdict_text(record), outcome))
+    return rows
+
+
+def _comparator_rows(controls: Mapping[str, Any]) -> list[_ControlRow]:
+    """The comparator's pairs, judged against the contract's three pairs (17.6), not against the record alone.
+
+    A record whose own expectation was edited cannot pass a pair the
+    contract requires to disagree. A contract pair the record lacks is NOT
+    RECORDED, and a recorded pair the contract does not name is listed with
+    a note.
+    """
+    pairs = _dicts(_dict(controls.get("comparator_self_test")).get("pairs"))
+    rows = []
+    for claim, stored, required in COMPARATOR_PAIRS:
+        recorded = [pair for pair in pairs if _is(pair.get("claim"), claim) and _is(pair.get("stored"), stored)]
+        label = f"claim {claim} vs stored {stored}"
+        if len(recorded) != 1:
+            why = "not recorded" if not recorded else f"recorded {len(recorded)} times"
+            rows.append(_ControlRow("comparator", label, f"contract pair {why}", required, "not recorded",
+                                    "NOT RECORDED"))
+            continue
+        pair = recorded[0]
+        actual = pair.get("actual")
+        outcome = (
+            "NOT RECORDED" if not isinstance(actual, str) else "AS REQUIRED" if actual == required else "NOT AS REQUIRED"
+        )
+        note = None if _is(pair.get("expected"), required) else (
+            f"the record expects {_plain(pair.get('expected'))}; the contract requires {required}"
+        )
+        rows.append(_ControlRow("comparator", label, "compared through the live comparator", required,
+                                _plain(actual), outcome, note))
+    known = {(claim, stored) for claim, stored, _ in COMPARATOR_PAIRS}
+    for pair in pairs:
+        claim, stored = pair.get("claim"), pair.get("stored")
+        if isinstance(claim, str) and isinstance(stored, str) and (claim, stored) in known:
+            continue
+        actual = pair.get("actual")
+        outcome = "AS REQUIRED" if _str(actual) and actual == pair.get("expected") else "NOT AS REQUIRED"
+        rows.append(_ControlRow("comparator", f"claim {_plain(claim)} vs stored {_plain(stored)}",
+                                "not one of the contract's pairs", _plain(pair.get("expected")), _plain(actual),
+                                outcome, "a pair the contract does not name"))
+    return rows
+
+
+def _resolver_checks(doc: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [check for check in _dicts(doc.get("checks")) if _is(check.get("kind"), "citation_resolver")]
+
+
+def _canary_outcome(record: Mapping[str, Any]) -> str:
+    """RESOLVED (a proven miss), HOLDS, NOT HELD (coverage unknown) or NOT RECORDED, from the record (17.14).
+
+    A canary whose state is a resolution is RESOLVED whatever its ``holds``
+    says, so a relabelled record cannot read as holding.
+    """
+    state = record.get("state")
+    if isinstance(state, str) and state in _RESOLVING_STATES:
+        return "RESOLVED"
+    holds = record.get("holds")
+    return "HOLDS" if holds is True else "NOT HELD" if holds is False else "NOT RECORDED"
+
+
+def _resolver_rows(doc: Mapping[str, Any]) -> list[_ControlRow]:
+    rows = []
+    for check in _resolver_checks(doc):
+        evidence = _evidence(check)
+        for key, source in (("canaries", "frozen"), ("live_canaries", "live")):
+            canaries = _dict(evidence.get(key))
+            for prefix in sorted(canaries, key=_plain):
+                record = _dict(canaries[prefix])
+                recorded = f"{_plain(record.get('state'))}, body code {_plain(record.get('handle_response_code'))}"
+                rows.append(
+                    _ControlRow(
+                        "resolver",
+                        f"{_plain(check.get('check_id'))}: prefix {_plain(prefix)} ({source})",
+                        record.get("doi") if record.get("doi") is not None else "no canary record",
+                        "not resolved, body code 100",
+                        recorded,
+                        _canary_outcome(record),
+                    )
+                )
+    return rows
+
+
+def _pins_rows(controls: Mapping[str, Any]) -> list[_ControlRow]:
+    pins = controls.get("pins")
+    if not isinstance(pins, dict):
+        return [_ControlRow("pins", "harness pins", "not recorded", "unchanged and unwritten", "not recorded",
+                            "NOT RECORDED")]
+    changed, writes = _strs(pins.get("changed")), _dicts(pins.get("writes"))
+    holds = pins.get("holds")
+    if holds is False or changed or writes:
+        outcome = "DOES NOT HOLD"
+    else:
+        outcome = "HOLDS" if holds is True else "NOT RECORDED"
+    return [
+        _ControlRow(
+            "pins",
+            f"{_count(pins.get('pinned'))} pinned file(s)",
+            "manifest, inputs, documents and checker modules, hashed before the PLAN",
+            "unchanged and unwritten",
+            f"{len(changed)} changed, {len(writes)} write(s)",
+            outcome,
+        )
+    ]
+
+
+def _control_rows(doc: Mapping[str, Any]) -> list[_ControlRow]:
+    controls = _controls(doc)
+    return (
+        _falsifier_rows(doc)
+        + _canary_rows(controls)
+        + _comparator_rows(controls)
+        + _resolver_rows(doc)
+        + _pins_rows(controls)
+    )
+
+
+def _controls_svg(rows: Sequence[_ControlRow]) -> str:
+    """Every negative control as a dumbbell: what it had to do, joined to what the run recorded.
+
+    A held control joins a hollow required mark to a filled mark of its
+    outcome's tone with a solid bar; a control that did not do what it had
+    to has a dashed bar, so a miss shows without reading a word.
+    """
+    width, required_x, recorded_x = 960.0, 514.0, 628.0
+    parts = [
+        _text(required_x, 20, "REQUIRED", "sv-caps", "middle"),
+        _text(recorded_x, 20, "RECORDED", "sv-caps", "middle"),
+        _text(width - 16, 20, "OUTCOME", "sv-caps", "end"),
+    ]
+    y = 30.0
+    good = {"REJECTED", "AS REQUIRED", "HOLDS"}
+    for family, title, purpose in _CONTROL_FAMILIES:
+        members = [row for row in rows if row.family == family]
+        if not members:
+            continue
+        y += 40
+        parts.append(_text(16, y, _e(f"{title.upper()} \u00b7 {len(members)}"), "sv-caps"))
+        parts.append(_text(250, y, _e(purpose), "sv-small"))
+        parts.append(f'<line class="sv-grid" x1="12" y1="{_n(y + 7)}" x2="{_n(width - 12)}" y2="{_n(y + 7)}"/>')
+        shown = members[:_MAX_CONTROL_ROWS]
+        for row in shown:
+            y += 36
+            mid = y - 4
+            tone, glyph = row.style
+            words = (
+                f"{_plain(row.label)}: {_plain(row.detail)}; required {_plain(row.required)}, recorded "
+                f"{_plain(row.recorded)}; {row.outcome}" + (f" ({row.note})" if row.note else "")
+            )
+            dash = "" if row.outcome in good else " missed"
+            parts.append(
+                f"<g>{_tip(_e(words))}"
+                + _text(16, mid - 3, _clip(row.label, 44), "sv-label")
+                + _text(16, mid + 12, _clip(row.detail, 52), "sv-small")
+                + _text(required_x - 14, mid + 4, _clip(row.required, 27), "sv-value", "end")
+                + _marker("accent", None, required_x, mid, 6, filled=False)
+                + f'<line class="dumbbell t-{tone}{dash}" x1="{_n(required_x + 8)}" y1="{_n(mid)}" '
+                f'x2="{_n(recorded_x - 11)}" y2="{_n(mid)}"/>'
+                + _marker(tone, glyph, recorded_x, mid, 9)
+                + _text(recorded_x + 16, mid + 4, _clip(row.recorded, 27), "sv-value")
+                + _text(width - 16, mid + 4, _e(row.outcome), "sv-label", "end")
+                + "</g>"
+            )
+        if len(members) > len(shown):
+            y += 24
+            parts.append(_text(16, y, f"{len(members) - len(shown)} more in the table", "sv-small"))
+    counts = "; ".join(
+        f"{title}: {sum(1 for row in rows if row.family == family and row.outcome in good)} of "
+        f"{sum(1 for row in rows if row.family == family)} as required"
+        for family, title, _ in _CONTROL_FAMILIES
+        if any(row.family == family for row in rows)
+    )
+    return _svg("controls", width, y + 24, "Negative controls", f"{counts}.", parts, "wide-svg")
+
+
+def _note(text: str) -> str:
+    """A highlighted line in a table cell, kept for a record that disagrees with itself or with the contract."""
+    return f'<div class="cell-note">{_e(text)}</div>'
+
+
+def _same_checker(check: Mapping[str, Any], case: Mapping[str, Any]) -> str:
+    """Whether a falsifier ran the subject's own checker and params, by the digests both record (17.5)."""
+    evidence = _evidence(check)
+    differing = [
+        name
+        for name in ("checker_sha256", "params_sha256")
+        if not (_str(case.get(name)) and case.get(name) == evidence.get(name))
+    ]
+    if not differing:
+        return "same checker and params digests"
+    return "NO: " + " and ".join(f"{name} differs or is missing" for name in differing)
+
+
+def _falsifier_table(doc: Mapping[str, Any], ledger: _LedgerView) -> str:
+    """One row per falsifier case (17.5), as the text equivalent of the witness part of the controls figure.
+
+    Each row gives the check and its witness state, the known-bad input,
+    what the case had to give and what it gave, the ledger invocation that
+    ran it, and whether it ran the subject's own checker and params.
+    """
+    rows = []
+    unfalsified = []
+    for position, check in enumerate(_dicts(doc.get("checks"))):
+        state, cases = _evidence(check).get("falsification"), _cases(check)
+        owner = _code(check.get("check_id")) + _sub(_e(check.get("kind")), words=True)
+        if state is None and not cases:
+            if _is(check.get("verdict"), "PASS"):
+                missing = _pill("NOT RECORDED", "warning", "question")
+                rows.append([owner + _sub(missing), _e("no witness record"),
+                             _e("a known-bad case rejected") + _sub("recorded: nothing"), missing, "", ""])
+            else:
+                unfalsified.append(check.get("check_id"))
+            continue
+        state_pill = _pill(state, *_style(_WITNESS_STYLE, state))
+        if not cases:
+            meaning = _WITNESS_MEANING.get(state, "no case ran") if isinstance(state, str) else "no case ran"
+            rows.append([owner + _sub(state_pill), _e(meaning), _e("a known-bad case") + _sub("recorded: none ran"),
+                         state_pill, "", ""])
+            continue
+        for number, case in enumerate(cases):
+            outcome = _case_outcome(case)
+            recorded = case.get("outcome")
+            note = "" if _is(recorded, outcome) else _note(f"the case records {_plain(recorded)}")
+            invocation = ledger.falsifier_invocations.get((position, number))
+            where = (
+                _sub(f"invocation {_code(invocation)}, derived from its ledger position")
+                if invocation
+                else _sub("invocation not derivable from run.json; ledger.jsonl holds it")
+            )
+            expected_id = f"control:falsifier:{_plain(check.get('check_id'))}:{_plain(case.get('case_id'))}"
+            id_note = "" if _is(case.get("control_id"), expected_id) else _note(f"expected ledger id {expected_id}")
+            actual = _dict(case.get("actual"))
+            rows.append(
+                [
+                    owner + (_sub(state_pill) if number == 0 else ""),
+                    _code(case.get("case_id")) + _sub(_e(case.get("description"))),
+                    _e(_verdict_text(case.get("expected")))
+                    + _sub(f"recorded: {_e(_verdict_text(actual))} \u00b7 {_e(actual.get('execution_state'))}"),
+                    _pill(outcome, *_style(_CONTROL_STYLE, outcome)) + note,
+                    _breakable(case.get("control_id")) + where + id_note,
+                    _e(_same_checker(check, case)),
+                ]
+            )
+    table = _table(
+        "Falsifier witnesses: each PASS re-run on a known-bad case of its own input",
+        ("Check and witness", "Control input (known-bad case)", "Required, then recorded", "Outcome",
+         "Ledger control and invocation", "Same checker"),
+        rows,
+        equivalent_of="controls",
+        empty="no check reached a would-be PASS, so none was falsified",
+        css="control-table",
+    )
+    if unfalsified:
+        listed = ", ".join(_code(item) for item in unfalsified)
+        table += f'<p class="small muted table-note">Not falsified (no would-be PASS to witness): {listed}</p>'
+    return table
+
+
+def _witness_lists(doc: Mapping[str, Any]) -> list[str]:
+    """Where ``controls.falsifiers`` disagrees with the checks' own witness states; empty when they agree."""
+    recorded = _controls(doc).get("falsifiers")
+    if not isinstance(recorded, dict):
+        return ["controls.falsifiers is not recorded"]
+    problems = []
+    checks = _dicts(doc.get("checks"))
+    for state in _WITNESS_STYLE:
+        own = sorted(_plain(c.get("check_id")) for c in checks if _is(_evidence(c).get("falsification"), state))
+        listed = recorded.get(state)
+        if not isinstance(listed, list) or sorted(_plain(item) for item in listed) != own:
+            problems.append(f"controls.falsifiers.{state} lists {_plain(listed)}, the checks give {own}")
+    invocations = sum(len(_cases(check)) for check in checks)
+    if _int(recorded.get("invocations")) != invocations:
+        problems.append(
+            f"controls.falsifiers.invocations is {_plain(recorded.get('invocations'))}, the checks record "
+            f"{invocations} case(s)"
+        )
+    return problems
+
+
+def _control_cells(rows: Sequence[_ControlRow], family: str) -> list[list[str]]:
+    return [
+        [
+            _breakable(row.label),
+            _e(row.detail),
+            _e(row.required),
+            _e(row.recorded),
+            _pill(row.outcome, *row.style) + (_note(row.note) if row.note else ""),
+        ]
+        for row in rows
+        if row.family == family
+    ]
+
+
+def _resolver_table(doc: Mapping[str, Any]) -> str:
+    """Per-prefix resolver canaries (17.14): one table row per canary, then the prefixes no longer trusted."""
+    checks = _resolver_checks(doc)
+    if not checks:
+        return ""
+    rows = []
+    for check in checks:
+        evidence = _evidence(check)
+        for key, source in (("canaries", "frozen"), ("live_canaries", "live")):
+            canaries = _dict(evidence.get(key))
+            for prefix in sorted(canaries, key=_plain):
+                record = _dict(canaries[prefix])
+                provenance = _dict(record.get("provenance"))
+                outcome = _canary_outcome(record)
+                rows.append(
+                    [
+                        _code(check.get("check_id")) + _sub(_e(source)),
+                        _code(prefix),
+                        _hash(record.get("doi")),
+                        _e(record.get("state")) + _sub(f"body code {_e(record.get('handle_response_code'))}"),
+                        _e(provenance.get("retrieved_at")) + _sub(_e(provenance.get("resolver_identity"))),
+                        _pill(outcome, *_style(_CONTROL_STYLE, outcome)) + _sub(_e(record.get("detail"))),
+                    ]
+                )
+        distrusted = _strs(evidence.get("distrusted_prefixes"))
+        if distrusted:
+            rows.append(
+                [
+                    _code(check.get("check_id")),
+                    ", ".join(_code(prefix) for prefix in distrusted),
+                    _e("distrusted prefix"),
+                    _e("every DOI under it is reported SOURCE_UNAVAILABLE, never DOI_RESOLVED"),
+                    "",
+                    _pill("RESOLVED", *_style(_CONTROL_STYLE, "RESOLVED")),
+                ]
+            )
+    return _table(
+        "Resolver canaries, per prefix the run touched",
+        ("Resolver check", "Prefix", "Canary DOI", "State", "Captured", "Outcome"),
+        rows,
+        equivalent_of="controls",
+        empty="the resolver records no canary for any prefix",
+    )
+
+
+def _min_discrimination_text(doc: Mapping[str, Any]) -> str:
+    weakest = _controls(doc).get("min_discrimination")
+    if not isinstance(weakest, dict):
+        return "no PASS result records a discrimination ratio"
+    ratio = _ratio_view(weakest.get("ratio"))
+    return f"{_plain(weakest.get('check_id'))}: {ratio.text()} of its grid rejected"
+
+
+def _claim_join_text(doc: Mapping[str, Any]) -> str:
+    counts = _controls(doc).get("claim_join")
+    if not isinstance(counts, dict):
+        return "no claim_join check ran"
+    return ", ".join(f"{outcome} {_count(counts.get(outcome))}" for outcome in _JOIN_OUTCOMES)
+
+
+def _controls_section(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow], ledger: _LedgerView) -> str:
+    controls = _controls(doc)
+    rows = _control_rows(doc)
+    figure = _figure(
+        "controls",
+        _controls_svg(rows),
+        "Each line is one negative control the run executed: on the left what it had to do, on the right what "
+        "the run recorded. A dashed bar is a control that did not do what it had to. A falsifier re-runs a "
+        "PASS check's own checker on a known-bad case of its input, so a PASS that survives it could have failed.",
+        "scroll-wide",
+    )
+    legend = _legend(
+        [
+            ("accent", "hollow", "what the control had to do"),
+            ("good", "fill", "as required: rejected, held"),
+            ("critical", "fill", "a proven miss: accepted, resolved, broken"),
+            ("warning", "fill", "not recorded, or coverage unknown"),
+        ]
+    )
+    comparator = _dict(controls.get("comparator_self_test"))
+    canary = _dict(controls.get("canary"))
+    canary_rows = []
+    for control_id, twin, required, fixed in _CANARY_TWINS:
+        record = _dict(canary.get(twin))
+        row = next(item for item in rows if item.family == "canary" and item.label == control_id)
+        canary_rows.append(
+            [_breakable(control_id), _e(f"duplicate_rows over {fixed} (fixed by ARCHITECTURE.md 17.5)"),
+             _e(required), _e(_verdict_text(record)), _code(record.get("invocation_id")), _pill(row.outcome, *row.style)]
+        )
+    tables = (
+        _falsifier_table(doc, ledger)
+        + _table(
+            "Run canary: the same checker path on input fixed by the contract",
+            ("Twin", "Input", "Required", "Recorded", "Invocation", "Outcome"),
+            canary_rows,
+            equivalent_of="controls",
+            empty="no canary",
+        )
+        + _table(
+            f"Comparator self-test (invocation {_plain(comparator.get('invocation_id'))})",
+            ("Pair", "How", "Required by the contract", "Recorded", "Outcome"),
+            _control_cells(rows, "comparator"),
+            equivalent_of="controls",
+            empty="no pair",
+        )
+        + _resolver_table(doc)
+    )
+    checker_invariants = [row for row in invariants if row.plane == "checker"]
+    facts = [
+        ("Harness pins", _e(_pins_text(_dict(controls.get("pins"))) if isinstance(controls.get("pins"), dict)
+                            else "not recorded")),
+        ("Write detection", _e("in-process file access only: subprocess and C-extension I/O are invisible to the "
+                               "harness hook (D10)")),
+        ("Weakest discrimination", _e(_min_discrimination_text(doc))),
+        ("Claim-to-invocation join", _e(_claim_join_text(doc))),
+        *(
+            (f"Invariant {_breakable(row.name)}", f"{_pill(row.state, *_INVARIANT_STYLE[row.state])} {_e(row.detail)}")
+            for row in checker_invariants
+        ),
+    ]
+    disagreements = _witness_lists(doc)
+    notice = (
+        '<div class="notice t-warning"><p>The run\'s witness summary disagrees with its checks:</p><ul>'
+        + "".join(f"<li>{_e(text)}</li>" for text in disagreements)
+        + "</ul></div>"
+        if disagreements
+        else ""
+    )
+    fact_html = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
+    return _section(
+        "controls",
+        "Checker controls",
+        "could the checks have failed? (the CHECKER part of performance)",
+        f"{figure}{legend}{notice}<dl class=\"meta compact\" data-equivalent-of=\"controls\">{fact_html}</dl>{tables}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Numeric discrimination (17.8, 17.11)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Discrimination:
+    """A check's discrimination: the share of a stated grid of nearby values it would reject."""
+
+    check: Mapping[str, Any]
+    ratio: _RatioView
+    #: ``(entry label, its ratio, its grid or note)`` for each compared value or consistency test.
+    entries: tuple[tuple[str, _RatioView, str], ...]
+
+
+#: The grid numeric_agreement and the comparator probe (17.8): 21 claims around the printed claim.
+_AGREEMENT_GRID = "21 claims: the printed claim plus or minus up to 10 units of its last printed digit"
+
+
+def _discriminations(doc: Mapping[str, Any]) -> list[_Discrimination]:
+    items = []
+    for check in _dicts(doc.get("checks")):
+        evidence = _evidence(check)
+        if "discrimination_ratio" not in evidence:
+            continue
+        entries: list[tuple[str, _RatioView, str]] = []
+        for comparison in _dicts(evidence.get("comparisons")):
+            if "discrimination" in comparison:
+                stored = _dict(comparison.get("stored")).get("text")
+                label = (
+                    f"key {_plain(comparison.get('key'))}: claim {_plain(comparison.get('claimed'))} "
+                    f"vs stored {_plain(stored)}"
+                )
+                entries.append((label, _ratio_view(comparison.get("discrimination")), _AGREEMENT_GRID))
+        for test in _dicts(_dict(evidence.get("consistency")).get("tests")):
+            grid = _dict(test.get("evidence")).get("grid")
+            label = f"{_plain(test.get('claim_id'))} {_plain(test.get('test'))}: {_plain(test.get('outcome'))}"
+            entries.append((label, _ratio_view(test.get("discrimination_ratio")), _plain(grid) if grid else ""))
+        items.append(_Discrimination(check, _ratio_view(evidence.get("discrimination_ratio")), tuple(entries)))
+    return items
+
+
+def _weakest(items: Sequence[_Discrimination]) -> Any:
+    """The check id the page computes as the weakest PASS (17.8): least exact value, ties to the first check id."""
+    passed = [
+        item for item in items
+        if _is(item.check.get("verdict"), "PASS") and item.ratio.defined and item.ratio.ratio is not None
+    ]
+    if not passed:
+        return None
+    best = min(passed, key=lambda item: (item.ratio.ratio.value, _plain(item.check.get("check_id"))))
+    return best.check.get("check_id")
+
+
+def _discrimination_svg(items: Sequence[_Discrimination], weakest: Any) -> str:
+    """One bar per check, filled by the share of its grid it would reject; a ratio without a value is never filled."""
+    width, track_x, track_w, step = 860.0, 250.0, 360.0, 46.0
+    shown = items[:_MAX_DISCRIMINATION_ROWS]
+    parts = [_text(track_x, 22, "SHARE OF ITS GRID THE CHECK WOULD REJECT", "sv-caps")]
+    y = 40.0
+    for item in shown:
+        check = item.check
+        parts.append(_text(16, y + 12, _clip(check.get("check_id"), 30), "sv-label"))
+        parts.append(_text(16, y + 27, _clip(f"{_plain(check.get('kind'))} \u00b7 {_plain(check.get('verdict'))}", 36),
+                           "sv-small"))
+        tip = _tip(_e(f"{_plain(check.get('check_id'))}: {item.ratio.text()}"))
+        ratio = item.ratio.ratio
+        if item.ratio.defined and ratio is not None and ratio.value is not None and ratio.denominator:
+            parts.append(f'<g>{tip}<rect class="track" x="{_n(track_x)}" y="{_n(y + 6)}" width="{_n(track_w)}" '
+                         f'height="16" rx="4"/>')
+            fill = float(ratio.value) * track_w
+            parts.append(f'<g class="t-accent">{_bar(track_x, y + 6, fill, 16, "fill-tone")}</g>')
+            if ratio.denominator <= 30:
+                for unit in range(1, ratio.denominator):
+                    tick = track_x + unit * track_w / ratio.denominator
+                    parts.append(_line("tick", tick, y + 6, tick, y + 22))
+            parts.append("</g>")
+        else:
+            parts.append(f'<g>{tip}<rect class="track undefined" x="{_n(track_x)}" y="{_n(y + 6)}" '
+                         f'width="{_n(track_w)}" height="16" rx="4"/></g>')
+        parts.append(_text(track_x + track_w + 12, y + 19, _clip(item.ratio.text(), 34), "sv-value"))
+        if weakest is not None and _is(check.get("check_id"), weakest):
+            parts.append(_text(track_x + track_w + 12, y + 33, "weakest PASS", "sv-small"))
+        y += step
+    if len(items) > len(shown):
+        parts.append(_text(16, y + 12, f"{len(items) - len(shown)} more in the table", "sv-small"))
+        y += step
+    desc = "; ".join(f"{_plain(item.check.get('check_id'))} {item.ratio.text()}" for item in items) + "."
+    return _svg("discrimination", width, y + 6, "Numeric discrimination", desc, parts, "wide-svg")
+
+
+def _discrimination_section(doc: Mapping[str, Any]) -> str:
+    items = _discriminations(doc)
+    weakest = _weakest(items)
+    figure = _figure(
+        "discrimination",
+        _discrimination_svg(items, weakest),
+        "How sharp each numeric check was: of a stated grid of values near the one it checked, the share it would "
+        "have rejected. A PASS needs more than zero. A ratio without a value (a zero or unknown denominator) is "
+        "drawn as an empty dashed track, never as 0% or 100%.",
+        "scroll-wide",
+    )
+    rows = []
+    for item in items:
+        check = item.check
+        rows.append(
+            [_code(check.get("check_id")) + _sub(_wbr(check.get("kind"), "_"), words=True), _e("whole check (its minimum)"),
+             _e(item.ratio.text()), _e(_plain(_dict(_evidence(check).get("discrimination_ratio")).get("state"))),
+             _e("weakest PASS" if weakest is not None and _is(check.get("check_id"), weakest) else "")]
+        )
+        rows += [
+            ["", _e(label), _e(ratio.text()), _e(ratio.ratio.state.value if ratio.ratio else "not recorded"), _e(grid)]
+            for label, ratio, grid in item.entries
+        ]
+    table = _table(
+        "Discrimination per check and per compared value",
+        ("Check", "Entry", "Rejected of its grid", "State", "Grid and note"),
+        rows,
+        equivalent_of="discrimination",
+        empty="no check records a discrimination ratio",
+    )
+    recorded_id = _dict(_controls(doc).get("min_discrimination")).get("check_id")
+    agreement = ""
+    if not (_is(recorded_id, weakest) or (recorded_id is None and weakest is None)):
+        disagreement = (
+            f"run.json records the weakest PASS as {_plain(recorded_id)}, but its checks give {_plain(weakest)}"
+        )
+        agreement = f'<div class="notice t-warning"><p>{_e(disagreement)}</p></div>'
+    line = (
+        '<p class="closure-line">Weakest discrimination among PASS results, as recorded: '
+        f"{_e(_min_discrimination_text(doc))}</p>"
+    )
+    return _section(
+        "discrimination",
+        "Numeric discrimination",
+        "how much of a nearby grid each numeric check would reject",
+        f"{line}{agreement}{figure}{table}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan and closure (17.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PlanItem:
+    """One item the PLAN commits to: a declared check or a planned control, and what run.json records for it."""
+
+    item_id: Any
+    family: str
+    kind: Any
+    required: Any
+    invocation: str | None
+    outcome: str
+
+    @property
+    def closed(self) -> bool:
+        """True when run.json records a terminal invocation for the item (an id on its result or control)."""
+        return self.invocation is not None
+
+
+def _plan_items(doc: Mapping[str, Any]) -> list[_PlanItem]:
+    """The planned checks (the manifest's, which ``plan_matches_manifest`` ties to the PLAN) and the planned controls."""
+    results: dict[str, Mapping[str, Any]] = {}
+    for result in _dicts(doc.get("checks")):
+        if isinstance(result.get("check_id"), str):
+            results.setdefault(result["check_id"], result)
+    items = []
+    for spec in _dicts(_dict(doc.get("declared")).get("checks")):
+        check_id = spec.get("id")
+        result = results.get(check_id) if isinstance(check_id, str) else None
+        invocation = _str(result.get("invocation_id")) if result is not None else None
+        outcome = _verdict_text(result) if result is not None else "no result recorded"
+        items.append(_PlanItem(check_id, "check", spec.get("kind"), spec.get("required"), invocation, outcome))
+    records = {control_id: (record, outcome) for control_id, record, outcome in _control_records(doc)}
+    for control_id in PLANNED_CONTROLS:
+        record, outcome = records.get(control_id, ({}, "not recorded"))
+        items.append(_PlanItem(control_id, "control", "control", True, _str(record.get("invocation_id")), outcome))
+    return items
+
+
+def _plan_svg(plan: Any, items: Sequence[_PlanItem]) -> str:
+    """The PLAN token, then one cell per planned item: closed when run.json records its terminal invocation.
+
+    Checks are squares and controls circles; a closed item is filled with a
+    check mark, an open one hollow with a cross, so a gap shows by shape and
+    mark as well as by color.
+    """
+    width, cells_x, slot, per_row, row_step, first = 960.0, 214.0, 61.0, 12, 78.0, 60.0
+    record = _dict(plan)
+    parts = [
+        '<rect class="plan-token" x="16" y="40" width="170" height="66" rx="10"/>',
+        _text(30, 62, "PLAN", "sv-caps"),
+        _text(30, 80, "ledger entry 1" if record else "not recorded", "sv-small"),
+        _text(30, 96, _e(_short_hash(record.get("entry_sha256"))), "sv-mono"),
+        f'<path class="arrow-tip" d="M{_n(cells_x - 16)} 68L{_n(cells_x - 7)} 73L{_n(cells_x - 16)} 78Z"/>',
+        _line("chain-link", 186, 73, cells_x - 14, 73),
+    ]
+    shown = items[:_MAX_PLAN_CELLS]
+    # Each family is named once, above its first cell: the planned checks, then the contract's controls.
+    for family, title in (("check", "CHECKS"), ("control", "CONTROLS")):
+        members = [index for index, item in enumerate(shown) if item.family == family]
+        if members:
+            row, column = divmod(members[0], per_row)
+            count = sum(1 for item in items if item.family == family)
+            label = _e(f"{title} \u00b7 {count}")
+            parts.append(_text(cells_x + column * slot + 2, first - 10 + row * row_step, label, "sv-caps"))
+    y = first
+    for index, item in enumerate(shown):
+        row, column = divmod(index, per_row)
+        x, y = cells_x + column * slot + 15, first + row * row_step
+        tone, glyph = ("good", "check") if item.closed else ("critical", "cross")
+        words = f"{_plain(item.item_id)} ({item.family}): " + (
+            f"terminal invocation {item.invocation}, recorded {item.outcome}" if item.closed else
+            f"no terminal invocation recorded ({item.outcome})"
+        )
+        if item.family == "check":
+            shape = "fill-tone" if item.closed else "hollow"
+            mark = (f'<rect class="{shape}" x="{_n(x - 13)}" y="{_n(y)}" width="26" height="26" rx="6"/>'
+                    + _glyph(glyph, x, y + 13, 13, on_fill=item.closed))
+            parts.append(f'<g class="t-{tone}">{_tip(_e(words))}{mark}</g>')
+        else:
+            parts.append(f"<g>{_tip(_e(words))}{_marker(tone, glyph, x, y + 13, 13, filled=item.closed)}</g>")
+        parts.append(_text(x, y + 42, _clip(_short_id(item.item_id), 9), "sv-small", "middle"))
+    closed = sum(1 for item in items if item.closed)
+    bottom = y + 62
+    if len(items) > len(shown):
+        parts.append(_text(cells_x, bottom, f"{len(items) - len(shown)} more in the table", "sv-small"))
+        bottom += 18
+    parts.append(_text(16, bottom, _e(f"{closed} of {len(items)} planned item(s) closed by a terminal invocation "
+                                       "recorded in run.json"), "sv-sub"))
+    desc = (
+        f"PLAN {'recorded at ledger entry 1' if record else 'not recorded'}; {len(items)} planned item(s), "
+        f"{closed} closed: " + ", ".join(f"{_plain(item.item_id)} {'closed' if item.closed else 'OPEN'}" for item in items)
+        + "."
+    )
+    return _svg("plan", width, bottom + 12, "Plan closure", desc, parts, "wide-svg")
+
+
+def _short_id(value: Any) -> str:
+    """A planned control's last word (``must_fail``) or a check's id, for a label under its cell."""
+    text = _plain(value)
+    return text.rsplit(":", 1)[-1] if text.startswith("control:") else text
+
+
+def _plan_section(doc: Mapping[str, Any], invariants: Sequence[_InvariantRow]) -> str:
+    plan = _controls(doc).get("plan")
+    record = _dict(plan)
+    items = _plan_items(doc)
+    figure = _figure(
+        "plan",
+        _plan_svg(plan, items),
+        "Before any check ran, the run wrote a PLAN as ledger entry 1: every declared check and every planned "
+        "control (the canary twins and the comparator). Each cell is one planned item, closed when run.json records "
+        "its terminal invocation. plan_closure checks the same against the ledger itself.",
+        "scroll-wide",
+    )
+    manifest = _dict(doc.get("manifest")).get("sha256")
+    committed = record.get("manifest_sha256")
+    declared = _dict(doc.get("declared"))
+    pins = _controls(doc).get("pins")
+    same = "the manifest this run read" if _str(committed) and committed == manifest else (
+        f"this run read manifest sha256 {_plain(manifest)}"
+    )
+    facts = [
+        ("PLAN entry", f"ledger entry 1, entry sha256 {_hash(record.get('entry_sha256'))}" if record
+         else _e("not recorded: nothing shows what the run committed to before its checks ran")),
+        ("Manifest", f"{_hash(committed)} ({_e(same)})" if record else _e("not recorded")),
+        ("Planned",
+         _e(f"{_count(record.get('inputs_planned'))} input(s), {_count(record.get('checks_planned'))} check(s), "
+            f"{_count(record.get('pins'))} pin(s), and the {len(PLANNED_CONTROLS)} contract controls")
+         if record else _e("not recorded")),
+        ("Declared",
+         _e(f"{len(_dicts(declared.get('inputs')))} input(s) and {len(_dicts(declared.get('checks')))} check(s) "
+            f"in the manifest; {_count(_dict(pins).get('pinned'))} file(s) pinned by the harness")),
+    ]
+    for name in _PLAN_INVARIANTS:
+        for row in (row for row in invariants if row.name == name):
+            facts.append((f"Invariant {_breakable(name)}", f"{_pill(row.state, *_INVARIANT_STYLE[row.state])} {_e(row.detail)}"))
+    gaps = [item for item in items if not item.closed]
+    mismatches = []
+    if record:
+        for key, count, what in (
+            ("checks_planned", len(_dicts(declared.get("checks"))), "checks"),
+            ("inputs_planned", len(_dicts(declared.get("inputs"))), "inputs"),
+        ):
+            if _int(record.get(key)) != count:
+                mismatches.append(f"the PLAN records {key} {_plain(record.get(key))}, but run.json declares {count} {what}")
+        if isinstance(pins, dict) and _int(record.get("pins")) != _int(pins.get("pinned")):
+            mismatches.append(
+                f"the PLAN records {_plain(record.get('pins'))} pin(s), but the harness reports "
+                f"{_plain(pins.get('pinned'))} pinned"
+            )
+    notices = ""
+    if gaps:
+        listed = "".join(f"<li>{_code(item.item_id)} ({_e(item.family)}): {_e(item.outcome)}</li>" for item in gaps)
+        notices += (
+            '<div class="notice t-critical"><p>Planned but not closed by a terminal invocation in run.json (an '
+            f"unexecuted planned item is a failure, D1):</p><ul>{listed}</ul></div>"
+        )
+    if mismatches:
+        notices += (
+            '<div class="notice t-warning"><p>The PLAN summary disagrees with the rest of run.json:</p><ul>'
+            + "".join(f"<li>{_e(text)}</li>" for text in mismatches)
+            + "</ul></div>"
+        )
+    table = _table(
+        "Planned items and their terminal invocations",
+        ("Planned item", "Kind", "Required", "Terminal invocation", "Recorded", "Closed"),
+        [
+            [_breakable(item.item_id), _e(item.kind), _e(_required_word(item.required)), _code(item.invocation),
+             _e(item.outcome),
+             _pill("CLOSED", "good", "check") if item.closed else _pill("OPEN", "critical", "cross")]
+            for item in items
+        ],
+        equivalent_of="plan",
+        empty="nothing was planned",
+    )
+    fact_html = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
+    return _section(
+        "plan",
+        "Plan closure",
+        "committed before any check ran, then closed by what ran",
+        f'{figure}{notices}<dl class="meta compact" data-equivalent-of="plan">{fact_html}</dl>{table}',
+    )
+
+
+# ---------------------------------------------------------------------------
+# Claim-to-invocation join (17.15)
+# ---------------------------------------------------------------------------
+
+
+def _claim_join_results(doc: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [check for check in _dicts(doc.get("checks")) if _is(check.get("kind"), "claim_join")]
+
+
+def _join_members(results: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
+    """Every bucket's members across the claim_join results, in result order (17.15)."""
+    members: dict[str, list[str]] = {outcome: [] for outcome in _JOIN_OUTCOMES}
+    for result in results:
+        buckets = _dict(_evidence(result).get("buckets"))
+        for outcome in _JOIN_OUTCOMES:
+            members[outcome] += [_plain(item) for item in _strs(buckets.get(outcome))]
+    return members
+
+
+def _claim_join_svg(members: Mapping[str, Sequence[str]]) -> str:
+    """Four columns, one per join outcome, with one mark per assertion (or, for ORPHANED, per invocation)."""
+    width, column = 960.0, 240.0
+    parts = []
+    deepest = 0
+    for index, outcome in enumerate(_JOIN_OUTCOMES):
+        x = index * column + 16
+        listed = list(members.get(outcome, ()))
+        tone, glyph = _JOIN_STYLE[outcome]
+        parts.append(_text(x, 26, _e(f"{outcome} \u00b7 {len(listed)}"), "sv-caps"))
+        parts.append(_text(x, 42, _clip(_JOIN_MEANING[outcome], 38), "sv-small"))
+        shown = listed[:_MAX_JOIN_PER_BUCKET]
+        for row, identifier in enumerate(shown):
+            y = 70 + row * 26
+            parts.append(f"<g>{_tip(_e(f'{outcome}: {identifier}'))}{_marker(tone, glyph, x + 9, y, 9)}</g>")
+            parts.append(_text(x + 26, y + 4, _clip(identifier, 30), "sv-label"))
+        if not listed:
+            parts.append(_text(x, 74, "none", "sv-sub"))
+        hidden = len(listed) - len(shown)
+        if hidden:
+            parts.append(_text(x, 70 + len(shown) * 26 + 4, f"{hidden} more in the table", "sv-small"))
+        deepest = max(deepest, len(shown) + (1 if hidden else 0), 1)
+    desc = "; ".join(f"{outcome} {len(members.get(outcome, ()))}" for outcome in _JOIN_OUTCOMES) + "."
+    return _svg("claim-join", width, 70 + deepest * 26 + 10, "Claim-to-invocation join", desc, parts, "wide-svg")
+
+
+def _claims_section(doc: Mapping[str, Any]) -> str:
+    """Asserted actions joined to a sealed run's ledger (#6): which claims the execution record backs."""
+    results = _claim_join_results(doc)
+    members = _join_members(results)
+    figure = _figure(
+        "claim-join",
+        _claim_join_svg(members),
+        "Each assertion an agent or author made about what ran is joined to the sealed run it cites. BACKED: a "
+        "terminal invocation in an intact chain backs it. NARRATED: nothing does. CONTRADICTED: the invocation "
+        "recorded another result. ORPHANED lists failing invocations no assertion mentions; it does not decide.",
+        "scroll-wide",
+    )
+    assertion_rows = []
+    facts = []
+    recomputed: dict[str, int] = {outcome: 0 for outcome in _JOIN_OUTCOMES}
+    problems = []
+    for result in results:
+        evidence = _evidence(result)
+        check_id = result.get("check_id")
+        for assertion in _dicts(evidence.get("assertions")):
+            outcome = assertion.get("outcome")
+            assertion_rows.append(
+                [_code(assertion.get("claim_id")) + _sub(_e(check_id)), _e(assertion.get("kind")),
+                 _code(assertion.get("cites")), _pill(outcome, *_style(_JOIN_STYLE, outcome)),
+                 _e(assertion.get("detail"))]
+            )
+        counts = evidence.get("counts")
+        buckets = _dict(evidence.get("buckets"))
+        if isinstance(counts, dict):
+            for outcome in _JOIN_OUTCOMES:
+                recomputed[outcome] += _int(counts.get(outcome)) or 0
+                if _int(counts.get(outcome)) != len(_strs(buckets.get(outcome))):
+                    problems.append(
+                        f"{_plain(check_id)} counts {outcome} {_plain(counts.get(outcome))}, but its bucket lists "
+                        f"{len(_strs(buckets.get(outcome)))}"
+                    )
+            tally = ", ".join(f"{outcome} {_count(counts.get(outcome))}" for outcome in _JOIN_OUTCOMES)
+        else:
+            label = _evidence(result).get("skip_justification")
+            tally = f"unknown: no counts recorded ({_plain(result.get('execution_state'))}, {_plain(label)})"
+        seal = _dict(_dict(evidence.get("sealed_run")).get("seal"))
+        chain = _dict(evidence.get("chain"))
+        chain_text = (
+            f"intact {_plain(chain.get('intact'))}, {_count(chain.get('observed_length'))} entries observed, head "
+            f"{_short_hash(chain.get('observed_head'))}"
+            + (f"; problems: {'; '.join(_strs(chain.get('problems')))}" if _strs(chain.get("problems")) else "")
+        )
+        facts += [
+            (f"{_e(check_id)} verdict", f"{_status_pill(result.get('verdict'))} {_e(result.get('reason'))}"),
+            ("Counts", _e(tally)),
+            ("Sealed run", f"{_path(_dict(evidence.get('sealed_run')).get('path'))} {_e(seal.get('run_id'))}, "
+                           f"{_e(_count(seal.get('ledger_length')))} entries, head {_hash(seal.get('ledger_head_sha256'))}"),
+            ("Chain", _e(chain_text)),
+        ]
+    mirrored = _controls(doc).get("claim_join")
+    with_counts = [result for result in results if isinstance(_evidence(result).get("counts"), dict)]
+    if with_counts and not (isinstance(mirrored, dict) and all(
+        _int(mirrored.get(outcome)) == recomputed[outcome] for outcome in _JOIN_OUTCOMES
+    )):
+        problems.append(f"controls.claim_join records {_plain(mirrored)}, but the claim_join results sum to {recomputed}")
+    if not with_counts and mirrored is not None:
+        problems.append(f"controls.claim_join records {_plain(mirrored)}, but no claim_join result carries counts")
+    facts.append(("Mirrored in controls", _e(_claim_join_text(doc))))
+    notice = (
+        '<div class="notice t-warning"><p>The join\'s counts disagree with its own records:</p><ul>'
+        + "".join(f"<li>{_e(text)}</li>" for text in problems)
+        + "</ul></div>"
+        if problems
+        else ""
+    )
+    orphaned = [[_code(identifier), _e("a terminal FAIL or ERROR invocation that no assertion cites")]
+                for identifier in members[AssertionOutcome.ORPHANED.value]]
+    tables = _table(
+        "Assertions and how they join the sealed run",
+        ("Claim", "Kind", "Cites", "Outcome", "Detail"),
+        assertion_rows,
+        equivalent_of="claim-join",
+        empty="no assertion was recorded",
+    ) + _table(
+        "Orphaned invocations (listed, never decisive)",
+        ("Invocation", "Why it is listed"),
+        orphaned,
+        equivalent_of="claim-join",
+        empty="none",
+    )
+    fact_html = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
+    return _section(
+        "claims",
+        "Claim join",
+        "asserted actions joined to the ledger of the run they cite",
+        f'{notice}{figure}<dl class="meta compact" data-equivalent-of="claim-join">{fact_html}</dl>{tables}',
     )
 
 
@@ -2246,7 +4285,8 @@ def _invariant_section(invariants: Sequence[_InvariantRow]) -> str:
         items.append(
             f'<li value="{index}"><span class="inv-num" aria-hidden="true">{index}</span>'
             f'{_pill(row.state, tone, glyph)}<span class="facet-name">{_code(row.name)}</span>'
-            f'<span class="plane-tag">{row.plane}</span><span class="facet-detail">{_e(row.detail)}</span></li>'
+            f'<span class="plane-tag">{_INVARIANT_TAGS.get(row.plane, row.plane)}</span>'
+            f'<span class="facet-detail">{_e(row.detail)}</span></li>'
         )
     listing = f'<ol class="invariant-list" data-equivalent-of="invariants">{"".join(items)}</ol>'
     return _section(
@@ -2257,31 +4297,48 @@ def _invariant_section(invariants: Sequence[_InvariantRow]) -> str:
     )
 
 
-def _ledger_section(doc: Mapping[str, Any]) -> str:
-    ledger = _ledger_view(doc)
+def _ledger_section(doc: Mapping[str, Any], ledger: _LedgerView) -> str:
     figure = _figure(
         "ledger",
         _chain_svg(ledger),
-        "Each link is one ledger entry, and each entry hashes the entry before it. A filled link is the STARTED "
-        "entry of a check's invocation, placed exactly by recomputing inv-sha256(run_id:seq). The other entries "
-        "(terminal results) are in ledger.jsonl and are not identified from run.json.",
+        "Each link is one ledger entry, and each entry hashes the entry before it. STARTED entries are placed "
+        "exactly by recomputing inv-sha256(run_id:seq). The PLAN, the terminal entries and each check's falsifier "
+        "runs are placed by the ledger order of ARCHITECTURE.md 17.5, and only when they then fill the sealed "
+        "length exactly; otherwise they are drawn plain and not guessed. A bracket groups each invocation with "
+        "the falsifiers that ran inside it.",
         "scroll-wide",
     )
+    legend = _legend(
+        [
+            ("accent", "plan", "PLAN (entry 1)"),
+            ("accent", "fill", "a check's STARTED entry"),
+            ("good", "fill", "a check's terminal entry, in its verdict's color"),
+            ("accent", "dashed", "a falsifier run inside its check"),
+            ("muted", "hollow", "a control (comparator, canary twin)"),
+            ("muted", "plain", "not identified from run.json"),
+        ]
+    )
     rows = [
-        [_e(seq), _code(check.get("invocation_id")), _code(check.get("check_id")), _status_pill(check.get("verdict"))]
-        for seq, checks in ledger.starts.items()
-        for check in checks
+        [
+            _e(seq),
+            _e(entry.phase),
+            _e(entry.family) + _sub(_breakable(entry.owner)),
+            _code(entry.invocation) if entry.invocation is not None else '<span class="muted">none</span>',
+            _e(entry.outcome) if entry.outcome is not None else "",
+        ]
+        for seq, entry in ledger.entries.items()
     ]
     table = _table(
-        "Invocation starts placed on the chain",
-        ("Seq", "Invocation", "Check", "Verdict"),
+        "Ledger entries identified from run.json" if ledger.complete else "Ledger entries placed exactly from their ids",
+        ("Seq", "Entry", "Belongs to", "Invocation", "Recorded"),
         rows,
         equivalent_of="ledger",
-        empty="no invocation start could be placed",
+        empty="no entry could be identified",
     )
     facts = [
         ("Entries", _e(_count(ledger.length))),
         ("Head", _hash(ledger.head)),
+        ("Identified", _e(ledger.note)),
     ]
     if not ledger.derived:
         facts.append(
@@ -2318,7 +4375,7 @@ def _ledger_section(doc: Mapping[str, Any]) -> str:
         "ledger",
         "Ledger chain",
         "append-only, hash-chained, sealed by its head",
-        f'{figure}<dl class="meta compact" data-equivalent-of="ledger">{fact_html}</dl>{table}',
+        f'{figure}{legend}<dl class="meta compact" data-equivalent-of="ledger">{fact_html}</dl>{table}',
     )
 
 
@@ -2372,6 +4429,17 @@ def _fired_cell(item: _Mutation) -> str:
     return "".join(parts)
 
 
+def _harness_controls(report: Mapping[str, Any]) -> tuple[str, str]:
+    """The v2 harness controls (17.12) as recorded: M00's forced detection and the conservation identities.
+
+    A report without them (an INVALID_BASELINE report, or one written before
+    v2) shows "not recorded", never a control that held.
+    """
+    holds = _dict(report.get("conservation")).get("holds")
+    conservation_text = "holds" if holds is True else "does NOT hold" if holds is False else "not recorded"
+    return _forced_words(_dict(report.get("forced_detection"))), conservation_text
+
+
 def _mutation_head(report: Mapping[str, Any]) -> str:
     """The mutation report's own outcome and identity, as recorded.
 
@@ -2392,6 +4460,8 @@ def _mutation_head(report: Mapping[str, Any]) -> str:
         ("Operators", _e(selection)),
         ("Baseline run", _code(_dict(report.get("baseline")).get("run_id"))),
     ]
+    forced_text, conservation_text = _harness_controls(report)
+    facts += [("Forced detection (M00)", _e(forced_text)), ("Conservation", _e(conservation_text))]
     rows = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
     message = report.get("message")
     return (
@@ -2467,6 +4537,121 @@ def _mutation_row(item: _Mutation) -> list[str]:
     ]
 
 
+def _identity_word(value: bool | None) -> str:
+    return "holds" if value is True else "does NOT hold" if value is False else "not recorded"
+
+
+def _conservation_part(view: _MutationView) -> str:
+    """The conservation identities and M00 (17.12), drawn and then listed, both recomputed rather than trusted.
+
+    A report without buckets and without a forced detection (one written
+    before v2, or an INVALID_BASELINE report) shows a sentence saying so,
+    never an identity that held.
+    """
+    cons, forced = view.conservation, view.forced
+    if not cons.available and not forced:
+        return (
+            '<p class="muted small table-note">This report records no buckets and no forced detection (M00), so '
+            "the conservation identities and the harness control cannot be shown.</p>"
+        )
+    figure = _figure(
+        "conservation",
+        _conservation_svg(view),
+        "Every generated mutant must land in exactly one bucket: the executed ones, or one of the reasons a mutant "
+        "never executed (not applicable, suppressed, a no-op, canonically equivalent, a duplicate, skipped, or not "
+        "activated). The executed mutants open into their outcomes. Only DETECTED counts as a detection. M00 is a "
+        "defect the harness plants in its own sealed run first; it is never counted.",
+        "scroll-wide",
+    )
+    rows = []
+    for part, statuses in (("executed", _EXECUTED_PARTITION), ("not executed", _UNEXECUTED_PARTITION)):
+        for status in statuses:
+            size = cons.sizes.get(status)
+            members = cons.members.get(status, ())
+            rows.append(
+                [
+                    _pill(status, _BUCKET_TONE.get(status, "muted"), None),
+                    _e(part),
+                    _e(_count(size)),
+                    ", ".join(_code(item) for item in members) or '<span class="muted">none</span>',
+                ]
+            )
+    buckets = _table(
+        "Mutation buckets, as recorded",
+        ("Bucket", "Part of", "Count", "Mutations"),
+        rows,
+        equivalent_of="conservation",
+        empty="no buckets are recorded",
+    )
+    recorded = cons.recorded
+    generated_sum = " + ".join(f"{status} {_count(cons.sizes.get(status))}" for status in _UNEXECUTED_PARTITION)
+    executed_sum = " + ".join(f"{status} {_count(cons.sizes.get(status))}" for status in _EXECUTED_PARTITION)
+    facts = [
+        (
+            "Generated",
+            _e(f"{cons.generated} = executed {_count(cons.executed)} + {generated_sum}: "
+               f"{_identity_word(cons.generated_holds)} (recomputed); the report records "
+               f"{_identity_word(recorded.get('generated_holds'))}"),
+        ),
+        (
+            "Executed",
+            _e(f"{_count(cons.executed)} = {executed_sum}: {_identity_word(cons.executed_holds)} (recomputed); the "
+               f"report records {_identity_word(recorded.get('executed_holds'))}"),
+        ),
+        (
+            "Disjoint",
+            _e(f"{'yes' if cons.disjoint else 'NO' if cons.disjoint is False else 'not recorded'} (recomputed); the "
+               f"report records {_plain(recorded.get('disjoint'))}"),
+        ),
+        ("Problems", _e("; ".join(cons.problems)) if cons.problems else '<span class="muted">none</span>'),
+    ]
+    fired = [
+        f"{_plain(item.get('detector'))} {_plain(item.get('status'))}" if isinstance(item, dict) else _plain(item)
+        for item in (forced.get("fired") if isinstance(forced.get("fired"), list) else [])
+    ]
+    m00 = _table(
+        "Harness control M00 (never counted)",
+        ("Control", "Planted defect", "Required detector", "Detected", "Fired"),
+        [
+            [
+                _breakable(forced.get("mutation_id") or "M00_forced_detection"),
+                _e(forced.get("target")),
+                _breakable(forced.get("detector")),
+                _e(_forced_words(forced)),
+                "<br>".join(_e(item) for item in fired) or '<span class="muted">none recorded</span>',
+            ]
+        ],
+        equivalent_of="conservation",
+        empty="not recorded",
+    )
+    fact_html = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in facts)
+    return f'{figure}<dl class="meta compact single" data-equivalent-of="conservation">{fact_html}</dl>{m00}{buckets}'
+
+
+def _pie_table(view: _MutationView) -> str:
+    """The blind spots by PIE stage (17.12), in the order a defect travels, as text."""
+    blind = view.group(BLIND_SPOT)
+    if not blind:
+        return ""
+    stages = list(_PIE_STAGES) + ([_NO_STAGE] if any(item.stage == _NO_STAGE for item in blind) else [])
+    rows = [
+        [
+            _code(stage) if stage != _NO_STAGE else _e(stage),
+            _e(_PIE_MEANING.get(stage, "the record names no stage (a report before v2, or an escape with none)")),
+            ", ".join(_code(item.mutation_id) for item in blind if item.stage == stage)
+            or '<span class="muted">none</span>',
+        ]
+        for stage in stages
+    ]
+    return _table(
+        "Blind spots by PIE stage: where each undetected defect stopped mattering",
+        ("Stage", "Meaning", "Blind spots"),
+        rows,
+        equivalent_of="mutations",
+        empty="no blind spot",
+    )
+
+
 def _mutation_section(report: Any) -> str:
     if not isinstance(report, dict):
         return _section(
@@ -2489,8 +4674,10 @@ def _mutation_section(report: Any) -> str:
             "mutations",
             _constellation_svg(view),
             "Each star is one mutation of the verifier's input. Detected: the status left PASS and the expected "
-            "detector fired. Blind spot: it executed and nothing caught it. Skipped and not-applicable mutations "
-            "are drawn apart and never count as detections.",
+            "detector fired. Blind spot: it executed and nothing caught it; below, each blind spot sits on the PIE "
+            "stage where the defect stopped mattering. Mutants never executed (not activated, no-op, equivalent, "
+            "duplicate, suppressed) and skipped or inapplicable operators are drawn apart and never count as "
+            "detections.",
             "scroll-wide",
         )
         if view.mutations
@@ -2513,7 +4700,9 @@ def _mutation_section(report: Any) -> str:
         _mutation_head(report)
         + _mutation_figures(report, view)
         + discrepancy_html
+        + _conservation_part(view)
         + figure
+        + _pie_table(view)
         + table
         + (f'<h3 class="sub-h">Report diagnostics</h3><ul class="plain-list">{diagnostics}</ul>' if diagnostics else "")
         + (
@@ -2522,6 +4711,28 @@ def _mutation_section(report: Any) -> str:
             else ""
         ),
     )
+
+
+def _transitions(doc: Mapping[str, Any]) -> str:
+    """The verdict lattice's log (#23): each step at which the run's verdict rose, and what raised it."""
+    recorded = _controls(doc).get("verdict_transitions")
+    if not isinstance(recorded, list):
+        listing = '<p class="muted">The verdict transitions are not recorded.</p>'
+    elif not recorded:
+        listing = (
+            '<p class="muted">No contribution was recorded, so the empty aggregate decided '
+            "(ABSTAIN / INSUFFICIENT_EVIDENCE, never PASS).</p>"
+        )
+    else:
+        steps = []
+        for item in recorded:
+            step = _dict(item)
+            steps.append(
+                f"<li>{_e(step.get('before'))} \u2192 <strong>{_e(step.get('after'))}</strong> at step "
+                f"{_e(_count(step.get('step')))}: {_code(step.get('source'))} {_e(step.get('reason'))}</li>"
+            )
+        listing = f'<ol class="plain-list">{"".join(steps)}</ol>'
+    return f'<h3 class="sub-h">How the verdict rose (NONE &lt; PASS &lt; ABSTAIN &lt; FAIL &lt; ERROR)</h3>{listing}'
 
 
 def _findings_section(doc: Mapping[str, Any]) -> str:
@@ -2539,6 +4750,7 @@ def _findings_section(doc: Mapping[str, Any]) -> str:
             f'<div class="finding-detail">{_e(finding.get("detail"))}</div></li>'
         )
     body = f'<ol class="findings">{"".join(items)}</ol>' if items else '<p class="muted">No finding was recorded.</p>'
+    body += _transitions(doc)
     issues = [
         # An empty pointer is the document root, written "/" as the manifest module prints it.
         [_code(issue.get("code")), _code("/" if issue.get("pointer") == "" else issue.get("pointer")),
@@ -2672,6 +4884,10 @@ def _boundary_section(doc: Mapping[str, Any]) -> str:
         "A PASS shows only that the declared checks had the opportunity to fail on the declared inputs and did not. "
         "It says nothing about inputs, checks or questions that were not declared, and nothing about whether the "
         "declared expectations were the right ones.",
+        "A falsifier witness shows that a checker rejected one known-bad case built from its own input. It does not "
+        "show that the checker catches every defect, and a discrimination figure covers only its stated grid.",
+        "Write detection sees in-process file access only: subprocess and C-extension I/O are invisible to the "
+        "harness hook, and a write from another thread is caught only by the post-run re-hash.",
         "Network: live lookups were enabled for this run."
         if live
         else "Network: no live lookup was performed; nothing was confirmed against an external source.",
@@ -2826,6 +5042,7 @@ code.brk{overflow-wrap:break-word}
 .meta dt{color:var(--ink-2);min-width:0;overflow-wrap:anywhere}
 .meta dd{margin:0;min-width:0;overflow-wrap:anywhere}
 .meta.compact{margin-top:14px}
+.meta.single{grid-template-columns:minmax(0,1fr)}
 .scope{font-size:13px;color:var(--ink-2)}
 .banner{margin-top:22px;padding:16px 20px;border-radius:14px;border:1px solid var(--tone);background:var(--tone-soft)}
 .banner h2{font-size:17px;margin-bottom:6px}
@@ -2846,7 +5063,7 @@ code.brk{overflow-wrap:break-word}
 .viz-scroll:focus-visible,.table-wrap:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .viz svg{display:block;width:100%;height:auto}
 .scroll-wide svg{min-width:560px}
-.scroll-panel svg{min-width:440px;max-width:620px}
+.scroll-panel svg{min-width:440px;max-width:680px}
 .scroll-ring svg{min-width:260px;max-width:360px;margin:0 auto}
 .hologram-svg{max-width:880px;margin:0 auto}
 figcaption{font-size:13px;color:var(--ink-2);margin-top:10px}
@@ -2996,6 +5213,35 @@ svg text{font-family:inherit}
 .head{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.25}
 .star-line{stroke:var(--tone);stroke-width:1;opacity:.35}
 .star-halo{fill:none;stroke:var(--tone);stroke-width:1.5;opacity:.55}
+.facets .facet-group{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;margin-top:4px;padding-top:8px;
+  border-top:1px solid var(--grid)}
+.facets .facet-group:first-child{margin-top:0;padding-top:0;border-top:0}
+.plane-card.void .facet-group{border-top-color:var(--void-edge)}
+.group-name{font-size:11px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.group-question{font-size:12px;color:var(--ink-2)}
+.link-plan{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2}
+.link-falsifier{fill:var(--surface);stroke:var(--accent);stroke-width:1.25;stroke-dasharray:3 2}
+.link-control{fill:var(--surface);stroke:var(--ink-2);stroke-width:1.5}
+.link-seq-tone{font-size:10.5px;fill:var(--on-tone);font-weight:650}
+.chain-link.wrap{fill:none}
+.bracket{fill:none;stroke:var(--axis);stroke-width:1}
+.sw-plan{background:var(--accent-soft);border-width:2px}
+.sw-dashed{background:transparent;border-style:dashed}
+.sw-plain{background:var(--surface);border-color:var(--axis)}
+.dumbbell{stroke:var(--tone);stroke-width:2;opacity:.7}
+.dumbbell.missed{stroke-dasharray:4 3;opacity:1}
+.control-box{fill:var(--surface);stroke:var(--axis);stroke-width:1.25}
+.plan-token{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+.track{fill:var(--surface-2);stroke:var(--axis);stroke-width:1}
+.track.undefined{fill:none;stroke-dasharray:4 3}
+.tick{stroke:var(--surface);stroke-width:1;opacity:.85}
+.fan{fill:var(--accent);opacity:.1}
+.sv-on{font-size:11px;font-weight:650;fill:var(--on-tone)}
+.table-note{margin-top:8px}
+.control-table td:first-child{min-width:150px}
+.control-table td:nth-child(2){min-width:220px}
+.control-table td:nth-child(5){min-width:200px}
+.control-table td .pill{white-space:nowrap}
 @media print{body{background:#ffffff}.panel,.verdict,.stat{box-shadow:none}.viz-scroll,.table-wrap{overflow:visible}}
 """
 )
@@ -3046,9 +5292,12 @@ def render(run: Any, mutation: Any = None) -> str:
     least one mutation executed, and the figure equals the one the records
     give.
     """
+    # One redaction scope per render reads the secret-named environment once for the whole page, instead of
+    # once per string; a fresh scope on every call still sees a secret set since the last render.
     token = _CLEANED.set({})
     try:
-        return _page(run, mutation)
+        with redaction_scope():
+            return _page(run, mutation)
     finally:
         _CLEANED.reset(token)
 
@@ -3061,12 +5310,21 @@ def _page(run: Any, mutation: Any) -> str:
     integrity, performance = _planes(doc, invariants, lattice)
     gaps = _pass_contract_gaps(doc, lattice, invariants)
     reverification = doc.get("reverification")
+    ledger = _ledger_view(doc)
     sections = [
         ("hologram", "Evidence boundary", _hologram_section(doc, integrity, performance)),
         ("accounting", "Input accounting", _accounting_section(doc)),
         ("lattice", "Check lattice", _lattice_section(doc, lattice)),
+        ("controls", "Checker controls", _controls_section(doc, invariants, ledger)),
+    ]
+    if _discriminations(doc):
+        sections.append(("discrimination", "Discrimination", _discrimination_section(doc)))
+    if _claim_join_results(doc) or _controls(doc).get("claim_join") is not None:
+        sections.append(("claims", "Claim join", _claims_section(doc)))
+    sections += [
+        ("plan", "Plan closure", _plan_section(doc, invariants)),
         ("invariants", "Invariant ring", _invariant_section(invariants)),
-        ("ledger", "Ledger chain", _ledger_section(doc)),
+        ("ledger", "Ledger chain", _ledger_section(doc, ledger)),
     ]
     if mutation is not None:
         sections.append(("mutations", "Mutations", _mutation_section(mutation)))

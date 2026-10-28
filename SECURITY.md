@@ -64,6 +64,11 @@ section 15) and, where noted, elsewhere.
   path, so a write that restores the original bytes is still caught
   (`harness_pins_intact`). The hook cannot see I/O done by subprocesses or C
   extensions.
+- **Hidden characters in the source.** No Python file in `src/` or `tests/`
+  may hold a carriage return or a character a reviewer cannot see or would
+  mistake for another: bidirectional and other format controls, zero-width
+  characters, look-alike spaces. A literal that needs one is written as an
+  escape (the "Trojan Source" class of attack).
 - **Network.** Live citation lookups run only with `--live` or
   `citations.live: true`, through `urllib` with a 10-second timeout. Any
   network error or non-2xx response becomes `SOURCE_UNAVAILABLE`. Tests

@@ -538,7 +538,7 @@ class _RecordFile:
 
     def __init__(self, fmt: str, text: str) -> None:
         self.fmt = fmt
-        self._bom = "﻿" if text.startswith("﻿") else ""
+        self._bom = "\ufeff" if text.startswith("\ufeff") else ""
         text = text[len(self._bom) :]
         self.header: tuple[str, ...] = ()
         self._lines: list[str] = []

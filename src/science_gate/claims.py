@@ -336,7 +336,7 @@ GARBLED_COMPARATOR_GLYPHS: Mapping[str, str] = MappingProxyType(
 CORRECTION_MARKERS = re.compile(r"\b(?:corrected|adjusted|bonferroni|holm|sidak|šidák|fdr)\b", re.IGNORECASE)
 _MARKER_WINDOW = 40
 _CLAUSE_BREAK = re.compile(r"[;!?]|\.(?=\s|$)")
-_SPACES = frozenset(" \t   ")
+_SPACES = frozenset(" \t\u00a0\u2009\u202f")
 
 # Coverage buckets (#17), in funnel order: where a manuscript number stopped.
 DECLARED_NOT_CLAIM = "DECLARED_NOT_CLAIM"
@@ -426,7 +426,7 @@ _MASKED = (
 )
 _NUMBER = re.compile(
     r"(?P<sign>[+\-−])?"
-    r"(?P<body>[0-9]+(?:[.,'_   ’][0-9]+)*)"
+    r"(?P<body>[0-9]+(?:[.,'_\u00a0\u2009\u202f’][0-9]+)*)"
     r"(?:[eE][+\-−]?[0-9]+)?"
 )
 #: Marks that glue digits to a preceding word, as in SYN-0001, doi.org/10 or Fig.2.

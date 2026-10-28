@@ -595,7 +595,7 @@ class ParseDecimalTests(unittest.TestCase):
         self.assertState("1.2,34", AMBIGUOUS_SEPARATOR, thousands=",")
 
     def test_undeclared_separators_are_ambiguous(self) -> None:
-        for text in ("1,234", "1 234", "1_234", "1'234", "1 234", "1.234.567"):
+        for text in ("1,234", "1 234", "1_234", "1'234", "1\u00a0234", "1.234.567"):
             with self.subTest(text=text):
                 self.assertState(text, AMBIGUOUS_SEPARATOR)
         self.assertState("1.234", AMBIGUOUS_SEPARATOR, decimal_point=",")

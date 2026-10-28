@@ -1409,7 +1409,10 @@ Mutations (17.12):
 - The HTML view groups the v2 statuses that never executed (NOT_ACTIVATED,
   NOOP_MUTATION, CANONICALLY_EQUIVALENT, DUPLICATE_MUTANT, SUPPRESSED) on
   their own, never as SKIPPED, and notes VERIFIER_ERROR, TIMED_OUT and FLAKY
-  as escaped (executed, not detected).
+  as escaped (executed, not detected). Its report header shows M00's forced
+  detection and the conservation result as the report records them, and
+  "not recorded" when a report carries neither (an INVALID_BASELINE report).
+  A blind spot's note names its PIE stage when the record has one.
 
 Dependencies (17.13):
 
@@ -1470,6 +1473,12 @@ Integration:
   refusal and the acceptance do not depend on the wall clock.
 - Packaging writes `expected/receipt.auth.json` beside the statement; the
   local-execution steps read the predicate at the statement's top level.
+- `tests/test_security.py` adds a source-text guard (section 15): no Python
+  file under `src/` or `tests/` holds a carriage return or a character a
+  reader cannot see or would mistake for another (bidirectional and other
+  format controls, zero-width characters, look-alike spaces, line and
+  paragraph separators). A literal that needs one, such as a byte-order mark
+  or a no-break thousands separator, writes it as an escape.
 
 ## 18. Recorded implementation decisions (0.1.0)
 
