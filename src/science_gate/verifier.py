@@ -2669,6 +2669,10 @@ def _pin_digest(manifest: Manifest, role: str, path: str) -> str | None:
         return None
     limit = None if role == "check_module" else max(manifest.limits.max_file_bytes, MAX_MANIFEST_BYTES)
     try:
+        # Discovery and document loading refuse special files. Pinning must
+        # preserve that boundary: opening a writerless FIFO would block here.
+        if not location.is_file():
+            return None
         return sha256_file(location, max_bytes=limit)[0]
     except (OSError, SizeLimitExceeded):
         return None
@@ -3376,6 +3380,8 @@ def _unavailable_accounting() -> InputAccounting:
 def _digest_if_readable(path: Path) -> str | None:
     """SHA-256 of a manifest file that failed validation, when its bytes can be read."""
     try:
+        if not path.is_file():
+            return None
         return sha256_file(path, max_bytes=MAX_MANIFEST_BYTES)[0]
     except (OSError, SizeLimitExceeded):
         return None
