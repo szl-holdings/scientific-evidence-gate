@@ -23,6 +23,7 @@ this tool's threat model: it runs locally on the operator's own files.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import posixpath
 import re
@@ -170,14 +171,22 @@ def is_within(root: str | os.PathLike[str], candidate: str | os.PathLike[str]) -
 def _resolve(path: Path, relpath: str) -> Path:
     """``path.resolve()``, with a symlink loop reported as an unsafe path.
 
-    Python 3.11 signals a loop with a bare ``RuntimeError``. A loop can only
-    come from links placed in the tree, so it is refused like any other
-    link-based trick rather than surfacing as a traceback. The message names
-    only the relative path: the absolute one would differ between machines.
+    Older Python versions signal a loop with ``RuntimeError``; Python 3.13
+    raises ``OSError(ELOOP)`` only in strict mode. Resolve strictly first so
+    a loop cannot be silently left unresolved. Missing paths are allowed for
+    output creation and MISSING input accounting, so only FileNotFoundError
+    falls back to non-strict resolution. Other OS errors still propagate.
+    The message names only the relative path, not a machine-specific absolute
+    path.
     """
     try:
-        return path.resolve()
-    except RuntimeError:
+        try:
+            return path.resolve(strict=True)
+        except FileNotFoundError:
+            return path.resolve(strict=False)
+    except (RuntimeError, OSError) as exc:
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+            raise
         raise UnsafePathError(SYMLINK_LOOP, f"{relpath!r} runs into a symbolic link loop", path=relpath) from None
 
 
@@ -258,3 +267,4 @@ def safe_read(root: str | os.PathLike[str], relpath: str, *, max_bytes: int | No
     if max_bytes is not None and len(data) > max_bytes:
         raise SafeIOError(FILE_TOO_LARGE, f"file grew beyond the {max_bytes}-byte limit while reading", path=clean)
     return data
+

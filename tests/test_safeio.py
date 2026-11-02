@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import unittest
 from pathlib import Path
@@ -154,6 +155,31 @@ class ResolveUnderRootTests(TempDirTestCase):
         self.assertEqual(caught.exception.code, SYMLINK_LOOP)
         self.assertNotIn(str(self.tmp), str(caught.exception))
 
+    def test_os_loop_signal_becomes_a_named_refusal(self) -> None:
+        with mock.patch.object(Path, "resolve", side_effect=OSError(errno.ELOOP, "Too many links")):
+            with self.assertRaises(UnsafePathError) as caught:
+                resolve_under_root(self.tmp, "a")
+        self.assertEqual(caught.exception.code, SYMLINK_LOOP)
+        self.assertNotIn(str(self.tmp), str(caught.exception))
+
+    def test_missing_path_still_resolves_for_input_accounting_and_writes(self) -> None:
+        root = self.tmp / "root"
+        root.mkdir()
+        self.assertEqual(resolve_under_root(root, "missing/child.csv"), root / "missing" / "child.csv")
+
+    def test_dangling_symlink_outside_root_is_still_refused(self) -> None:
+        root = self.tmp / "root"
+        root.mkdir()
+        try_symlink(self, self.tmp / "outside" / "missing.csv", root / "link.csv")
+        with self.assertRaises(UnsafePathError) as caught:
+            resolve_under_root(root, "link.csv")
+        self.assertEqual(caught.exception.code, SYMLINK_ESCAPE)
+
+    def test_non_loop_os_errors_are_not_relabelled(self) -> None:
+        with mock.patch.object(Path, "resolve", side_effect=PermissionError(errno.EACCES, "Denied")):
+            with self.assertRaises(PermissionError):
+                resolve_under_root(self.tmp, "a")
+
 
 class SafeWriteTests(TempDirTestCase):
     def listing(self) -> list[str]:
@@ -239,3 +265,4 @@ class SafeReadTests(TempDirTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
