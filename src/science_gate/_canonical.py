@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import PurePath
 from typing import Any, BinaryIO, Mapping
@@ -286,6 +286,26 @@ def _data_integer(text: str) -> int | Decimal:
     return Decimal(text) if abs(value) > MAX_SAFE_INTEGER else value
 
 
+def _data_decimal(text: str) -> Decimal:
+    """Parse a finite decimal without inheriting an invalid-operation policy.
+
+    Even a short JSON exponent can exceed Decimal's implementation range.
+    Depending on the caller's context that otherwise raises InvalidOperation
+    or produces NaN. Refuse both as a named input error, without changing the
+    caller's traps or flags. Decimal construction preserves printed precision
+    and does not expand a representable exponent into its digits.
+    """
+    try:
+        with localcontext() as context:
+            context.traps[InvalidOperation] = True
+            value = Decimal(text)
+    except InvalidOperation:
+        raise StrictJSONError("MALFORMED_JSON", "number is outside the finite decimal representation") from None
+    if not value.is_finite():
+        raise StrictJSONError("NON_FINITE_NUMBER", "number is not a finite decimal")
+    return value
+
+
 def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
     """Parse strict JSON from text or UTF-8 bytes (a leading BOM is accepted).
 
@@ -308,7 +328,7 @@ def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
-            parse_float=_reject_non_integer if integers_only else Decimal,
+            parse_float=_reject_non_integer if integers_only else _data_decimal,
             parse_int=_canonical_integer if integers_only else _data_integer,
         )
     except StrictJSONError:

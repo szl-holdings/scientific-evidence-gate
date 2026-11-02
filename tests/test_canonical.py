@@ -9,7 +9,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Iterator, Mapping
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path, PurePosixPath
 
 from _helpers import SRC_DIR, TempDirTestCase
@@ -151,6 +151,41 @@ class StrictLoadsTests(unittest.TestCase):
         value = strict_loads('{"v": 0.1, "w": 1e3, "n": 7}')
         self.assertEqual(value, {"v": Decimal("0.1"), "w": Decimal("1E+3"), "n": 7})
         self.assertIsInstance(value["v"], Decimal)
+
+    def test_unrepresentable_decimals_are_named_errors_under_either_trap_setting(self) -> None:
+        # A short valid JSON token can exceed Decimal's implementation range.
+        # The context must not decide between a raw exception and admitted NaN.
+        tokens = ("1e9999999999999999999", "-1e9999999999999999999",
+                  "1e-9999999999999999999", "0e9999999999999999999")
+        for trapped in (True, False):
+            with localcontext() as context:
+                context.traps[InvalidOperation] = trapped
+                original_flags = dict(context.flags)
+                for token in tokens:
+                    for text in (token, "[" + token + "]", '{"value":' + token + '}'):
+                        for document in (text, text.encode("utf-8")):
+                            with self.subTest(trapped=trapped, document=document):
+                                self.assertKind("MALFORMED_JSON", document)
+                                self.assertEqual(context.traps[InvalidOperation], trapped)
+                                self.assertEqual(dict(context.flags), original_flags)
+
+    def test_representable_decimal_precision_and_large_exponents_are_unchanged(self) -> None:
+        for trapped in (True, False):
+            with localcontext() as context:
+                context.traps[InvalidOperation] = trapped
+                for token in ("1.50", "-0.00", "1e999999", "1e-999999"):
+                    with self.subTest(trapped=trapped, token=token):
+                        parsed = strict_loads(token)
+                        self.assertIsInstance(parsed, Decimal)
+                        self.assertTrue(parsed.is_finite())
+                        self.assertEqual(parsed.as_tuple(), Decimal(token).as_tuple())
+                        self.assertEqual(canonical_bytes(parsed), canonical_bytes(Decimal(token)))
+
+    def test_canonical_mode_still_refuses_unrepresentable_exponent_tokens(self) -> None:
+        for trapped in (True, False):
+            with localcontext() as context:
+                context.traps[InvalidOperation] = trapped
+                self.assertKind("NON_INTEGER_NUMBER", "1e9999999999999999999", integers_only=True)
 
     def test_integers_only_mode_refuses_fractions_and_exponents(self) -> None:
         self.assertKind("NON_INTEGER_NUMBER", "[1.5]", integers_only=True)
