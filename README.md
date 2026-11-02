@@ -302,6 +302,11 @@ PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests
 `tests/test_required.py` holds one test per numbered requirement (r01 to
 r28). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+GitHub Actions runs this suite and the self-checking demonstration on Python
+3.11 and 3.13 for pull requests and pushes to `main`. A run with no discovered
+tests or no completed passing tests fails. Skips remain visible in the test
+output; they are never counted as passing tests.
+
 ## License status
 
 No license has been chosen. The license field in `pyproject.toml` is
