@@ -23,6 +23,7 @@ state, so an unsafe role path is refused here with ``UNSAFE_PATH``.
 from __future__ import annotations
 
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -745,7 +746,10 @@ def load_manifest(path: str | Path, *, registered_kinds: Iterable[str] = BUILTIN
     """
     location = Path(path)
     try:
-        if location.stat().st_size > MAX_MANIFEST_BYTES:
+        info = location.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ManifestError([ManifestIssue(MANIFEST_UNREADABLE, "", "manifest is not a regular file")])
+        if info.st_size > MAX_MANIFEST_BYTES:
             raise ManifestError([_too_large()])
         with open(location, "rb") as handle:
             data = handle.read(MAX_MANIFEST_BYTES + 1)
