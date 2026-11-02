@@ -23,6 +23,7 @@ this tool's threat model: it runs locally on the operator's own files.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import posixpath
 import re
@@ -168,16 +169,24 @@ def is_within(root: str | os.PathLike[str], candidate: str | os.PathLike[str]) -
 
 
 def _resolve(path: Path, relpath: str) -> Path:
-    """``path.resolve()``, with a symlink loop reported as an unsafe path.
+    """Resolve missing paths, but report symlink loops as unsafe paths.
 
-    Python 3.11 signals a loop with a bare ``RuntimeError``. A loop can only
-    come from links placed in the tree, so it is refused like any other
-    link-based trick rather than surfacing as a traceback. The message names
-    only the relative path: the absolute one would differ between machines.
+    Python 3.13 suppresses loop errors in non-strict mode, so strictly check
+    the resolved spelling too. Checking that spelling also catches a cycle
+    after a missing/.. prefix, which a strict-first check would stop before.
+    Missing children remain valid paths for later creation or MISSING reports.
+    The refusal names only the relative path, never a machine-specific root.
     """
     try:
-        return path.resolve()
-    except RuntimeError:
+        resolved = path.resolve(strict=False)
+        try:
+            return resolved.resolve(strict=True)
+        except FileNotFoundError:
+            return resolved
+    except (RuntimeError, OSError) as exc:
+        # Older pathlib uses RuntimeError; newer versions use platform errors.
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP and getattr(exc, "winerror", None) != 1921:
+            raise
         raise UnsafePathError(SYMLINK_LOOP, f"{relpath!r} runs into a symbolic link loop", path=relpath) from None
 
 
@@ -258,3 +267,4 @@ def safe_read(root: str | os.PathLike[str], relpath: str, *, max_bytes: int | No
     if max_bytes is not None and len(data) > max_bytes:
         raise SafeIOError(FILE_TOO_LARGE, f"file grew beyond the {max_bytes}-byte limit while reading", path=clean)
     return data
+

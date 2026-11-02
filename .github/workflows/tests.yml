@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: stdlib suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    env:
+      PYTHONPATH: src
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run the real suite and reject an empty or entirely skipped run
+        run: |
+          python -B - <<'PY'
+          import sys
+          import unittest
+          
+          suite = unittest.defaultTestLoader.discover("tests")
+          if suite.countTestCases() == 0:
+              raise SystemExit("No tests discovered; refusing an empty CI pass")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          passed = (result.testsRun - len(result.failures) - len(result.errors)
+                    - len(result.skipped) - len(result.expectedFailures)
+                    - len(result.unexpectedSuccesses))
+          print(f"Completed passing tests: {passed}; skipped: {len(result.skipped)}; "
+                f"documented expected failures: {len(result.expectedFailures)}")
+          if not result.wasSuccessful() or passed <= 0:
+              sys.exit(1)
+          PY
+      - name: Run the self-checking synthetic demonstration
+        run: python -B -m science_gate.cli demo

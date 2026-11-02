@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Mapping
 from unittest import mock
@@ -210,9 +210,24 @@ class ActivationTreeTests(unittest.TestCase):
                 self.assertEqual(self.records[mutation_id].activation, {"mode": REPLAY_MODE, "activated": True})
 
     def test_activation_records_name_relative_paths_only(self) -> None:
-        text = str(pretty_json_bytes(self.report.to_dict()), "utf-8")
+        document = self.report.to_dict()
+        text = str(pretty_json_bytes(document), "utf-8")
         self.assertNotIn("science-gate-mutate-", text, "no temporary path is recorded")
-        self.assertNotIn(str(Path(os.sep)), text.replace("\\n", "").replace('\\"', ""))
+        self.assertNotIn(str(REPO_ROOT), text, "no checkout path is recorded")
+        paths = []
+        for record in document["mutations"]:
+            activation = record["activation"] or {}
+            for field in ("files_read", "mutated_paths", "mutated_paths_read"):
+                for path in activation.get(field, []):
+                    with self.subTest(mutation=record["mutation_id"], field=field, path=path):
+                        self.assertTrue(path)
+                        self.assertFalse(PurePosixPath(path).is_absolute())
+                        self.assertFalse(PureWindowsPath(path).anchor)
+                        self.assertNotIn("..", PurePosixPath(path).parts)
+                        self.assertNotIn("..", PureWindowsPath(path).parts)
+                    paths.append(path)
+        # A relative path may contain separators, as may a sensitivity fraction.
+        self.assertIn("data/samples.csv", paths)
 
 
 # ---------------------------------------------------------------------------
