@@ -339,4 +339,3 @@ def strict_loads(data: str | bytes, *, integers_only: bool = False) -> Any:
         raise StrictJSONError("MALFORMED_JSON", "nesting is too deep") from exc
     except ValueError as exc:  # e.g. integers beyond the interpreter's digit limit
         raise StrictJSONError("MALFORMED_JSON", str(exc)) from exc
-
