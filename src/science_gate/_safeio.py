@@ -66,7 +66,9 @@ NOT_A_REGULAR_FILE = "NOT_A_REGULAR_FILE"
 FILE_TOO_LARGE = "FILE_TOO_LARGE"
 
 _WINDOWS_DEVICE_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL"}
+    # Windows also recognizes the superscript digits ¹, ² and ³ as device aliases.
+    | {f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"}
 )
 _WINDOWS_FORBIDDEN_CHARS = frozenset('<>"|?*')
 _SEPARATORS = re.compile(r"[\\/]+")

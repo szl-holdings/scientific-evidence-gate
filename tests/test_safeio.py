@@ -83,6 +83,31 @@ class NormalizeRelpathTests(unittest.TestCase):
     def test_device_names_are_whole_segments_only(self) -> None:
         self.assertEqual(normalize_relpath("console/auxiliary.csv"), "console/auxiliary.csv")
 
+    def test_superscript_device_names_are_refused_on_every_platform(self) -> None:
+        # Windows reserves these six aliases, including mixed case, extensions
+        # and intermediate directories. They must also be refused on Linux.
+        for name in ("COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"):
+            for relpath in (
+                name,
+                name.lower() + ".csv",
+                name + ".tar.gz",
+                "data/" + name + ".json",
+                name + "/measurements.csv",
+                "data\\" + name.lower() + "\\measurements.csv",
+            ):
+                with self.subTest(relpath=relpath):
+                    with self.assertRaises(UnsafePathError) as caught:
+                        normalize_relpath(relpath)
+                    self.assertEqual(caught.exception.code, RESERVED_NAME)
+
+    def test_similar_unreserved_names_remain_valid(self) -> None:
+        for relpath in (
+            "COM0", "LPT0", "COM10", "LPT10", "COM⁴", "LPT⁴",
+            "COM¹data.csv", "xLPT².txt", "data.LPT³", "measurements³.csv",
+        ):
+            with self.subTest(relpath=relpath):
+                self.assertEqual(normalize_relpath(relpath), relpath)
+
 
 class ComparisonKeyTests(unittest.TestCase):
     def test_equivalent_spellings_share_a_key(self) -> None:
@@ -245,6 +270,18 @@ class SafeWriteTests(TempDirTestCase):
     def listing(self) -> list[str]:
         return sorted(str(path.relative_to(self.tmp)) for path in self.tmp.rglob("*"))
 
+    def test_superscript_device_names_are_refused_before_creating_directories(self) -> None:
+        root = self.tmp / "out"
+        for name in ("COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"):
+            with self.subTest(name=name), mock.patch.object(
+                Path, "mkdir", side_effect=AssertionError("reserved path reached directory creation")
+            ) as mkdir:
+                with self.assertRaises(UnsafePathError) as caught:
+                    safe_write(root, "data/" + name + ".csv", "synthetic")
+                self.assertEqual(caught.exception.code, RESERVED_NAME)
+                mkdir.assert_not_called()
+        self.assertFalse(root.exists())
+
     def test_writes_bytes_verbatim_and_text_as_utf8(self) -> None:
         root = self.tmp / "out"
         written = safe_write(root, "a/b/data.bin", b"one\r\ntwo\n")
@@ -295,6 +332,16 @@ class SafeWriteTests(TempDirTestCase):
 
 
 class SafeReadTests(TempDirTestCase):
+    def test_superscript_device_names_are_refused_before_resolving_paths(self) -> None:
+        for name in ("COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"):
+            with self.subTest(name=name), mock.patch.object(
+                Path, "resolve", side_effect=AssertionError("reserved path reached filesystem resolution")
+            ) as resolve:
+                with self.assertRaises(UnsafePathError) as caught:
+                    safe_read(self.tmp, "data/" + name + ".csv")
+                self.assertEqual(caught.exception.code, RESERVED_NAME)
+                resolve.assert_not_called()
+
     def test_reads_a_file_under_the_root(self) -> None:
         self.write("root/a.txt", b"payload")
         self.assertEqual(safe_read(self.tmp / "root", "a.txt"), b"payload")
