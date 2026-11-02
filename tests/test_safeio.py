@@ -181,6 +181,66 @@ class ResolveUnderRootTests(TempDirTestCase):
                 resolve_under_root(self.tmp, "a")
 
 
+    def test_loop_is_refused_when_nonstrict_pathlib_suppresses_errors(self) -> None:
+        root = self.tmp / "root"
+        root.mkdir()
+        try_symlink(self, root / "b", root / "a")
+        try_symlink(self, root / "a", root / "b")
+
+        def resolve_like_python313(path: Path, strict: bool = False) -> Path:
+            # Python 3.13 no longer raises for loops in non-strict mode.
+            # os.path.realpath exposes those semantics on earlier Pythons too.
+            return Path(os.path.realpath(path, strict=strict))
+
+        with mock.patch.object(Path, "resolve", resolve_like_python313):
+            for base, relative in (
+                (root, "a"),
+                (root / "missing" / "..", "a"),
+                (root / "missing" / ".." / "a", "child.csv"),
+            ):
+                with self.subTest(base=base, relative=relative):
+                    with self.assertRaises(UnsafePathError) as caught:
+                        resolve_under_root(base, relative)
+                    self.assertEqual(caught.exception.code, SYMLINK_LOOP)
+                    self.assertNotIn(str(self.tmp), str(caught.exception))
+
+    def test_windows_loop_signal_becomes_a_named_refusal(self) -> None:
+        error = OSError(errno.EINVAL, "synthetic unresolvable filename")
+        error.winerror = 1921  # ERROR_CANT_RESOLVE_FILENAME, the Windows loop signal.
+        with mock.patch.object(Path, "resolve", side_effect=error):
+            with self.assertRaises(UnsafePathError) as caught:
+                resolve_under_root(self.tmp, "a")
+        self.assertEqual(caught.exception.code, SYMLINK_LOOP)
+
+    def test_unrelated_resolution_errors_propagate_unchanged(self) -> None:
+        for code in (errno.EACCES, errno.EIO, errno.ENOTDIR):
+            error = OSError(code, "synthetic filesystem error")
+            with self.subTest(errno=code), mock.patch.object(Path, "resolve", side_effect=error):
+                with self.assertRaises(OSError) as caught:
+                    resolve_under_root(self.tmp, "a")
+                self.assertIs(caught.exception, error)
+
+    def test_missing_children_are_resolved_without_becoming_safety_errors(self) -> None:
+        for relative in ("missing.csv", "missing/child.csv"):
+            with self.subTest(relative=relative):
+                self.assertEqual(resolve_under_root(self.tmp, relative), self.tmp / relative)
+
+    def test_dangling_symlink_inside_root_is_still_a_missing_path(self) -> None:
+        target = self.tmp / "missing" / "child.csv"
+        try_symlink(self, target, self.tmp / "alias.csv")
+        self.assertEqual(resolve_under_root(self.tmp, "alias.csv"), target)
+        with self.assertRaises(FileNotFoundError):
+            safe_read(self.tmp, "alias.csv")
+
+    def test_dangling_symlink_outside_root_is_refused(self) -> None:
+        root = self.tmp / "root"
+        root.mkdir()
+        try_symlink(self, self.tmp / "missing.csv", root / "alias.csv")
+        with self.assertRaises(UnsafePathError) as caught:
+            resolve_under_root(root, "alias.csv")
+        self.assertEqual(caught.exception.code, SYMLINK_ESCAPE)
+
+
 class SafeWriteTests(TempDirTestCase):
     def listing(self) -> list[str]:
         return sorted(str(path.relative_to(self.tmp)) for path in self.tmp.rglob("*"))

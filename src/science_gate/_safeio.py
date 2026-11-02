@@ -169,23 +169,23 @@ def is_within(root: str | os.PathLike[str], candidate: str | os.PathLike[str]) -
 
 
 def _resolve(path: Path, relpath: str) -> Path:
-    """``path.resolve()``, with a symlink loop reported as an unsafe path.
+    """Resolve missing paths, but report symlink loops as unsafe paths.
 
-    Older Python versions signal a loop with ``RuntimeError``; Python 3.13
-    raises ``OSError(ELOOP)`` only in strict mode. Resolve strictly first so
-    a loop cannot be silently left unresolved. Missing paths are allowed for
-    output creation and MISSING input accounting, so only FileNotFoundError
-    falls back to non-strict resolution. Other OS errors still propagate.
-    The message names only the relative path, not a machine-specific absolute
-    path.
+    Python 3.13 suppresses loop errors in non-strict mode, so strictly check
+    the resolved spelling too. Checking that spelling also catches a cycle
+    after a missing/.. prefix, which a strict-first check would stop before.
+    Missing children remain valid paths for later creation or MISSING reports.
+    The refusal names only the relative path, never a machine-specific root.
     """
     try:
+        resolved = path.resolve(strict=False)
         try:
-            return path.resolve(strict=True)
+            return resolved.resolve(strict=True)
         except FileNotFoundError:
-            return path.resolve(strict=False)
+            return resolved
     except (RuntimeError, OSError) as exc:
-        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+        # Older pathlib uses RuntimeError; newer versions use platform errors.
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP and getattr(exc, "winerror", None) != 1921:
             raise
         raise UnsafePathError(SYMLINK_LOOP, f"{relpath!r} runs into a symbolic link loop", path=relpath) from None
 
