@@ -181,11 +181,25 @@ class DigestAndSafetyTests(DiscoveryTestCase):
 
     def test_symlink_escape_is_refused(self) -> None:
         self.write("outside/secret.csv", MEASUREMENTS_CSV)
-        (self.tmp / "data").mkdir()
-        try_symlink(self, self.tmp / "outside" / "secret.csv", self.tmp / "data" / "link.csv")
-        _, opened = self.discover([spec("link", "data/link.csv")])
+        (self.tmp / "project" / "data").mkdir(parents=True)
+        try_symlink(self, self.tmp / "outside" / "secret.csv", self.tmp / "project" / "data" / "link.csv")
+        document = manifest_document(inputs=[spec("link", "data/link.csv")], checks=[])
+        manifest = load_manifest(self.write_manifest(document, "project/manifest.json"))
+        self.assertFalse((self.tmp / "outside" / "secret.csv").is_relative_to(manifest.root))
+        _, opened = discover(manifest)
         self.assertIs(opened["link"].state, InputState.REFUSED)
         self.assertIn("SYMLINK_ESCAPE", opened["link"].record.diagnostics[0])
+        self.assertFalse(opened["link"].record.opened)
+        self.assertIsNone(opened["link"].sha256)
+        self.assertIsNone(opened["link"].rows)
+
+    def test_symlink_inside_manifest_root_is_allowed(self) -> None:
+        target = self.write("data/source.csv", MEASUREMENTS_CSV)
+        try_symlink(self, target, self.tmp / "data" / "link.csv")
+        _, opened = self.discover([spec("link", "data/link.csv")])
+        self.assertIs(opened["link"].state, InputState.PARSED)
+        self.assertEqual(opened["link"].absolute_path, target.resolve())
+        self.assertEqual(opened["link"].sha256, hashlib.sha256(MEASUREMENTS_CSV.encode("utf-8")).hexdigest())
 
     def test_oversized_input_is_refused_before_opening(self) -> None:
         self.write("data/big.csv", "a\n" + "1\n" * 100)
