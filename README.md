@@ -315,3 +315,7 @@ No license has been chosen. The license field in `pyproject.toml` is
 All fixtures and examples are synthetic: invented sample ids, sites,
 reviewers, authors, journals, assertions and values, with DOIs under the
 `10.5555` test prefix. None of them reports a real finding.
+
+## Relation to the estate
+
+Part of the [SZL Holdings](https://github.com/szl-holdings) GitHub estate; models, datasets and Spaces are published under the [SZLHOLDINGS](https://huggingface.co/SZLHOLDINGS) Hugging Face org.
