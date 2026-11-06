@@ -307,9 +307,11 @@ PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests
 r28). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 GitHub Actions runs this suite and the self-checking demonstration on Python
-3.11 and 3.13 for pull requests and pushes to `main`. A run with no discovered
-tests or no completed passing tests fails. Skips remain visible in the test
-output; they are never counted as passing tests.
+3.11, 3.12 and 3.13 for pull requests and pushes to `main`. A run with no
+discovered tests or no completed passing tests fails. Skips remain visible in
+the test output; they are never counted as passing tests. A CodeQL workflow
+(the organization's SHA-pinned reusable workflow) analyses the Python code and
+the workflow files on the same events and weekly.
 
 ## License status
 
