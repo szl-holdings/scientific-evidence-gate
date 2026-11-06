@@ -140,7 +140,11 @@ wrote. Exit codes:
 | 2 | ABSTAIN | Something was missing, empty, skipped, unavailable, unverified or untestable. |
 | 3 | ERROR | The manifest was invalid or unsafe, an argument was wrong, an export failed its validator, the tool itself failed, or `--require-signature` was given and the receipt's HMAC-SHA256 authenticator did not verify. |
 
-Argument errors exit 3, never 2, so that 2 always means ABSTAIN.
+Argument errors exit 3, never 2, so that 2 always means ABSTAIN. A standard
+output that stops accepting lines (a reader that leaves early, as in
+`science-gate demo | head -1`) also exits 3, with one line on standard error
+naming the cause, never with a traceback or with Python's own exit 1, which
+would read as FAIL.
 
 A `verify` run directory holds `run.json`, `report.md`, `ledger.jsonl`,
 `evidence-manifest.json`, `receipt.json`, `receipt.auth.json`,

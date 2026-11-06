@@ -507,7 +507,13 @@ The subcommands are:
 
 Exit codes follow `Status`: 0, 1, 2 or 3. Argument errors exit 3 with a
 message, not argparse's 2, so that 2 always means ABSTAIN. Every command
-prints a one-line status headline first, then the paths it wrote.
+prints a one-line status headline first, then the paths it wrote. A standard
+output that stops accepting lines (EPIPE from a reader that left early, EINVAL
+on Windows, a full disk or a closed stream) is ERROR as well: `main` exits 3,
+names the cause in one line on standard error and points the dead stream at
+`os.devnull`. The exit code therefore stays within 0 to 3: never a traceback,
+never Python's own exit 1 for an uncaught BrokenPipeError (which would read as
+FAIL), and never its exit 120 from a failed final flush.
 
 ## 15. Security (tests in `tests/test_security.py`)
 
