@@ -1248,8 +1248,8 @@ class FullFixtureTests(unittest.TestCase):
                 for check in run.result.checks
                 if any("NotImplementedError" in text for text in check.diagnostics)
             )
-            if missing:
-                self.skipTest(f"specialist checks not implemented in this build: {missing}")
+            # Every specialist builder has delivered; a check that raises NotImplementedError is a regression.
+            self.assertEqual(missing, [], "specialist checks raised NotImplementedError")
             self.assertIs(run.status, Status.PASS, [finding.to_dict() for finding in run.findings])
             report = mutate(FULL_MANIFEST, operators=sorted(SPECIALIST_OPERATORS))
         executed = {record.mutation_id: record for record in report.mutations if record.detected is not None}

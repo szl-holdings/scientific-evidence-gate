@@ -179,9 +179,8 @@ class PlanTamperTests(ProjectTestCase):
         self.assertEqual((decision.status, decision.reason), (Status.FAIL, Reason.PARTIAL_EXECUTION))
 
     def test_b_the_m21_removed_plan_operator_is_detected_by_plan_closure(self) -> None:
-        operators = getattr(mutations, "OPERATOR_IDS", ())
-        if "M21_removed_plan" not in operators:
-            self.skipTest("M21_removed_plan is delivered by the mutations builder (section 17.12)")
+        # The mutations builder delivered M21 (section 17.12); losing it is a regression, never a skip.
+        self.assertIn("M21_removed_plan", mutations.OPERATOR_IDS)
         tree = self.tmp / "valid"
         shutil.copytree(VALID_MANIFEST.parent, tree)
         report = mutations.mutate(tree / "manifest.json", operators=["M21_removed_plan"])
