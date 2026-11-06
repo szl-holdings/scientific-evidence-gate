@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -52,19 +53,51 @@ def returns_seven(args: argparse.Namespace) -> int:
     return 7
 
 
+def prints_pass(args: argparse.Namespace) -> int:
+    print("PASS stand-in: synthetic")
+    return 0
+
+
+class ClosedStream:
+    """A standard stream whose reader has gone, as in ``science-gate demo | head -1``.
+
+    With ``fail_writes=False`` it behaves like a buffered stream: writes are
+    accepted, and the closed pipe surfaces only when the buffer is flushed.
+    It has no file descriptor, so nothing in the test process is redirected.
+    """
+
+    encoding = "utf-8"
+
+    def __init__(self, error: OSError, *, fail_writes: bool = True) -> None:
+        self.error = error
+        self.fail_writes = fail_writes
+
+    def write(self, text: str) -> int:
+        if self.fail_writes:
+            raise self.error
+        return len(text)
+
+    def flush(self) -> None:
+        raise self.error
+
+
 class CliTestCase(TempDirTestCase):
-    def run_cli(self, *args: str, cwd: Path | None = None, **env: str) -> subprocess.CompletedProcess[str]:
-        """Run ``python -m science_gate.cli`` with a pinned clock and no signing key."""
+    def cli_environment(self, **env: str) -> dict[str, str]:
+        """The environment for ``python -m science_gate.cli``: a pinned clock and no signing key."""
         hidden = (HMAC_KEY_FILE_ENV, "PYTHONHASHSEED")
         environment = {key: value for key, value in os.environ.items() if key not in hidden}
         environment.update(
             {"PYTHONPATH": str(SRC_DIR), "PYTHONDONTWRITEBYTECODE": "1", "SCIENCE_GATE_FIXED_TIME": FIXED_TIME}
         )
         environment.update(env)
+        return environment
+
+    def run_cli(self, *args: str, cwd: Path | None = None, **env: str) -> subprocess.CompletedProcess[str]:
+        """Run ``python -m science_gate.cli`` with a pinned clock and no signing key."""
         return subprocess.run(
             [sys.executable, "-m", "science_gate.cli", *args],
             cwd=cwd or self.tmp,
-            env=environment,
+            env=self.cli_environment(**env),
             capture_output=True,
             text=True,
             timeout=300,
@@ -318,6 +351,85 @@ class LazyCommandTests(unittest.TestCase):
         self.assertEqual(code, 3)
         expected = "ERROR verify: export validation failed: SARIF_KIND_MISMATCH: synthetic first\n"
         self.assertEqual(stdout.getvalue(), expected)
+
+
+class ClosedOutputTests(CliTestCase):
+    """A reader that leaves early (``science-gate demo | head -1``) gets ERROR, exit 3.
+
+    Never Python's own exit 1 for an uncaught BrokenPipeError, which in this
+    scheme reads as FAIL, and never a traceback (section 14).
+    """
+
+    @staticmethod
+    def notice(command: str, cause: str) -> str:
+        return f"ERROR {command}: standard output stopped accepting lines ({cause}); exit 3\n"
+
+    def invoke(self, stdout: Any, stderr: Any) -> int:
+        with mock.patch.object(cli, "LAZY_COMMANDS", {"demo": f"{__name__}:prints_pass"}):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                return cli.main(["demo"])
+
+    def test_a_closed_standard_output_exits_3_with_one_line_on_standard_error(self) -> None:
+        # EPIPE on POSIX; Windows reports a write to a pipe whose reader has gone as EINVAL.
+        for error in (BrokenPipeError(errno.EPIPE, "Broken pipe"), OSError(errno.EINVAL, "Invalid argument")):
+            for fail_writes in (True, False):
+                with self.subTest(error=type(error).__name__, fail_writes=fail_writes):
+                    stderr = io.StringIO()
+                    self.assertEqual(self.invoke(ClosedStream(error, fail_writes=fail_writes), stderr), 3)
+                    self.assertEqual(stderr.getvalue(), self.notice("demo", error.strerror))
+
+    def test_closed_standard_output_and_error_still_exit_3(self) -> None:
+        error = BrokenPipeError(errno.EPIPE, "Broken pipe")
+        self.assertEqual(self.invoke(ClosedStream(error), ClosedStream(error)), 3)
+
+    def test_a_standard_output_closed_outright_exits_3(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        stdout.close()
+        with self.assertRaises(ValueError) as closed:  # the stream's own wording of the cause
+            stdout.write("")
+        self.assertEqual(self.invoke(stdout, stderr), 3)
+        self.assertEqual(stderr.getvalue(), self.notice("demo", str(closed.exception)))
+
+    def test_an_os_error_from_the_command_is_still_reported_on_standard_output(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "verify", side_effect=OSError(errno.ENOSPC, "synthetic full disk")):
+            with contextlib.redirect_stdout(stdout):
+                code = cli.main(["verify", str(VALID_MANIFEST)])
+        self.assertEqual(code, 3)
+        expected = f"ERROR verify: internal error (OSError: [Errno {errno.ENOSPC}] synthetic full disk)\n"
+        self.assertEqual(stdout.getvalue(), expected)
+
+    @unittest.skipUnless(
+        os.name == "posix", "only POSIX fails a write to a reader-closed pipe with EPIPE; EINVAL is covered in process"
+    )
+    def test_the_real_cli_exits_3_when_its_reader_left_before_the_first_line(self) -> None:
+        # Unbuffered output meets the closed pipe at the first line, buffered output at the final flush.
+        for mode in ("unbuffered", "buffered"):
+            with self.subTest(mode=mode):
+                environment = self.cli_environment()
+                environment.pop("PYTHONUNBUFFERED", None)
+                if mode == "unbuffered":
+                    environment["PYTHONUNBUFFERED"] = "1"
+                output = self.tmp / mode
+                command = ["verify", str(VALID_MANIFEST), "--output", str(output)]
+                reader, writer = os.pipe()
+                os.close(reader)
+                try:
+                    completed = subprocess.run(
+                        [sys.executable, "-m", "science_gate.cli", *command],
+                        cwd=self.tmp,
+                        env=environment,
+                        stdout=writer,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=300,
+                    )
+                finally:
+                    os.close(writer)
+                self.assertEqual(completed.stderr, self.notice("verify", os.strerror(errno.EPIPE)))
+                self.assertEqual(completed.returncode, 3)
+                # The verdict was still reached and recorded; only its printout was lost.
+                self.assertTrue((output / RUN_JSON).is_file())
 
 
 class ParserTests(unittest.TestCase):

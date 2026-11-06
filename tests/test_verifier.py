@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import json
 import shutil
 import unittest
@@ -145,15 +144,6 @@ TEST_REGISTRY = {
 }
 TEST_FALSIFIERS = {**FALSIFIERS, "narrates": f"{__name__}:falsify_narrating"}
 
-#: Who delivers each specialist generator (section 17.1).
-GENERATOR_OWNERS = {
-    "science_gate.citations": "citations",
-    "science_gate.claims": "numeric",
-    "science_gate.dependencies": "dependencies",
-    "science_gate.assertions": "assertions",
-    "science_gate.mutations": "mutations",
-}
-
 
 class RegistryTests(unittest.TestCase):
     def test_registry_covers_exactly_the_contract_kinds(self) -> None:
@@ -180,12 +170,10 @@ class RegistryTests(unittest.TestCase):
                 self.assertTrue(target.partition(":")[2].startswith("falsify_"))
 
     def test_every_generator_resolves(self) -> None:
+        # Every builder has delivered its generator (section 17.1); one that stops resolving is a
+        # regression, never a skip: its kind would end NO_GENERATOR and could never PASS.
         for kind, target in sorted(FALSIFIERS.items()):
             with self.subTest(kind=kind):
-                module_name, _, name = target.partition(":")
-                if module_name != "science_gate.verifier" and not hasattr(importlib.import_module(module_name), name):
-                    # Visible, never silent: until the owner delivers it, that kind ends NO_GENERATOR, never PASS.
-                    self.skipTest(f"{target} is not delivered yet by the {GENERATOR_OWNERS[module_name]} builder")
                 self.assertTrue(callable(resolve_check(target)))
 
     def test_only_specialist_kinds_live_outside_the_verifier(self) -> None:

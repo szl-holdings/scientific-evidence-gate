@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 from pathlib import Path
 from types import MappingProxyType
@@ -384,6 +385,43 @@ _HANDLERS: Mapping[str, Callable[[argparse.Namespace, TextIO], int]] = MappingPr
 )
 
 
+def _discard(stream: TextIO) -> None:
+    """Point a stream that can no longer be written at ``os.devnull``.
+
+    The interpreter flushes the standard streams once more when it exits;
+    without this, that flush meets the closed pipe again, prints "Exception
+    ignored" and exits 120. A stream without a file descriptor (a test's
+    stand-in) has nothing to redirect.
+    """
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, descriptor)
+    finally:
+        os.close(devnull)
+
+
+def _output_failed(command: str, failure: Exception, out: TextIO, err: TextIO) -> int:
+    """Exit 3 when standard output stopped accepting lines, as in ``science-gate demo | head -1``.
+
+    The command may have reached its verdict and written its files, but its
+    headline and paths were not all delivered, so the outcome is ERROR. Left
+    alone, a BrokenPipeError would end the process with Python's own exit 1,
+    which here means FAIL. One line on standard error names the cause.
+    """
+    _discard(out)
+    reason = getattr(failure, "strerror", None) or str(failure) or type(failure).__name__
+    try:
+        _emit(err, f"ERROR {command}: standard output stopped accepting lines ({reason}); exit {_ERROR}")
+        err.flush()
+    except (OSError, ValueError):
+        _discard(err)  # standard error went too; the exit code is the only report left
+    return _ERROR
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return its exit code. ``--help`` and ``--version`` exit 0 via SystemExit."""
     out, err = sys.stdout, sys.stderr
@@ -397,9 +435,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # Every command redacts what it prints and writes; read the environment's secrets once for all of it.
         with redaction_scope():
-            return _HANDLERS[args.command](args, out)
+            code = _HANDLERS[args.command](args, out)
+        # Deliver buffered lines now, so a reader that has gone is met here, not at interpreter exit.
+        out.flush()
+        return code
     except Exception as exc:  # the last line of defence: an exit code and a message, never a traceback
-        _emit(out, f"ERROR {args.command}: internal error ({type(exc).__name__}: {exc})")
+        try:
+            _emit(out, f"ERROR {args.command}: internal error ({type(exc).__name__}: {exc})")
+            out.flush()
+        except (OSError, ValueError) as failure:
+            # Standard output itself cannot be written: its reader left (EPIPE, or EINVAL on Windows),
+            # its file is full, or it was closed.
+            return _output_failed(args.command, failure, out, err)
         return _ERROR
 
 
