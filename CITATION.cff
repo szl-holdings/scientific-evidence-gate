@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please credit SZL Holdings."
+title: "scientific-evidence-gate - Private scientific evidence gate â€” PASS/FAIL/ABSTAIN/ERROR receipts and fixtures for evidence-bound scientific claims (SZL Holdings) (SZL Holdings governed-AI estate)"
+authors:
+  - name: SZL Holdings
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/szl-holdings/scientific-evidence-gate"
+keywords:
+  - governed-ai
+  - provenance
+  - szl-holdings
