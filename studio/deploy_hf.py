@@ -39,7 +39,7 @@ app_file: app.py
 python_version: 3.12
 suggested_hardware: cpu-basic
 license: other
-short_description: Live falsifiable synthetic evidence gate with original machine receipts
+short_description: Interactive synthetic evidence verifier
 ---
 
 # SZL Science Gate Studio
@@ -69,6 +69,10 @@ freeze or signature and does not imply independent B1 reproduction.
 [GitHub protected source](https://github.com/szl-holdings/scientific-evidence-gate)
 · [SZL Holdings](https://github.com/szl-holdings)
 """
+    description_lines = [line.split(":", 1)[1].strip() for line in readme.splitlines()
+                         if line.startswith("short_description:")]
+    if len(description_lines) != 1 or not 1 <= len(description_lines[0]) <= 60:
+        raise PublishHold("invalid Hub Space card short_description")
     requirements = (
         f"gradio=={GRADIO_VERSION}\n"
         "scientific-evidence-gate @ git+"
