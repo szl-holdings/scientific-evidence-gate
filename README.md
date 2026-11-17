@@ -325,3 +325,18 @@ reviewers, authors, journals, assertions and values, with DOIs under the
 ## Relation to the estate
 
 Part of the [SZL Holdings](https://github.com/szl-holdings) GitHub estate; models, datasets and Spaces are published under the [SZLHOLDINGS](https://huggingface.co/SZLHOLDINGS) Hugging Face org.
+
+
+## Live product: SZL Science Gate Studio (synthetic-only)
+
+The [Studio source and release contract](studio/README.md) provide an
+interactive Gradio application built over the **real** scientific-evidence-gate
+engine, not a screenshot or an independently implemented scoring demo.
+Visitors can run six source-bundled synthetic scenarios and download original
+verifier receipts, check outcomes and a reproducibility ZIP. A Lutar arithmetic
+panel is deliberately marked as WHAT-IF rather than as live authenticated
+release evidence. Deployment is to a source-pinned CPU-only HF Space; exact
+GitHub protected main remains the sole application source.
+
+**No biological data, model training, independent validation, or production
+release is represented by this public synthetic tool.**
