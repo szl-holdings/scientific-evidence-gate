@@ -32,6 +32,8 @@ class PublisherContractTests(unittest.TestCase):
         self.assertIn(TEST_SHA, files["requirements.txt"].decode())
         self.assertIn(TEST_SHA, files["README.md"].decode())
         self.assertIn("sdk: gradio", files["README.md"].decode())
+        desc = files["README.md"].decode().split("short_description: ", 1)[1].splitlines()[0]
+        self.assertLessEqual(len(desc), 60, "Hub Space rejects longer descriptions")
         self.assertNotIn("token", files["app.py"].decode().lower())
 
     def test_reject_nonimmutable_source(self):
