@@ -94,8 +94,8 @@ reusing this same canonical engine. Such an installation must separately
 implement real auth, durable signed receipts, complete fixture licensing,
 operator independence, audit retention, rate limits, isolation and
 publication qualification. Those controls are not supplied by the public
-synthetic demonstrator. Do not claim that the Vidal-Gadea Lab has deployed or
-endorsed this product.
+synthetic demonstrator. Do not claim that any partner laboratory has deployed
+or endorsed this product.
 
 
 ## Live HTTP and backend smoke test

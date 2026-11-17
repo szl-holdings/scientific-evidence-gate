@@ -63,7 +63,7 @@ its package metadata declares NOASSERTION; metadata reconciliation remains
 an upstream owner responsibility, so the Space card does not assert a
 resolved license identifier.
 
-This public demonstration is separate from any Vidal-Gadea Lab protocol
+This public demonstration is separate from any partner-laboratory protocol
 freeze or signature and does not imply independent B1 reproduction.
 
 [GitHub protected source](https://github.com/szl-holdings/scientific-evidence-gate)
