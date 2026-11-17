@@ -7,22 +7,23 @@ are accepted; no arbitrary file uploads, dynamic manifest, URLs, or code.
 """
 from __future__ import annotations
 
+import contextlib
 import html
 import hashlib
+import io
 import json
 import math
 import os
 from pathlib import Path
 import shutil
-import subprocess
-import sys
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
 from typing import Any
 
-from . import __version__
+from . import __version__, cli
 from ._resources import bundled_dir
 
 SCENARIOS = {
@@ -38,7 +39,7 @@ SOURCE_MATH = "szl-holdings/lutar-lean@c2ca813fca00ecf58bcc5f505f2aa4237fbf2481"
 SOURCE_CODE = "https://github.com/szl-holdings/scientific-evidence-gate"
 MAX_FIXTURE_BYTES = 256_000
 MAX_ARCHIVE_BYTES = 2_000_000
-CLI_TIMEOUT = 50
+_ENGINE_LOCK = threading.Lock()
 CLAIM_BOUNDARY = (
     "Synthetic, locally executed verifier demonstration. A PASS proves only "
     "the declared synthetic checks with the displayed falsifier evidence. "
@@ -93,16 +94,6 @@ def _mutate(project: Path, mode: str | None) -> None:
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-
-
-def _safe_child_env() -> dict[str, str]:
-    allow = {
-        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
-        "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "HOME", "USERPROFILE",
-        "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "PYTHONUTF8",
-        "PYTHONIOENCODING", "TZ",
-    }
-    return {k: v for k, v in os.environ.items() if k.upper() in allow}
 
 
 def _receipt_archive(project: Path, result_dir: Path, scenario: str, metadata: dict) -> str:
@@ -162,23 +153,24 @@ def verify_scenario(name: str, *, export: bool = False) -> dict[str, Any]:
         shutil.copytree(_source_dir(relative), project, symlinks=False)
         _mutate(project, mutation)
         result_dir = work / "run"
-        cmd = [sys.executable, "-m", "science_gate.cli", "verify",
-               str(project / "manifest.json"), "--output", str(result_dir)]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=work, capture_output=True, text=True,
-                timeout=CLI_TIMEOUT, env=_safe_child_env(), check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise StudioHold("verifier execution was unavailable") from exc
-
+        # The canonical source contract prohibits starting a process from
+        # the science_gate package. Drive its CLI IN PROCESS, serialized so
+        # its global stdout/redaction context never overlaps another run.
+        buffer = io.StringIO()
+        started = time.monotonic()
+        with _ENGINE_LOCK:
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                code = cli.main(["verify", str(project / "manifest.json"),
+                                 "--output", str(result_dir)])
+        if time.monotonic() - started > 20:
+            raise StudioHold("synthetic verifier exceeded the demonstration budget")
         result_path = result_dir / "run.json"
         if not result_path.is_file():
-            raise StudioHold(f"verifier produced no complete receipt (exit {proc.returncode})")
+            raise StudioHold(f"verifier produced no complete receipt (exit {code})")
         result = json.loads(result_path.read_text(encoding="utf-8"))
         status = result.get("status")
         codes = {"PASS": 0, "FAIL": 1, "ABSTAIN": 2, "ERROR": 3}
-        if status not in codes or proc.returncode != codes[status]:
+        if status not in codes or code != codes[status]:
             raise StudioHold("verifier exit code and receipt disagree")
         checks = result.get("checks")
         if not isinstance(checks, list):
@@ -206,7 +198,7 @@ def verify_scenario(name: str, *, export: bool = False) -> dict[str, Any]:
             "tool_version": __version__,
             "studio_source_sha": os.getenv("SZL_STUDIO_SOURCE_SHA", "UNBOUND_LOCAL"),
             "source_repository": SOURCE_CODE,
-            "method": "canonical science_gate.cli verify; network lookups disabled",
+            "method": "canonical science_gate.cli.main in-process; network lookups disabled",
             "biological_validation": False,
             "independent_lab_reproduction": False,
             "release_admission": False,

@@ -96,3 +96,27 @@ operator independence, audit retention, rate limits, isolation and
 publication qualification. Those controls are not supplied by the public
 synthetic demonstrator. Do not claim that the Vidal-Gadea Lab has deployed or
 endorsed this product.
+
+
+## Live HTTP and backend smoke test
+
+After launching locally, use the standard-library end-to-end witness:
+
+```sh
+python studio/smoke.py --base-url http://127.0.0.1:7860
+```
+
+After a verified Hugging Face deployment, use:
+
+```sh
+python studio/smoke.py \
+  --base-url https://szlholdings-szl-science-gate-studio.hf.space
+```
+
+The smoke reads the real Gradio `/config`, invokes the actual backend
+`verify_synthetic` endpoint with both a known-good and a deliberately
+re-pinned duplicate, and invokes `lutar_what_if` with deliberately
+missing evidence. It refuses any other remote origin, insecure public
+HTTP, credentials, paths and query strings. The result distinguishes
+WITNESSED_PASS, REJECTED and SIMULATED_HOLD. A merely responding
+website or build success cannot satisfy this contract.
